@@ -172,3 +172,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Training outputs and model checkpoints
+model/
+model_demo/
+model_original/
+*.pt
+*_results.json
