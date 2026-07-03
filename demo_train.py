@@ -1,4 +1,4 @@
-"""Stage-7 demo: modality-specific modulation for two GSDG graphs.
+"""Stage-8 demo: overlap-conditioned second-layer dynamic graphs.
 
 The fixed hypergraph/HGCN path is replaced by GSDG graph/GAT propagation.
 The default uses independent HSI and LiDAR graphs; the previous concatenated
@@ -42,7 +42,7 @@ from utils import (
 )
 
 
-STAGE = "stage7_optional_lidar_rag_lowhigh"
+STAGE = "stage8_overlap_conditioned_qk"
 
 
 def parse_args():
@@ -125,11 +125,18 @@ def parse_args():
     )
     parser.add_argument(
         "--cross-modal-interaction",
-        choices=("none", "overlap-gate", "overlap-attention"),
+        choices=(
+            "none",
+            "overlap-gate",
+            "overlap-attention",
+            "overlap-qk-condition",
+        ),
         default="none",
         help=(
             "Interaction between independent HSI/LiDAR graphs after "
-            "GAT1. The default 'none' exactly preserves late fusion."
+            "GAT1. overlap-qk-condition uses cross-partition overlap "
+            "context only to condition each modality's second Q/K graph. "
+            "The default 'none' exactly preserves late fusion."
         ),
     )
     parser.add_argument(
@@ -137,6 +144,16 @@ def parse_args():
         type=int,
         default=16,
         help="Query/key dimension of overlap-constrained cross-attention.",
+    )
+    parser.add_argument(
+        "--overlap-metric",
+        choices=("iou", "coverage"),
+        default="iou",
+        help=(
+            "Cross-modal superpixel correspondence. 'iou' uses "
+            "intersection over union; 'coverage' preserves the earlier "
+            "directional intersection/target-area weighting."
+        ),
     )
     parser.add_argument(
         "--fdsm-scope",
@@ -433,21 +450,127 @@ class MaskedDynamicGraphBuilder(DynamicGraphBuilder):
         return adjacency
 
 
+class CrossConditionedDynamicGraphBuilder(DynamicGraphBuilder):
+    """Second-layer Q/K graph conditioned by overlap-aligned other nodes."""
+
+    def __init__(
+        self,
+        *args,
+        cross_channels,
+        candidate_mask=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        d_k = self.query.out_features
+        self.cross_query = nn.Linear(cross_channels, d_k)
+        self.cross_key = nn.Linear(cross_channels, d_k)
+        self.register_buffer(
+            "candidate_mask",
+            (
+                torch.as_tensor(candidate_mask, dtype=torch.bool)
+                if candidate_mask is not None
+                else None
+            ),
+            persistent=False,
+        )
+        self.last_cross_context = None
+
+    def forward(
+        self,
+        node_features,
+        spatial_prior,
+        cross_context,
+    ):
+        if cross_context.shape[0] != node_features.shape[0]:
+            raise ValueError(
+                "Cross context must have one row per target node."
+            )
+        query = (
+            self.query(node_features)
+            + self.cross_query(cross_context)
+            + self.position_encoding
+        )
+        key = (
+            self.key(node_features)
+            + self.cross_key(cross_context)
+            + self.position_encoding
+        )
+        logits = (
+            query @ key.transpose(0, 1) * self.scale
+            + torch.log(spatial_prior + 1e-6)
+        ) / self.tau
+        if self.candidate_mask is not None:
+            logits = logits.masked_fill(
+                ~self.candidate_mask,
+                torch.finfo(logits.dtype).min,
+            )
+        scores = torch.softmax(logits, dim=-1)
+
+        k = min(self.topk, scores.size(1))
+        values, indices = torch.topk(scores, k=k, dim=-1)
+        adjacency = torch.zeros_like(scores).scatter_(
+            dim=-1,
+            index=indices,
+            src=values,
+        )
+        if self.candidate_mask is not None:
+            adjacency = adjacency * self.candidate_mask.to(
+                adjacency.dtype
+            )
+        if self.symmetrize:
+            adjacency = torch.maximum(
+                adjacency,
+                adjacency.transpose(0, 1),
+            )
+        adjacency = adjacency / (
+            adjacency.sum(dim=-1, keepdim=True) + 1e-6
+        )
+        self.last_cross_context = cross_context.detach()
+        self.last_adjacency = adjacency.detach()
+        return adjacency
+
+
 def build_cross_modal_overlap(
     hsi_assignment,
     lidar_assignment,
+    metric="iou",
 ):
-    """Return row-normalized HSI->LiDAR and LiDAR->HSI overlap."""
+    """Return directional row-normalized IoU or coverage weights."""
     overlap = hsi_assignment.transpose() @ lidar_assignment
     if issparse(overlap):
         overlap = overlap.toarray()
     overlap = np.asarray(overlap, dtype=np.float32)
-    hsi_to_lidar = overlap / np.maximum(
-        overlap.sum(axis=1, keepdims=True),
+    if metric == "iou":
+        hsi_area = np.asarray(
+            hsi_assignment.sum(axis=0)
+        ).reshape(-1).astype(np.float32)
+        lidar_area = np.asarray(
+            lidar_assignment.sum(axis=0)
+        ).reshape(-1).astype(np.float32)
+        union = (
+            hsi_area[:, None]
+            + lidar_area[None, :]
+            - overlap
+        )
+        correspondence = np.divide(
+            overlap,
+            np.maximum(union, 1.0),
+            out=np.zeros_like(overlap),
+            where=overlap > 0,
+        )
+    elif metric == "coverage":
+        correspondence = overlap
+    else:
+        raise ValueError(
+            "Overlap metric must be 'iou' or 'coverage'."
+        )
+
+    hsi_to_lidar = correspondence / np.maximum(
+        correspondence.sum(axis=1, keepdims=True),
         1e-6,
     )
-    lidar_to_hsi = overlap.T / np.maximum(
-        overlap.T.sum(axis=1, keepdims=True),
+    lidar_to_hsi = correspondence.T / np.maximum(
+        correspondence.T.sum(axis=1, keepdims=True),
         1e-6,
     )
     return (
@@ -767,6 +890,7 @@ class ModalityGSDGGraphEncoder(nn.Module):
         lidar_modulation="none",
         rag_adjacency=None,
         geometry_descriptors=None,
+        use_cross_conditioned_builder=False,
     ):
         super().__init__()
         pooling_assignment, projection_assignment = (
@@ -832,6 +956,17 @@ class ModalityGSDGGraphEncoder(nn.Module):
                 candidate_mask=candidate_mask,
                 **graph_builder_options,
             )
+        self.cross_conditioned_graph_builder = (
+            CrossConditionedDynamicGraphBuilder(
+                hidden_dim,
+                assignment.shape[1],
+                cross_channels=hidden_dim,
+                candidate_mask=candidate_mask,
+                **graph_builder_options,
+            )
+            if use_cross_conditioned_builder
+            else None
+        )
         self.gat1 = MultiHeadGAT(
             hidden_dim,
             head_channels=30,
@@ -886,8 +1021,19 @@ class ModalityGSDGGraphEncoder(nn.Module):
         first_graph_features,
         adjacency=None,
         rebuild_graph=False,
+        cross_context=None,
     ):
-        if rebuild_graph:
+        if cross_context is not None:
+            if self.cross_conditioned_graph_builder is None:
+                raise ValueError(
+                    "Cross-conditioned graph builder is not enabled."
+                )
+            adjacency = self.cross_conditioned_graph_builder(
+                first_graph_features,
+                self.spatial_prior,
+                cross_context,
+            )
+        elif rebuild_graph:
             adjacency = self.graph_builder(
                 first_graph_features,
                 self.spatial_prior,
@@ -938,6 +1084,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         dynamic_tau=1.0,
         cross_modal_interaction="none",
         cross_attention_d_k=16,
+        overlap_metric="iou",
         fdsm_scope="none",
         lidar_modulation="none",
         lidar_rag_adjacency=None,
@@ -949,6 +1096,10 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.graph_modality_lambda = graph_modality_lambda
         self.fusion_lambda = fusion_lambda
         self.cross_modal_interaction = cross_modal_interaction
+        self.overlap_metric = overlap_metric
+        use_qk_condition = (
+            cross_modal_interaction == "overlap-qk-condition"
+        )
         self.hsi_graph = ModalityGSDGGraphEncoder(
             in_channels=hsi_channels,
             assignment=hsi_assignment,
@@ -957,7 +1108,9 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             dynamic_d_k=dynamic_d_k,
             dynamic_topk=dynamic_topk,
             dynamic_tau=dynamic_tau,
+            use_edge_weights=use_qk_condition,
             use_fdsm=fdsm_scope == "hsi",
+            use_cross_conditioned_builder=use_qk_condition,
         )
         self.lidar_graph = ModalityGSDGGraphEncoder(
             in_channels=1,
@@ -968,17 +1121,65 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             dynamic_topk=dynamic_topk,
             dynamic_tau=dynamic_tau,
             candidate_mask=lidar_candidate_mask,
-            use_edge_weights=lidar_candidate_mask is not None,
+            use_edge_weights=(
+                lidar_candidate_mask is not None
+                or use_qk_condition
+            ),
             lidar_modulation=lidar_modulation,
             rag_adjacency=lidar_rag_adjacency,
             geometry_descriptors=lidar_geometry_descriptors,
+            use_cross_conditioned_builder=use_qk_condition,
         )
-        if cross_modal_interaction == "none":
-            self.cross_interaction = None
-        else:
+        if cross_modal_interaction == "overlap-qk-condition":
             hsi_to_lidar, lidar_to_hsi = build_cross_modal_overlap(
                 hsi_assignment,
                 lidar_assignment,
+                metric=overlap_metric,
+            )
+            self.register_buffer(
+                "hsi_to_lidar_overlap",
+                torch.as_tensor(
+                    hsi_to_lidar,
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "lidar_to_hsi_overlap",
+                torch.as_tensor(
+                    lidar_to_hsi,
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+            self.cross_interaction = None
+        elif cross_modal_interaction == "none":
+            self.register_buffer(
+                "hsi_to_lidar_overlap",
+                None,
+                persistent=False,
+            )
+            self.register_buffer(
+                "lidar_to_hsi_overlap",
+                None,
+                persistent=False,
+            )
+            self.cross_interaction = None
+        else:
+            self.register_buffer(
+                "hsi_to_lidar_overlap",
+                None,
+                persistent=False,
+            )
+            self.register_buffer(
+                "lidar_to_hsi_overlap",
+                None,
+                persistent=False,
+            )
+            hsi_to_lidar, lidar_to_hsi = build_cross_modal_overlap(
+                hsi_assignment,
+                lidar_assignment,
+                metric=overlap_metric,
             )
             self.cross_interaction = OverlapCrossModalInteraction(
                 hidden_dim,
@@ -1008,10 +1209,38 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.classifier = nn.Linear(hidden_dim, class_count)
 
     def forward(self, hsi, lidar, joint_input):
-        if self.cross_interaction is None:
+        if self.cross_modal_interaction == "none":
             # Preserve the original Stage-3 path exactly.
             hsi_graph_features = self.hsi_graph(hsi)
             lidar_graph_features = self.lidar_graph(lidar)
+        elif (
+            self.cross_modal_interaction
+            == "overlap-qk-condition"
+        ):
+            hsi_nodes = self.hsi_graph.encode_nodes(hsi)
+            lidar_nodes = self.lidar_graph.encode_nodes(lidar)
+            hsi_features, _ = self.hsi_graph.apply_gat1(hsi_nodes)
+            lidar_features, _ = self.lidar_graph.apply_gat1(
+                lidar_nodes
+            )
+            hsi_cross_context = (
+                self.hsi_to_lidar_overlap @ lidar_features
+            )
+            lidar_cross_context = (
+                self.lidar_to_hsi_overlap @ hsi_features
+            )
+            hsi_graph_features = (
+                self.hsi_graph.apply_gat2_and_project(
+                    hsi_features,
+                    cross_context=hsi_cross_context,
+                )
+            )
+            lidar_graph_features = (
+                self.lidar_graph.apply_gat2_and_project(
+                    lidar_features,
+                    cross_context=lidar_cross_context,
+                )
+            )
         else:
             hsi_nodes = self.hsi_graph.encode_nodes(hsi)
             lidar_nodes = self.lidar_graph.encode_nodes(lidar)
@@ -1224,6 +1453,7 @@ def train_one_run(
             graph_modality_lambda=args.graph_modality_lambda,
             cross_modal_interaction=args.cross_modal_interaction,
             cross_attention_d_k=args.cross_attention_dk,
+            overlap_metric=args.overlap_metric,
             fdsm_scope=args.fdsm_scope,
             **common_options,
         ).to(device)
@@ -1304,6 +1534,7 @@ def train_one_run(
         f"lidar-{args.lidar_segmentation}_"
         f"prior-{args.lidar_graph_prior}_"
         f"cross-{args.cross_modal_interaction}_"
+        f"overlap-{args.overlap_metric}_"
         f"fdsm-{args.fdsm_scope}_"
         f"lidarmod-{args.lidar_modulation}_"
         f"run{run_index + 1}.pt"
@@ -1396,7 +1627,7 @@ def main():
 
     print("=" * 72)
     print(
-        "demo_train | Stage 7: optional modality-specific modulation"
+        "demo_train | Stage 8: overlap-conditioned second-layer Q/K"
     )
     print(
         "Unchanged CNN: joint PCA(HSI)+LiDAR -> WMF -> "
@@ -1424,6 +1655,19 @@ def main():
             "Cross-modal graph interaction: "
             f"{args.cross_modal_interaction}"
         )
+        if args.cross_modal_interaction != "none":
+            print(
+                "Cross-modal overlap metric: "
+                f"{args.overlap_metric}"
+            )
+        if (
+            args.cross_modal_interaction
+            == "overlap-qk-condition"
+        ):
+            print(
+                "Cross condition: C_HL @ L and C_LH @ H modify "
+                "both modalities' second-layer Q/K; no feature gate"
+            )
         print(f"HSI FDSM: {args.fdsm_scope}")
         print(f"LiDAR modulation: {args.lidar_modulation}")
     else:
@@ -1497,6 +1741,7 @@ def main():
         f"lidar-{args.lidar_segmentation}_"
         f"prior-{args.lidar_graph_prior}_"
         f"cross-{args.cross_modal_interaction}_"
+        f"overlap-{args.overlap_metric}_"
         f"fdsm-{args.fdsm_scope}_"
         f"lidarmod-{args.lidar_modulation}_results.json"
     )

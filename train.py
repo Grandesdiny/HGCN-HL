@@ -374,6 +374,72 @@ def superpixel_centroids(assignment, height, width):
     ).astype(np.float32)
 
 
+def build_cross_modal_relation_data(
+    hsi_assignment,
+    lidar_assignment,
+    height,
+    width,
+):
+    """Build directed overlap priors and relative-geometry edge data."""
+    overlap = hsi_assignment.transpose() @ lidar_assignment
+    if issparse(overlap):
+        overlap = overlap.toarray()
+    overlap = np.asarray(overlap, dtype=np.float32)
+    lidar_to_hsi_overlap = overlap / np.maximum(
+        overlap.sum(axis=1, keepdims=True),
+        1e-6,
+    )
+    hsi_to_lidar_overlap = overlap.T / np.maximum(
+        overlap.T.sum(axis=1, keepdims=True),
+        1e-6,
+    )
+
+    hsi_centroids = superpixel_centroids(
+        hsi_assignment,
+        height,
+        width,
+    )
+    lidar_centroids = superpixel_centroids(
+        lidar_assignment,
+        height,
+        width,
+    )
+    lidar_to_hsi_delta = (
+        lidar_centroids[None, :, :]
+        - hsi_centroids[:, None, :]
+    )
+    hsi_to_lidar_delta = (
+        hsi_centroids[None, :, :]
+        - lidar_centroids[:, None, :]
+    )
+    lidar_to_hsi_distance = np.linalg.norm(
+        lidar_to_hsi_delta,
+        axis=-1,
+        keepdims=True,
+    )
+    hsi_to_lidar_distance = np.linalg.norm(
+        hsi_to_lidar_delta,
+        axis=-1,
+        keepdims=True,
+    )
+    return {
+        "lidar_to_hsi_overlap": (
+            lidar_to_hsi_overlap.astype(np.float32)
+        ),
+        "hsi_to_lidar_overlap": (
+            hsi_to_lidar_overlap.astype(np.float32)
+        ),
+        "lidar_to_hsi_edge_attr": np.concatenate(
+            [lidar_to_hsi_distance, lidar_to_hsi_delta],
+            axis=-1,
+        ).astype(np.float32),
+        "hsi_to_lidar_edge_attr": np.concatenate(
+            [hsi_to_lidar_distance, hsi_to_lidar_delta],
+            axis=-1,
+        ).astype(np.float32),
+    }
+
+
 def robust_bandwidth(values):
     values = np.asarray(values, dtype=np.float32)
     positive = values[values > 0]
@@ -1572,6 +1638,465 @@ class DualGSDGHGCNFusionNetwork(nn.Module):
         return self.classifier(fused_features)
 
 
+class DirectedOverlapAttention(nn.Module):
+    """One directed cross-modal relation with overlap/geometry bias."""
+
+    def __init__(
+        self,
+        target_channels,
+        source_channels,
+        out_channels,
+        overlap,
+        edge_attributes,
+        d_k=16,
+    ):
+        super().__init__()
+        self.query = nn.Linear(target_channels, d_k)
+        self.key = nn.Linear(source_channels, d_k)
+        self.value = nn.Linear(source_channels, out_channels)
+        self.edge_bias = nn.Sequential(
+            nn.Linear(edge_attributes.shape[-1], d_k),
+            nn.LeakyReLU(),
+            nn.Linear(d_k, 1),
+        )
+        self.overlap_beta = nn.Parameter(torch.tensor(1.0))
+        self.scale = d_k ** -0.5
+        self.register_buffer(
+            "overlap",
+            torch.as_tensor(overlap, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "edge_attributes",
+            torch.as_tensor(
+                edge_attributes,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.last_attention = None
+
+    def forward(self, target_features, source_features):
+        logits = (
+            self.query(target_features)
+            @ self.key(source_features).transpose(0, 1)
+            * self.scale
+        )
+        logits = (
+            logits
+            + self.overlap_beta
+            * torch.log(self.overlap + 1e-6)
+            + self.edge_bias(self.edge_attributes).squeeze(-1)
+        )
+        overlap_mask = self.overlap > 0
+        logits = logits.masked_fill(
+            ~overlap_mask,
+            torch.finfo(logits.dtype).min,
+        )
+        attention = torch.softmax(logits, dim=-1)
+        attention = attention * overlap_mask.to(attention.dtype)
+        attention = attention / (
+            attention.sum(dim=-1, keepdim=True) + 1e-6
+        )
+        self.last_attention = attention.detach()
+        return attention @ self.value(source_features)
+
+
+class RelationGate(nn.Module):
+    """Per-node competition between intra- and cross-modal messages."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(3 * channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, 2),
+        )
+        self.norm = nn.LayerNorm(channels)
+        self.last_relation_weights = None
+
+    def forward(
+        self,
+        residual,
+        intra_message,
+        cross_message,
+    ):
+        relation_weights = torch.softmax(
+            self.gate(
+                torch.cat(
+                    [residual, intra_message, cross_message],
+                    dim=-1,
+                )
+            ),
+            dim=-1,
+        )
+        self.last_relation_weights = relation_weights.detach()
+        return self.norm(
+            residual
+            + relation_weights[:, :1] * intra_message
+            + relation_weights[:, 1:] * cross_message
+        )
+
+
+class FourRelationLayer(nn.Module):
+    """HSI->HSI, LiDAR->LiDAR, and two directed overlap relations."""
+
+    def __init__(
+        self,
+        hsi_channels,
+        lidar_channels,
+        out_channels,
+        relation_data,
+        cross_d_k=16,
+    ):
+        super().__init__()
+        self.hsi_residual = (
+            nn.Identity()
+            if hsi_channels == out_channels
+            else nn.Linear(hsi_channels, out_channels)
+        )
+        self.lidar_residual = (
+            nn.Identity()
+            if lidar_channels == out_channels
+            else nn.Linear(lidar_channels, out_channels)
+        )
+        self.lidar_to_hsi = DirectedOverlapAttention(
+            target_channels=hsi_channels,
+            source_channels=lidar_channels,
+            out_channels=out_channels,
+            overlap=relation_data["lidar_to_hsi_overlap"],
+            edge_attributes=(
+                relation_data["lidar_to_hsi_edge_attr"]
+            ),
+            d_k=cross_d_k,
+        )
+        self.hsi_to_lidar = DirectedOverlapAttention(
+            target_channels=lidar_channels,
+            source_channels=hsi_channels,
+            out_channels=out_channels,
+            overlap=relation_data["hsi_to_lidar_overlap"],
+            edge_attributes=(
+                relation_data["hsi_to_lidar_edge_attr"]
+            ),
+            d_k=cross_d_k,
+        )
+        self.hsi_relation_gate = RelationGate(out_channels)
+        self.lidar_relation_gate = RelationGate(out_channels)
+
+    def forward(
+        self,
+        hsi_features,
+        lidar_features,
+        hsi_intra_message,
+        lidar_intra_message,
+    ):
+        lidar_to_hsi_message = self.lidar_to_hsi(
+            hsi_features,
+            lidar_features,
+        )
+        hsi_to_lidar_message = self.hsi_to_lidar(
+            lidar_features,
+            hsi_features,
+        )
+        hsi_updated = self.hsi_relation_gate(
+            self.hsi_residual(hsi_features),
+            hsi_intra_message,
+            lidar_to_hsi_message,
+        )
+        lidar_updated = self.lidar_relation_gate(
+            self.lidar_residual(lidar_features),
+            lidar_intra_message,
+            hsi_to_lidar_message,
+        )
+        return hsi_updated, lidar_updated
+
+
+class FourRelationHeterogeneousNetwork(nn.Module):
+    """Layer-wise four-relation HSI/LiDAR heterogeneous GSDG."""
+
+    def __init__(
+        self,
+        height,
+        width,
+        hsi_channels,
+        lidar_channels,
+        class_count,
+        hsi_assignment,
+        lidar_assignment,
+        hsi_superpixel_spatial_prior,
+        lidar_height_descriptors,
+        lidar_geometry_descriptors,
+        lidar_rag_candidates,
+        lidar_structure_prior,
+        dynamic_d_k=16,
+        dynamic_topk=8,
+        dynamic_tau=1.0,
+        gsdg_fusion_lambda=0.95,
+        modality_fusion_lambda=0.5,
+        hidden_dim=128,
+        graph_dim=64,
+        dropout=0.4,
+        lidar_edge_weight_beta=1.0,
+        hetero_layers=2,
+        cross_d_k=16,
+        pixel_fusion="adaptive",
+    ):
+        super().__init__()
+        if hetero_layers not in {1, 2}:
+            raise ValueError("hetero_layers must be 1 or 2.")
+        if pixel_fusion not in {"fixed", "adaptive"}:
+            raise ValueError(
+                "pixel_fusion must be fixed or adaptive."
+            )
+        self.height = height
+        self.width = width
+        self.hetero_layers = hetero_layers
+        self.pixel_fusion = pixel_fusion
+        self.modality_fusion_lambda = modality_fusion_lambda
+        self.gsdg_fusion_lambda = gsdg_fusion_lambda
+
+        self.hsi_gsdg = ModalitySuperpixelBranch(
+            height=height,
+            width=width,
+            in_channels=hsi_channels,
+            assignment=hsi_assignment,
+            superpixel_spatial_prior=hsi_superpixel_spatial_prior,
+            backbone="gsdg-graph",
+            graph_mode="dynamic",
+            dynamic_d_k=dynamic_d_k,
+            dynamic_topk=dynamic_topk,
+            dynamic_tau=dynamic_tau,
+            class_count=class_count,
+            use_prototype_hyperedges=False,
+            use_fdsm=True,
+            cnn_style="gsdg",
+            fusion_lambda=gsdg_fusion_lambda,
+            hidden_dim=hidden_dim,
+            graph_dim=graph_dim,
+            dropout=dropout,
+        )
+        # The heterogeneous architecture consumes learned dynamic edge
+        # weights, so its HSI Q/K builders remain differentiable.
+        for gat in (self.hsi_gsdg.gat1, self.hsi_gsdg.gat2):
+            for attention_layer in [
+                *gat.heads,
+                gat.output_attention,
+            ]:
+                attention_layer.use_edge_weights = True
+        self.hsi_graph_builder2 = DynamicGraphBuilder(
+            graph_dim,
+            hsi_assignment.shape[1],
+            d_k=dynamic_d_k,
+            topk=dynamic_topk,
+            tau=dynamic_tau,
+        )
+        self.lidar_gsdg = LiDARGeometryGSDGBranch(
+            height=height,
+            width=width,
+            in_channels=lidar_channels,
+            assignment=lidar_assignment,
+            height_descriptors=lidar_height_descriptors,
+            geometry_descriptors=lidar_geometry_descriptors,
+            rag_candidates=lidar_rag_candidates,
+            structure_prior=lidar_structure_prior,
+            dynamic_d_k=dynamic_d_k,
+            dynamic_topk=dynamic_topk,
+            dynamic_tau=dynamic_tau,
+            fusion_lambda=gsdg_fusion_lambda,
+            hidden_dim=hidden_dim,
+            graph_dim=graph_dim,
+            edge_weight_beta=lidar_edge_weight_beta,
+        )
+
+        relation_data = build_cross_modal_relation_data(
+            hsi_assignment,
+            lidar_assignment,
+            height,
+            width,
+        )
+        self.relation_layer1 = FourRelationLayer(
+            hidden_dim,
+            hidden_dim,
+            graph_dim,
+            relation_data,
+            cross_d_k=cross_d_k,
+        )
+        self.relation_layer2 = (
+            FourRelationLayer(
+                graph_dim,
+                graph_dim,
+                graph_dim,
+                relation_data,
+                cross_d_k=cross_d_k,
+            )
+            if hetero_layers == 2
+            else None
+        )
+        self.hsi_second_norm = nn.LayerNorm(graph_dim)
+        self.lidar_second_norm = nn.LayerNorm(graph_dim)
+        if pixel_fusion == "adaptive":
+            self.pixel_gate = nn.Sequential(
+                nn.Linear(3 * graph_dim, graph_dim),
+                nn.LeakyReLU(),
+                nn.Linear(graph_dim, 1),
+                nn.Sigmoid(),
+            )
+        else:
+            self.pixel_gate = None
+        self.classifier = nn.Linear(graph_dim, class_count)
+        self.last_pixel_gate = None
+
+    def _encode_hsi(self, hsi):
+        branch = self.hsi_gsdg
+        mapped = branch.feature_mapping(
+            hsi.permute(2, 0, 1).unsqueeze(0)
+        )
+        cnn_features = (
+            branch.cnn_branch(mapped)
+            .squeeze(0)
+            .permute(1, 2, 0)
+            .reshape(self.height * self.width, -1)
+        )
+        pixel_features = (
+            mapped.squeeze(0)
+            .permute(1, 2, 0)
+            .reshape(self.height * self.width, -1)
+        )
+        node_features = torch.sparse.mm(
+            branch.pooling_assignment.transpose(0, 1),
+            pixel_features,
+        )
+        return branch.frequency_modulation(node_features), cnn_features
+
+    def _encode_lidar(self, lidar):
+        branch = self.lidar_gsdg
+        mapped = branch.feature_mapping(
+            lidar.permute(2, 0, 1).unsqueeze(0)
+        )
+        cnn_features = branch.cnn_scale_fusion(
+            torch.cat(
+                [cnn_branch(mapped) for cnn_branch in branch.cnn_scales],
+                dim=1,
+            )
+        )
+        cnn_features = (
+            cnn_features.squeeze(0)
+            .permute(1, 2, 0)
+            .reshape(self.height * self.width, -1)
+        )
+        node_features = branch.height_descriptor_encoder(
+            branch.height_descriptors
+        )
+        return node_features, cnn_features
+
+    @staticmethod
+    def _project_nodes(branch, node_features):
+        pixel_features = torch.sparse.mm(
+            branch.projection_assignment,
+            node_features,
+        )
+        return branch.graph_projection(pixel_features)
+
+    def forward(self, hsi, lidar):
+        hsi_nodes, hsi_cnn = self._encode_hsi(hsi)
+        lidar_nodes, lidar_cnn = self._encode_lidar(lidar)
+
+        hsi_adjacency1 = self.hsi_gsdg.dynamic_graph_builder(
+            hsi_nodes,
+            self.hsi_gsdg.superpixel_spatial_prior,
+        )
+        hsi_intra1 = self.hsi_gsdg.gat1(
+            hsi_nodes,
+            hsi_adjacency1,
+        )
+        lidar_adjacency1 = self.lidar_gsdg.graph_builder1(
+            lidar_nodes
+        )
+        lidar_intra1 = self.lidar_gsdg.gat1(
+            lidar_nodes,
+            lidar_adjacency1,
+        )
+        hsi_nodes, lidar_nodes = self.relation_layer1(
+            hsi_nodes,
+            lidar_nodes,
+            hsi_intra1,
+            lidar_intra1,
+        )
+
+        # Cross-modal layer-1 output rebuilds both intra-modal graphs.
+        hsi_adjacency2 = self.hsi_graph_builder2(
+            hsi_nodes,
+            self.hsi_gsdg.superpixel_spatial_prior,
+        )
+        hsi_intra2 = self.hsi_gsdg.gat2(
+            hsi_nodes,
+            hsi_adjacency2,
+        )
+        lidar_adjacency2 = self.lidar_gsdg.graph_builder2(
+            lidar_nodes
+        )
+        lidar_intra2 = self.lidar_gsdg.gat2(
+            lidar_nodes,
+            lidar_adjacency2,
+        )
+
+        if self.relation_layer2 is None:
+            hsi_nodes = self.hsi_second_norm(
+                hsi_nodes + hsi_intra2
+            )
+            lidar_nodes = self.lidar_second_norm(
+                lidar_nodes + lidar_intra2
+            )
+        else:
+            hsi_nodes, lidar_nodes = self.relation_layer2(
+                hsi_nodes,
+                lidar_nodes,
+                hsi_intra2,
+                lidar_intra2,
+            )
+
+        hsi_graph = self._project_nodes(
+            self.hsi_gsdg,
+            hsi_nodes,
+        )
+        lidar_graph = self._project_nodes(
+            self.lidar_gsdg,
+            lidar_nodes,
+        )
+        hsi_pixels = (
+            self.gsdg_fusion_lambda * hsi_graph
+            + (1.0 - self.gsdg_fusion_lambda) * hsi_cnn
+        )
+        lidar_pixels = (
+            self.gsdg_fusion_lambda * lidar_graph
+            + (1.0 - self.gsdg_fusion_lambda) * lidar_cnn
+        )
+
+        if self.pixel_gate is None:
+            fused = (
+                self.modality_fusion_lambda * hsi_pixels
+                + (1.0 - self.modality_fusion_lambda)
+                * lidar_pixels
+            )
+        else:
+            pixel_gate = self.pixel_gate(
+                torch.cat(
+                    [
+                        hsi_pixels,
+                        lidar_pixels,
+                        torch.abs(hsi_pixels - lidar_pixels),
+                    ],
+                    dim=-1,
+                )
+            )
+            self.last_pixel_gate = pixel_gate.detach()
+            fused = (
+                pixel_gate * hsi_pixels
+                + (1.0 - pixel_gate) * lidar_pixels
+            )
+        return self.classifier(fused)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -1586,12 +2111,14 @@ def parse_args():
         choices=(
             "dual-superpixel",
             "dual-gsdg-hgcn-fusion",
+            "four-relation-hetero",
         ),
         default="dual-superpixel",
         help=(
             "Keep the configurable dual-superpixel model, or use HSI "
             "GSDG plus LiDAR Geometry-GSDG followed by HGCN-style "
-            "weighted modality fusion."
+            "weighted fusion or layer-wise four-relation heterogeneous "
+            "message passing."
         ),
     )
     parser.add_argument(
@@ -1619,6 +2146,7 @@ def parse_args():
         help=(
             "Segmentation used to construct LiDAR superpixels. Defaults "
             "to Geometry-SLIC for dual-gsdg-hgcn-fusion and "
+            "four-relation-hetero, and "
             "Felzenszwalb for the existing architecture."
         ),
     )
@@ -1745,6 +2273,32 @@ def parse_args():
             "used by dual-gsdg-hgcn-fusion."
         ),
     )
+    parser.add_argument(
+        "--hetero-layers",
+        type=int,
+        choices=(1, 2),
+        default=2,
+        help=(
+            "Number of four-relation updates. With one layer, GAT2 "
+            "remains modality-internal; with two, it also receives "
+            "directed cross-modal messages."
+        ),
+    )
+    parser.add_argument(
+        "--hetero-cross-dk",
+        type=int,
+        default=16,
+        help="Query/key and edge-MLP width of directed overlap attention.",
+    )
+    parser.add_argument(
+        "--pixel-fusion",
+        choices=("fixed", "adaptive"),
+        default="adaptive",
+        help=(
+            "Fixed HSI/LiDAR lambda or per-pixel learned modality gate "
+            "for four-relation-hetero."
+        ),
+    )
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--graph-dim", type=int, default=64)
     parser.add_argument(
@@ -1774,13 +2328,21 @@ def resolve_dataset_options(args):
     if args.lidar_segmentation is None:
         args.lidar_segmentation = (
             "slic"
-            if args.architecture == "dual-gsdg-hgcn-fusion"
+            if args.architecture
+            in {
+                "dual-gsdg-hgcn-fusion",
+                "four-relation-hetero",
+            }
             else "felzenszwalb"
         )
     if args.fusion_lambda is None:
         args.fusion_lambda = (
             0.95
-            if args.architecture == "dual-gsdg-hgcn-fusion"
+            if args.architecture
+            in {
+                "dual-gsdg-hgcn-fusion",
+                "four-relation-hetero",
+            }
             else 0.5
         )
     return config["loader_name"]
@@ -1985,7 +2547,10 @@ def prepare_data(args):
         hsi.shape[1],
         args,
     )
-    if args.architecture == "dual-gsdg-hgcn-fusion":
+    if args.architecture in {
+        "dual-gsdg-hgcn-fusion",
+        "four-relation-hetero",
+    }:
         lidar_features, lidar_structure = (
             prepare_lidar_geometry_structure(lidar, args)
         )
@@ -2031,6 +2596,16 @@ def experiment_name(args):
             f"topk-{args.dynamic_topk}_"
             f"gsdg-lambda-{args.fusion_lambda:g}_"
             f"modality-lambda-{args.modality_fusion_lambda:g}"
+        )
+    if args.architecture == "four-relation-hetero":
+        return (
+            f"{prefix}four_relation_hetero_"
+            f"layers-{args.hetero_layers}_"
+            f"crossdk-{args.hetero_cross_dk}_"
+            f"pixel-fusion-{args.pixel_fusion}_"
+            f"rag-{args.lidar_rag_hops}hop_"
+            f"topk-{args.dynamic_topk}_"
+            f"gsdg-lambda-{args.fusion_lambda:g}"
         )
     return (
         f"{prefix}dual_superpixel_{args.lidar_segmentation}_"
@@ -2104,6 +2679,28 @@ def train_one_run(
             gsdg_fusion_lambda=args.fusion_lambda,
             modality_fusion_lambda=args.modality_fusion_lambda,
             lidar_edge_weight_beta=args.lidar_edge_weight_beta,
+            **common_model_options,
+        ).to(device)
+    elif args.architecture == "four-relation-hetero":
+        model = FourRelationHeterogeneousNetwork(
+            lidar_height_descriptors=(
+                lidar_structure["height_descriptors"]
+            ),
+            lidar_geometry_descriptors=(
+                lidar_structure["geometry_descriptors"]
+            ),
+            lidar_rag_candidates=(
+                lidar_structure["rag_candidates"]
+            ),
+            lidar_structure_prior=(
+                lidar_structure["structure_prior"]
+            ),
+            gsdg_fusion_lambda=args.fusion_lambda,
+            modality_fusion_lambda=args.modality_fusion_lambda,
+            lidar_edge_weight_beta=args.lidar_edge_weight_beta,
+            hetero_layers=args.hetero_layers,
+            cross_d_k=args.hetero_cross_dk,
+            pixel_fusion=args.pixel_fusion,
             **common_model_options,
         ).to(device)
     else:
@@ -2256,7 +2853,11 @@ def main():
             "--backbone hypergraph."
         )
     if (
-        args.architecture == "dual-gsdg-hgcn-fusion"
+        args.architecture
+        in {
+            "dual-gsdg-hgcn-fusion",
+            "four-relation-hetero",
+        }
         and args.prototype_scope != "none"
     ):
         raise ValueError(
@@ -2264,13 +2865,19 @@ def main():
             "architecture; use --prototype-scope none."
         )
     if (
-        args.architecture == "dual-gsdg-hgcn-fusion"
+        args.architecture
+        in {
+            "dual-gsdg-hgcn-fusion",
+            "four-relation-hetero",
+        }
         and args.lidar_segmentation != "slic"
     ):
         raise ValueError(
-            "dual-gsdg-hgcn-fusion uses Geometry-SLIC; set "
+            "Geometry-GSDG architectures use Geometry-SLIC; set "
             "--lidar-segmentation slic."
         )
+    if args.hetero_cross_dk <= 0:
+        raise ValueError("--hetero-cross-dk must be positive.")
     if args.pca_components <= 0:
         raise ValueError("--pca-components must be positive.")
     if not args.scales or any(scale <= 0 for scale in args.scales):
@@ -2319,6 +2926,28 @@ def main():
         print(
             f"Within-branch GSDG graph/CNN lambda={args.fusion_lambda}"
         )
+    elif args.architecture == "four-relation-hetero":
+        print(
+            "Branches: HSI GSDG + LiDAR Geometry-GSDG + four "
+            "directed heterogeneous relations"
+        )
+        print(
+            "Relations: HSI->HSI spectral-spatial, LiDAR->LiDAR "
+            "height-geometry, and parameter-unshared HSI<->LiDAR "
+            "overlap attention"
+        )
+        print(
+            f"Heterogeneous updates={args.hetero_layers}, "
+            f"cross d_k={args.hetero_cross_dk}, "
+            f"pixel fusion={args.pixel_fusion}"
+        )
+        print(
+            "Cross edge data: overlap ratio + centroid distance + "
+            "relative y/x direction"
+        )
+        print(
+            f"Within-branch GSDG graph/CNN lambda={args.fusion_lambda}"
+        )
     else:
         print(f"Architecture backbone: {args.backbone}")
         print(f"Topology mode: {args.graph_mode}")
@@ -2335,10 +2964,17 @@ def main():
     elif args.architecture == "dual-superpixel":
         print("Propagation: ordinary graph multi-head GAT")
     if (
-        args.architecture == "dual-gsdg-hgcn-fusion"
+        args.architecture
+        in {
+            "dual-gsdg-hgcn-fusion",
+            "four-relation-hetero",
+        }
         or args.graph_mode == "dynamic"
     ):
-        if args.architecture == "dual-gsdg-hgcn-fusion":
+        if args.architecture in {
+            "dual-gsdg-hgcn-fusion",
+            "four-relation-hetero",
+        }:
             print(
                 f"Dynamic graph: d_k={args.dynamic_dk}, "
                 f"top-k={args.dynamic_topk}, tau={args.dynamic_tau}, "

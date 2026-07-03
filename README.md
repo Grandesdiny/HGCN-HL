@@ -5,7 +5,7 @@ and LiDAR data.
 ## Step-by-step demo
 
 `train_original.py` remains the Stage-0 fixed-incidence HGCN-HL baseline.
-`demo_train.py` is currently Stage 7:
+`demo_train.py` is currently Stage 8:
 
 ```bash
 python demo_train.py \
@@ -17,7 +17,8 @@ python demo_train.py \
   --lidar-rag-hops 2 \
   --lidar-height-knn-k 5 \
   --lidar-modulation rag-lowhigh \
-  --cross-modal-interaction overlap-gate \
+  --cross-modal-interaction overlap-qk-condition \
+  --overlap-metric iou \
   --fdsm-scope hsi \
   --device cuda
 ```
@@ -38,12 +39,18 @@ uses a geometry-gated decomposition into RAG-smoothed low-frequency and
 RAG-residual high-frequency node features. The optional
 `--lidar-graph-prior rag-height-knn` restricts LiDAR dynamic Top-k edges with
 a local RAG and elevation similarity. `--cross-modal-interaction
-overlap-gate` exchanges information between GAT stages using the spatial
-overlap of the independent HSI and LiDAR superpixels; `overlap-attention`
-provides the attention-based alternative. Each option defaults to `none` or
-the earlier centroid prior for ablation compatibility. The demo does not use
-a hypergraph or the GSDG CNN. Outputs are isolated under
-`model_demo/stage7_optional_lidar_rag_lowhigh`.
+overlap-qk-condition` aggregates the other modality through the directional
+superpixel-overlap matrix after GAT1 and injects that context into both
+modalities' independent Q/K projections when rebuilding the second graph.
+It does not directly add cross-modal messages to node features.
+`--overlap-metric iou` computes intersection over union before normalizing
+the HSI-to-LiDAR and LiDAR-to-HSI aggregation rows; `coverage` retains the
+earlier intersection-count weighting.
+`overlap-gate` and `overlap-attention` remain available as earlier
+interaction ablations. Each option defaults to `none` or the earlier
+centroid prior for compatibility. The demo does not use a hypergraph or the
+GSDG CNN. Outputs are isolated under
+`model_demo/stage8_overlap_conditioned_qk`.
 
 ## Supported datasets
 
@@ -186,6 +193,41 @@ hyperedges are intentionally excluded from this option. LiDAR geometry can
 be controlled with `--lidar-geometry-window`, `--lidar-rag-hops`,
 `--lidar-{spatial,height,roughness,boundary}-weight`, and
 `--lidar-edge-weight-beta`.
+
+## Four-relation heterogeneous GSDG
+
+`--architecture four-relation-hetero` combines the HSI GSDG encoder and
+LiDAR Geometry-GSDG encoder with four directed relations:
+
+```text
+HSI   -- spectral-spatial --> HSI
+LiDAR -- height-geometry  --> LiDAR
+HSI   -- overlap          --> LiDAR
+LiDAR -- overlap          --> HSI
+```
+
+The two cross-modal directions do not share Q/K/V projections or edge MLPs.
+Their attention logits combine learned feature affinity, log superpixel
+overlap, centroid distance, and relative x/y direction. A per-node relation
+gate then performs a two-way softmax over the intra-modal and cross-modal
+messages. With `--hetero-layers 2`, the first gated update rebuilds both
+modality-specific dynamic graphs before GAT2, and a second four-relation
+update follows GAT2. Use `--hetero-layers 1` for the one-layer ablation.
+
+`--pixel-fusion adaptive` learns one HSI/LiDAR gate for every pixel from the
+two projected features and their absolute difference. Use `fixed` to recover
+the scalar `--modality-fusion-lambda` baseline.
+
+```bash
+python train.py \
+  --architecture four-relation-hetero \
+  --dataset muufl \
+  --train-samples-per-class 20 \
+  --hetero-layers 2 \
+  --hetero-cross-dk 16 \
+  --pixel-fusion adaptive \
+  --device cuda
+```
 
 ## Original HGCN-HL
 
