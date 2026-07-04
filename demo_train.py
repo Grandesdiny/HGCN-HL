@@ -16,11 +16,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.sparse import hstack, issparse
+import torch.nn.functional as F
+from scipy.sparse import coo_matrix, hstack, issparse
 from sklearn.decomposition import PCA
 
 from train import (
-    CommonRefinementCellLayer,
     DATASET_CONFIG,
     DynamicGraphBuilder,
     FDSM,
@@ -33,9 +33,11 @@ from train import (
     build_superpixel_spatial_prior,
     minmax_normalize,
     normalized_sparse_assignments,
+    scipy_sparse_to_torch,
     set_seed,
     split_fixed_samples_per_class,
     superpixel_height_distribution,
+    symmetrically_normalize_sparse_adjacency,
 )
 from utils import (
     get_felzenszwalb_Segs,
@@ -169,6 +171,53 @@ def parse_args():
             "the existing second-layer graph construction. Default: none."
         ),
     )
+    parser.add_argument(
+        "--cell-pixel-descriptor",
+        choices=("none", "mean"),
+        default="none",
+        help=(
+            "Optionally append mean HSI-PCA and LiDAR pixels inside "
+            "each intersection cell to its node encoder. Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--cell-edge-mode",
+        choices=("binary", "spectral-height-boundary"),
+        default="binary",
+        help=(
+            "Binary 1-hop cell RAG or a sparse RAG weighted by cell "
+            "spectral angle, mean-height difference, and shared-boundary "
+            "LiDAR gradient. Default: binary."
+        ),
+    )
+    parser.add_argument(
+        "--cell-interaction-stages",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help=(
+            "Run cell interaction only after GAT1, or again after GAT2. "
+            "Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--cell-output-branch",
+        choices=("none", "fixed"),
+        default="none",
+        help=(
+            "Optionally project the latest cell features to pixels as "
+            "a third fixed-weight graph branch. Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--cell-output-weight",
+        type=float,
+        default=1.0 / 3.0,
+        help="Cell pixel-branch weight when --cell-output-branch fixed.",
+    )
+    parser.add_argument("--cell-sam-weight", type=float, default=1.0)
+    parser.add_argument("--cell-height-weight", type=float, default=1.0)
+    parser.add_argument("--cell-boundary-weight", type=float, default=1.0)
     parser.add_argument(
         "--fdsm-scope",
         choices=("none", "hsi"),
@@ -591,6 +640,419 @@ def build_cross_modal_overlap(
         hsi_to_lidar.astype(np.float32),
         lidar_to_hsi.astype(np.float32),
     )
+
+
+def aggregate_cell_pixel_means(
+    pixel_features,
+    pixel_cell_index,
+    cell_count,
+):
+    """Average a pixel feature cube inside every intersection cell."""
+    flat_features = np.asarray(
+        pixel_features,
+        dtype=np.float32,
+    ).reshape(-1, pixel_features.shape[-1])
+    pixel_cell_index = np.asarray(
+        pixel_cell_index,
+        dtype=np.int64,
+    ).reshape(-1)
+    sums = np.zeros(
+        (cell_count, flat_features.shape[1]),
+        dtype=np.float32,
+    )
+    np.add.at(sums, pixel_cell_index, flat_features)
+    counts = np.bincount(
+        pixel_cell_index,
+        minlength=cell_count,
+    ).astype(np.float32)
+    return sums / np.maximum(counts[:, None], 1.0)
+
+
+def attach_cell_pixel_descriptors(
+    cell_data,
+    hsi_features,
+    lidar_features,
+):
+    """Attach standardized mean HSI/LiDAR pixels to cell nodes."""
+    cell_count = cell_data["cell_count"]
+    pixel_cell_index = cell_data["pixel_cell_index"]
+    hsi_cell_mean = aggregate_cell_pixel_means(
+        hsi_features,
+        pixel_cell_index,
+        cell_count,
+    )
+    lidar_cell_mean = aggregate_cell_pixel_means(
+        lidar_features,
+        pixel_cell_index,
+        cell_count,
+    )
+    raw_descriptor = np.concatenate(
+        [hsi_cell_mean, lidar_cell_mean],
+        axis=1,
+    ).astype(np.float32)
+    descriptor_mean = raw_descriptor.mean(axis=0, keepdims=True)
+    descriptor_std = raw_descriptor.std(axis=0, keepdims=True)
+    cell_data["pixel_descriptors"] = (
+        (raw_descriptor - descriptor_mean)
+        / np.maximum(descriptor_std, 1e-6)
+    ).astype(np.float32)
+    cell_data["raw_pixel_descriptors"] = raw_descriptor
+
+
+def build_sparse_cell_boundary_gradient(
+    cell_segments,
+    elevation,
+):
+    """Return average elevation gradient for each adjacent cell pair."""
+    cell_count = int(cell_segments.max()) + 1
+    gradient_y, gradient_x = np.gradient(
+        np.asarray(elevation, dtype=np.float32)
+    )
+    gradient = np.sqrt(
+        gradient_x * gradient_x + gradient_y * gradient_y
+    )
+    key_parts = []
+    value_parts = []
+    for first, second, first_gradient, second_gradient in (
+        (
+            cell_segments[:, :-1],
+            cell_segments[:, 1:],
+            gradient[:, :-1],
+            gradient[:, 1:],
+        ),
+        (
+            cell_segments[:-1, :],
+            cell_segments[1:, :],
+            gradient[:-1, :],
+            gradient[1:, :],
+        ),
+    ):
+        boundary = first != second
+        if not np.any(boundary):
+            continue
+        left = first[boundary].astype(np.int64)
+        right = second[boundary].astype(np.int64)
+        lower = np.minimum(left, right)
+        upper = np.maximum(left, right)
+        key_parts.append(lower * cell_count + upper)
+        value_parts.append(
+            0.5
+            * (
+                first_gradient[boundary]
+                + second_gradient[boundary]
+            )
+        )
+    if not key_parts:
+        return np.empty(0, dtype=np.int64), np.empty(
+            0,
+            dtype=np.float32,
+        )
+    keys = np.concatenate(key_parts)
+    values = np.concatenate(value_parts).astype(np.float32)
+    unique_keys, inverse = np.unique(keys, return_inverse=True)
+    boundary_sum = np.zeros(unique_keys.size, dtype=np.float32)
+    boundary_count = np.zeros(unique_keys.size, dtype=np.float32)
+    np.add.at(boundary_sum, inverse, values)
+    np.add.at(boundary_count, inverse, 1.0)
+    return unique_keys, boundary_sum / np.maximum(
+        boundary_count,
+        1.0,
+    )
+
+
+def build_multimodal_weighted_cell_rag(
+    cell_data,
+    hsi,
+    lidar,
+    height,
+    width,
+    sam_weight=1.0,
+    height_weight=1.0,
+    boundary_weight=1.0,
+):
+    """Weight the 1-hop cell RAG by spectrum, height, and boundary."""
+    cell_count = cell_data["cell_count"]
+    pixel_cell_index = cell_data["pixel_cell_index"]
+    cell_segments = pixel_cell_index.reshape(height, width)
+    hsi_cell_mean = aggregate_cell_pixel_means(
+        hsi,
+        pixel_cell_index,
+        cell_count,
+    )
+    lidar_cell_mean = aggregate_cell_pixel_means(
+        lidar[:, :, None],
+        pixel_cell_index,
+        cell_count,
+    )[:, 0]
+
+    binary_rag = cell_data["cell_rag_adjacency"].tocoo()
+    rows = binary_rag.row.astype(np.int64)
+    columns = binary_rag.col.astype(np.int64)
+    nonself = rows != columns
+    edge_rows = rows[nonself]
+    edge_columns = columns[nonself]
+
+    numerator = np.sum(
+        hsi_cell_mean[edge_rows] * hsi_cell_mean[edge_columns],
+        axis=1,
+    )
+    denominator = (
+        np.linalg.norm(hsi_cell_mean[edge_rows], axis=1)
+        * np.linalg.norm(hsi_cell_mean[edge_columns], axis=1)
+    )
+    spectral_angle = np.arccos(
+        np.clip(
+            numerator / np.maximum(denominator, 1e-8),
+            -1.0,
+            1.0,
+        )
+    ).astype(np.float32)
+    height_difference = np.abs(
+        lidar_cell_mean[edge_rows]
+        - lidar_cell_mean[edge_columns]
+    ).astype(np.float32)
+
+    boundary_keys, boundary_values = (
+        build_sparse_cell_boundary_gradient(
+            cell_segments,
+            lidar,
+        )
+    )
+    lower = np.minimum(edge_rows, edge_columns)
+    upper = np.maximum(edge_rows, edge_columns)
+    edge_keys = lower * cell_count + upper
+    boundary_positions = np.searchsorted(
+        boundary_keys,
+        edge_keys,
+    )
+    if (
+        boundary_keys.size == 0
+        or np.any(boundary_positions >= boundary_keys.size)
+        or not np.array_equal(
+            boundary_keys[boundary_positions],
+            edge_keys,
+        )
+    ):
+        raise RuntimeError(
+            "Cell RAG edge does not match a shared pixel boundary."
+        )
+    boundary_gradient = boundary_values[
+        boundary_positions
+    ].astype(np.float32)
+
+    def scaled(values):
+        positive = values[values > 0]
+        bandwidth = (
+            float(np.median(positive))
+            if positive.size
+            else 1.0
+        )
+        return values / max(bandwidth, 1e-6)
+
+    edge_weights = np.exp(
+        -sam_weight * scaled(spectral_angle)
+        -height_weight * scaled(height_difference)
+        -boundary_weight * scaled(boundary_gradient)
+    ).astype(np.float32)
+    values = np.ones(rows.size, dtype=np.float32)
+    values[nonself] = edge_weights
+    weighted_rag = coo_matrix(
+        (values, (rows, columns)),
+        shape=(cell_count, cell_count),
+        dtype=np.float32,
+    ).tocsr()
+    cell_data["cell_weighted_adjacency"] = (
+        symmetrically_normalize_sparse_adjacency(weighted_rag)
+    )
+    if edge_weights.size:
+        cell_data["cell_weight_stats"] = {
+            "minimum": float(edge_weights.min()),
+            "mean": float(edge_weights.mean()),
+            "maximum": float(edge_weights.max()),
+        }
+    else:
+        cell_data["cell_weight_stats"] = {
+            "minimum": 1.0,
+            "mean": 1.0,
+            "maximum": 1.0,
+        }
+
+
+class IntersectionCellRAGLayer(nn.Module):
+    """Parent-cell-parent exchange with optional pixel descriptors."""
+
+    def __init__(
+        self,
+        channels,
+        cell_data,
+        use_pixel_descriptors=False,
+        edge_mode="binary",
+    ):
+        super().__init__()
+        self.hsi_node_count = int(
+            np.max(cell_data["hsi_parent"])
+        ) + 1
+        self.lidar_node_count = int(
+            np.max(cell_data["lidar_parent"])
+        ) + 1
+        for name, value, dtype in (
+            ("hsi_parent", cell_data["hsi_parent"], torch.long),
+            ("lidar_parent", cell_data["lidar_parent"], torch.long),
+            (
+                "hsi_coverage",
+                cell_data["hsi_coverage"],
+                torch.float32,
+            ),
+            (
+                "lidar_coverage",
+                cell_data["lidar_coverage"],
+                torch.float32,
+            ),
+            (
+                "cell_attributes",
+                cell_data["attributes"],
+                torch.float32,
+            ),
+        ):
+            self.register_buffer(
+                name,
+                torch.as_tensor(value, dtype=dtype),
+                persistent=False,
+            )
+        if use_pixel_descriptors:
+            if "pixel_descriptors" not in cell_data:
+                raise ValueError(
+                    "Cell pixel descriptors were not prepared."
+                )
+            self.register_buffer(
+                "pixel_descriptors",
+                torch.as_tensor(
+                    cell_data["pixel_descriptors"],
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+            descriptor_channels = cell_data[
+                "pixel_descriptors"
+            ].shape[1]
+        else:
+            self.pixel_descriptors = None
+            descriptor_channels = 0
+
+        adjacency_key = (
+            "cell_rag_adjacency"
+            if edge_mode == "binary"
+            else "cell_weighted_adjacency"
+        )
+        if adjacency_key not in cell_data:
+            raise ValueError(
+                f"Missing {adjacency_key} for cell edge mode."
+            )
+        self.register_buffer(
+            "cell_adjacency",
+            scipy_sparse_to_torch(cell_data[adjacency_key]),
+            persistent=False,
+        )
+        attribute_channels = cell_data["attributes"].shape[1]
+        self.cell_encoder = nn.Sequential(
+            nn.Linear(
+                2 * channels
+                + attribute_channels
+                + descriptor_channels,
+                channels,
+            ),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+            nn.LeakyReLU(),
+        )
+        self.cell_graph_projection = nn.Linear(
+            channels,
+            channels,
+            bias=False,
+        )
+        self.cell_graph_norm = nn.LayerNorm(channels)
+        self.hsi_gate = nn.Sequential(
+            nn.Linear(3 * channels, channels),
+            nn.Sigmoid(),
+        )
+        self.lidar_gate = nn.Sequential(
+            nn.Linear(3 * channels, channels),
+            nn.Sigmoid(),
+        )
+        self.hsi_norm = nn.LayerNorm(channels)
+        self.lidar_norm = nn.LayerNorm(channels)
+        self.last_cell_features = None
+        self.last_hsi_gate = None
+        self.last_lidar_gate = None
+
+    def forward(
+        self,
+        hsi_nodes,
+        lidar_nodes,
+        hsi_intra,
+        lidar_intra,
+    ):
+        if hsi_nodes.shape[0] != self.hsi_node_count:
+            raise ValueError("Unexpected number of HSI parent nodes.")
+        if lidar_nodes.shape[0] != self.lidar_node_count:
+            raise ValueError("Unexpected number of LiDAR parent nodes.")
+        cell_inputs = [
+            hsi_intra.index_select(0, self.hsi_parent),
+            lidar_intra.index_select(0, self.lidar_parent),
+            self.cell_attributes,
+        ]
+        if self.pixel_descriptors is not None:
+            cell_inputs.append(self.pixel_descriptors)
+        cell_features = self.cell_encoder(
+            torch.cat(cell_inputs, dim=-1)
+        )
+        cell_graph_message = torch.sparse.mm(
+            self.cell_adjacency,
+            self.cell_graph_projection(cell_features),
+        )
+        cell_features = self.cell_graph_norm(
+            cell_features + F.leaky_relu(cell_graph_message)
+        )
+
+        hsi_message = torch.zeros_like(hsi_nodes)
+        hsi_message.index_add_(
+            0,
+            self.hsi_parent,
+            cell_features * self.hsi_coverage.unsqueeze(1),
+        )
+        lidar_message = torch.zeros_like(lidar_nodes)
+        lidar_message.index_add_(
+            0,
+            self.lidar_parent,
+            cell_features * self.lidar_coverage.unsqueeze(1),
+        )
+        hsi_gate = self.hsi_gate(
+            torch.cat(
+                [hsi_nodes, hsi_intra, hsi_message],
+                dim=-1,
+            )
+        )
+        lidar_gate = self.lidar_gate(
+            torch.cat(
+                [lidar_nodes, lidar_intra, lidar_message],
+                dim=-1,
+            )
+        )
+        self.last_cell_features = cell_features.detach()
+        self.last_hsi_gate = hsi_gate.detach()
+        self.last_lidar_gate = lidar_gate.detach()
+        return (
+            self.hsi_norm(
+                hsi_nodes + hsi_intra + hsi_gate * hsi_message
+            ),
+            self.lidar_norm(
+                lidar_nodes
+                + lidar_intra
+                + lidar_gate * lidar_message
+            ),
+            cell_features,
+        )
 
 
 class OverlapCrossModalInteraction(nn.Module):
@@ -1037,6 +1499,22 @@ class ModalityGSDGGraphEncoder(nn.Module):
         rebuild_graph=False,
         cross_context=None,
     ):
+        graph_features = self.apply_gat2_nodes(
+            first_graph_features,
+            adjacency=adjacency,
+            rebuild_graph=rebuild_graph,
+            cross_context=cross_context,
+        )
+        return self.project_nodes(graph_features)
+
+    def apply_gat2_nodes(
+        self,
+        first_graph_features,
+        adjacency=None,
+        rebuild_graph=False,
+        cross_context=None,
+        return_intra=False,
+    ):
         if cross_context is not None:
             if self.cross_conditioned_graph_builder is None:
                 raise ValueError(
@@ -1054,10 +1532,12 @@ class ModalityGSDGGraphEncoder(nn.Module):
             )
         if adjacency is None:
             raise ValueError("GAT2 requires an adjacency matrix.")
-        graph_features = (
-            self.gat2(first_graph_features, adjacency)
-            + first_graph_features
-        )
+        intra_features = self.gat2(first_graph_features, adjacency)
+        if return_intra:
+            return intra_features
+        return intra_features + first_graph_features
+
+    def project_nodes(self, graph_features):
         pixel_graph_features = torch.sparse.mm(
             self.projection_assignment,
             graph_features,
@@ -1101,6 +1581,11 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         overlap_metric="iou",
         cell_interaction="none",
         cell_data=None,
+        cell_pixel_descriptor="none",
+        cell_edge_mode="binary",
+        cell_interaction_stages=1,
+        cell_output_branch="none",
+        cell_output_weight=1.0 / 3.0,
         fdsm_scope="none",
         lidar_modulation="none",
         lidar_rag_adjacency=None,
@@ -1114,6 +1599,9 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.cross_modal_interaction = cross_modal_interaction
         self.overlap_metric = overlap_metric
         self.cell_interaction = cell_interaction
+        self.cell_interaction_stages = cell_interaction_stages
+        self.cell_output_branch = cell_output_branch
+        self.cell_output_weight = cell_output_weight
         use_qk_condition = (
             cross_modal_interaction == "overlap-qk-condition"
         )
@@ -1210,13 +1698,66 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 raise ValueError(
                     "cell_data is required for cell interaction."
                 )
-            self.cell_layer = CommonRefinementCellLayer(
-                hidden_dim,
-                cell_data,
-                use_cell_rag=True,
+            cell_layer_options = {
+                "channels": hidden_dim,
+                "cell_data": cell_data,
+                "use_pixel_descriptors": (
+                    cell_pixel_descriptor == "mean"
+                ),
+                "edge_mode": cell_edge_mode,
+            }
+            self.cell_layer = IntersectionCellRAGLayer(
+                **cell_layer_options,
             )
+            self.cell_layer2 = (
+                IntersectionCellRAGLayer(
+                    **cell_layer_options,
+                )
+                if cell_interaction_stages == 2
+                else None
+            )
+            if cell_output_branch == "fixed":
+                pixel_cell_index = np.asarray(
+                    cell_data["pixel_cell_index"],
+                    dtype=np.int64,
+                )
+                pixel_indices = np.arange(
+                    pixel_cell_index.size,
+                    dtype=np.int64,
+                )
+                cell_assignment = coo_matrix(
+                    (
+                        np.ones(
+                            pixel_cell_index.size,
+                            dtype=np.float32,
+                        ),
+                        (pixel_indices, pixel_cell_index),
+                    ),
+                    shape=(
+                        pixel_cell_index.size,
+                        cell_data["cell_count"],
+                    ),
+                    dtype=np.float32,
+                )
+                self.register_buffer(
+                    "cell_projection_assignment",
+                    scipy_sparse_to_torch(cell_assignment),
+                    persistent=False,
+                )
+            else:
+                self.register_buffer(
+                    "cell_projection_assignment",
+                    None,
+                    persistent=False,
+                )
         elif cell_interaction == "none":
             self.cell_layer = None
+            self.cell_layer2 = None
+            self.register_buffer(
+                "cell_projection_assignment",
+                None,
+                persistent=False,
+            )
         else:
             raise ValueError(
                 "cell_interaction must be none or rag."
@@ -1249,7 +1790,11 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             lidar_features, _ = self.lidar_graph.apply_gat1(
                 lidar_nodes
             )
-            hsi_features, lidar_features = self.cell_layer(
+            (
+                hsi_features,
+                lidar_features,
+                latest_cell_features,
+            ) = self.cell_layer(
                 hsi_nodes,
                 lidar_nodes,
                 hsi_features,
@@ -1265,17 +1810,15 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 lidar_cross_context = (
                     self.lidar_to_hsi_overlap @ hsi_features
                 )
-                hsi_graph_features = (
-                    self.hsi_graph.apply_gat2_and_project(
-                        hsi_features,
-                        cross_context=hsi_cross_context,
-                    )
+                hsi_intra2 = self.hsi_graph.apply_gat2_nodes(
+                    hsi_features,
+                    cross_context=hsi_cross_context,
+                    return_intra=True,
                 )
-                lidar_graph_features = (
-                    self.lidar_graph.apply_gat2_and_project(
-                        lidar_features,
-                        cross_context=lidar_cross_context,
-                    )
+                lidar_intra2 = self.lidar_graph.apply_gat2_nodes(
+                    lidar_features,
+                    cross_context=lidar_cross_context,
+                    return_intra=True,
                 )
             else:
                 if self.cross_interaction is not None:
@@ -1285,18 +1828,36 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                             lidar_features,
                         )
                     )
-                hsi_graph_features = (
-                    self.hsi_graph.apply_gat2_and_project(
-                        hsi_features,
-                        rebuild_graph=True,
-                    )
+                hsi_intra2 = self.hsi_graph.apply_gat2_nodes(
+                    hsi_features,
+                    rebuild_graph=True,
+                    return_intra=True,
                 )
-                lidar_graph_features = (
-                    self.lidar_graph.apply_gat2_and_project(
-                        lidar_features,
-                        rebuild_graph=True,
-                    )
+                lidar_intra2 = self.lidar_graph.apply_gat2_nodes(
+                    lidar_features,
+                    rebuild_graph=True,
+                    return_intra=True,
                 )
+            if self.cell_layer2 is not None:
+                (
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                    latest_cell_features,
+                ) = self.cell_layer2(
+                    hsi_features,
+                    lidar_features,
+                    hsi_intra2,
+                    lidar_intra2,
+                )
+            else:
+                hsi_final_nodes = hsi_features + hsi_intra2
+                lidar_final_nodes = lidar_features + lidar_intra2
+            hsi_graph_features = self.hsi_graph.project_nodes(
+                hsi_final_nodes
+            )
+            lidar_graph_features = self.lidar_graph.project_nodes(
+                lidar_final_nodes
+            )
         elif self.cross_modal_interaction == "none":
             # Preserve the original Stage-3 path exactly.
             hsi_graph_features = self.hsi_graph(hsi)
@@ -1358,6 +1919,15 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             + (1.0 - self.graph_modality_lambda)
             * lidar_graph_features
         )
+        if self.cell_projection_assignment is not None:
+            cell_pixel_features = torch.sparse.mm(
+                self.cell_projection_assignment,
+                latest_cell_features,
+            )
+            graph_features = (
+                (1.0 - self.cell_output_weight) * graph_features
+                + self.cell_output_weight * cell_pixel_features
+            )
 
         mapped_joint = self.joint_feature_mapping(
             joint_input.permute(2, 0, 1).unsqueeze(0)
@@ -1448,6 +2018,20 @@ def prepare_data(args, config):
             hsi.shape[0],
             hsi.shape[1],
         )
+        if (
+            args.cell_edge_mode
+            == "spectral-height-boundary"
+        ):
+            build_multimodal_weighted_cell_rag(
+                cell_data,
+                hsi,
+                lidar,
+                hsi.shape[0],
+                hsi.shape[1],
+                sam_weight=args.cell_sam_weight,
+                height_weight=args.cell_height_weight,
+                boundary_weight=args.cell_boundary_weight,
+            )
 
     height, width, bands = hsi.shape
     component_count = min(args.pca_components, bands)
@@ -1465,6 +2049,15 @@ def prepare_data(args, config):
         axis=2,
     ).astype(np.float32)
     lidar_features = lidar[:, :, np.newaxis].astype(np.float32)
+    if (
+        cell_data is not None
+        and args.cell_pixel_descriptor == "mean"
+    ):
+        attach_cell_pixel_descriptors(
+            cell_data,
+            reduced_hsi,
+            lidar_features,
+        )
     return (
         reduced_hsi,
         lidar_features,
@@ -1554,6 +2147,11 @@ def train_one_run(
             overlap_metric=args.overlap_metric,
             cell_interaction=args.cell_interaction,
             cell_data=cell_data,
+            cell_pixel_descriptor=args.cell_pixel_descriptor,
+            cell_edge_mode=args.cell_edge_mode,
+            cell_interaction_stages=args.cell_interaction_stages,
+            cell_output_branch=args.cell_output_branch,
+            cell_output_weight=args.cell_output_weight,
             fdsm_scope=args.fdsm_scope,
             **common_options,
         ).to(device)
@@ -1636,6 +2234,10 @@ def train_one_run(
         f"cross-{args.cross_modal_interaction}_"
         f"overlap-{args.overlap_metric}_"
         f"cell-{args.cell_interaction}_"
+        f"celldesc-{args.cell_pixel_descriptor}_"
+        f"celledge-{args.cell_edge_mode}_"
+        f"cellstages-{args.cell_interaction_stages}_"
+        f"cellout-{args.cell_output_branch}_"
         f"fdsm-{args.fdsm_scope}_"
         f"lidarmod-{args.lidar_modulation}_"
         f"run{run_index + 1}.pt"
@@ -1713,6 +2315,31 @@ def validate_args(args):
             "--cell-interaction rag currently requires exactly one "
             "superpixel scale."
         )
+    cell_enhancement_requested = (
+        args.cell_pixel_descriptor != "none"
+        or args.cell_edge_mode != "binary"
+        or args.cell_interaction_stages != 1
+        or args.cell_output_branch != "none"
+    )
+    if (
+        cell_enhancement_requested
+        and args.cell_interaction != "rag"
+    ):
+        raise ValueError(
+            "Cell descriptor, weighted edges, two-stage interaction, "
+            "and cell output require --cell-interaction rag."
+        )
+    if not 0.0 <= args.cell_output_weight <= 1.0:
+        raise ValueError("--cell-output-weight must be between 0 and 1.")
+    if any(
+        weight < 0
+        for weight in (
+            args.cell_sam_weight,
+            args.cell_height_weight,
+            args.cell_boundary_weight,
+        )
+    ):
+        raise ValueError("Cell edge weights must be nonnegative.")
     if args.hidden_dim <= 0:
         raise ValueError("--hidden-dim must be positive.")
     if not 0.0 <= args.dropout < 1.0:
@@ -1795,6 +2422,29 @@ def main():
                 "excluding self="
                 f"{cell_data['cell_rag_edge_count']}"
             )
+            print(
+                "Cell enhancements: pixel descriptor="
+                f"{args.cell_pixel_descriptor}, edge mode="
+                f"{args.cell_edge_mode}, interaction stages="
+                f"{args.cell_interaction_stages}, pixel output="
+                f"{args.cell_output_branch}"
+            )
+            if (
+                args.cell_edge_mode
+                == "spectral-height-boundary"
+            ):
+                weight_stats = cell_data["cell_weight_stats"]
+                print(
+                    "Cell multimodal edge weights: "
+                    f"min={weight_stats['minimum']:.4f}, "
+                    f"mean={weight_stats['mean']:.4f}, "
+                    f"max={weight_stats['maximum']:.4f}"
+                )
+            if args.cell_output_branch == "fixed":
+                print(
+                    "Cell third pixel branch weight: "
+                    f"{args.cell_output_weight:g}"
+                )
         print(f"HSI FDSM: {args.fdsm_scope}")
         print(f"LiDAR modulation: {args.lidar_modulation}")
     else:
@@ -1871,6 +2521,10 @@ def main():
         f"cross-{args.cross_modal_interaction}_"
         f"overlap-{args.overlap_metric}_"
         f"cell-{args.cell_interaction}_"
+        f"celldesc-{args.cell_pixel_descriptor}_"
+        f"celledge-{args.cell_edge_mode}_"
+        f"cellstages-{args.cell_interaction_stages}_"
+        f"cellout-{args.cell_output_branch}_"
         f"fdsm-{args.fdsm_scope}_"
         f"lidarmod-{args.lidar_modulation}_results.json"
     )

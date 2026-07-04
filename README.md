@@ -39,6 +39,31 @@ second-layer Q/K builders. Thus the original joint CNN, HSI FDSM, LiDAR
 RAG-height-KNN, LiDAR low/high modulation, and overlap-Q/K condition remain
 active. This initial cell mode requires one superpixel scale.
 
+Four enhancements can be independently enabled on top of that command:
+
+```bash
+--cell-pixel-descriptor mean \
+--cell-edge-mode spectral-height-boundary \
+--cell-interaction-stages 2 \
+--cell-output-branch fixed \
+--cell-output-weight 0.3333333333
+```
+
+`mean` adds the mean HSI-PCA vector and mean LiDAR value of the pixels
+inside each cell. `spectral-height-boundary` replaces binary cell edge
+values with sparse weights based on normalized spectral angle, mean-height
+difference, and average DSM gradient along the shared cell boundary. Two
+interaction stages run separate parent-cell-parent layers after GAT1 and
+GAT2. The fixed output branch projects the latest cell features back with
+the pixel-to-cell assignment and mixes them with the already fused
+HSI/LiDAR graph output. The three edge terms can be controlled with
+`--cell-sam-weight`, `--cell-height-weight`, and
+`--cell-boundary-weight`.
+
+All four enhancements are disabled by default: descriptor `none`, edge
+mode `binary`, one interaction stage, and cell output `none`. They require
+`--cell-interaction rag`.
+
 The demo keeps the original
 joint `PCA(HSI)+LiDAR` input, two WMF blocks, original `5x5/5x5` CNN,
 lambda fusion, and classifier. In the default `--graph-layout separate`,
@@ -281,11 +306,10 @@ HSI/LiDAR GAT1 (separate modality graphs)
 
 Use `--cell-interaction bridge` to remove only the cell-cell RAG-GCN, or
 `--cell-interaction none` for the matched no-cell ablation. This initial
-interactive version uses one cell interaction after GAT1; it does not yet
-use spectral/height-weighted cell edges, a second post-GAT2 cell interaction,
-a pixel-level cell descriptor, or a third cell classification branch. It
-currently requires exactly one superpixel scale so that the cells form a
-true image partition.
+`train.py` architecture uses one cell interaction after GAT1 and does not
+enable the four enhanced `demo_train.py` cell options above. It currently
+requires exactly one superpixel scale so that the cells form a true image
+partition.
 
 ## Original HGCN-HL
 
