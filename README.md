@@ -23,6 +23,22 @@ python demo_train.py \
   --device cuda
 ```
 
+Intersection-cell RAG interaction is an optional addition to this exact
+pipeline and is disabled by default. Enable it by appending:
+
+```bash
+--cell-interaction rag
+```
+
+With this option, the two modality-specific GAT1 outputs are sent to one
+node per nonempty HSI/LiDAR superpixel intersection. The cell nodes run one
+sparse residual GCN over the common-refinement map's 1-hop RAG and return
+coverage-weighted messages to both parent graphs through independent gates.
+The updated parent features are then used by the existing IoU-conditioned
+second-layer Q/K builders. Thus the original joint CNN, HSI FDSM, LiDAR
+RAG-height-KNN, LiDAR low/high modulation, and overlap-Q/K condition remain
+active. This initial cell mode requires one superpixel scale.
+
 The demo keeps the original
 joint `PCA(HSI)+LiDAR` input, two WMF blocks, original `5x5/5x5` CNN,
 lambda fusion, and classifier. In the default `--graph-layout separate`,
@@ -228,6 +244,48 @@ python train.py \
   --pixel-fusion adaptive \
   --device cuda
 ```
+
+## Common-refinement Cell Bridge
+
+`--architecture common-refinement-cell` keeps the HSI GSDG and LiDAR
+Geometry-GSDG internal graphs, but can replace direct cross-modal attention
+with explicit intersection-cell nodes. The feature is disabled by default:
+
+```bash
+python train.py \
+  --architecture common-refinement-cell \
+  --cell-interaction rag \
+  --dataset muufl \
+  --train-samples-per-class 20 \
+  --device cuda
+```
+
+Every nonempty pair `S_h intersect S_l` becomes one cell. A binary parent
+lookup gathers the HSI/LiDAR parent features without attenuation. Cell
+features encode the two parents together with log-area, HSI/LiDAR coverage,
+IoU, centroid distance, and relative y/x. Separate coverage-normalized
+scatter weights then return the cell messages to HSI and LiDAR parents.
+`rag` first propagates the fused cell features through one sparse residual
+GCN on the common-refinement map's binary 1-hop RAG. Independent relation
+gates see the original parent feature, the modality-internal GAT1 message,
+and the returned cell message:
+
+```text
+HSI/LiDAR GAT1 (separate modality graphs)
+  -> parent-to-cell incidence + Cell MLP
+  -> optional cell-cell RAG-GCN
+  -> gated Cell-to-HSI and Cell-to-LiDAR injection
+  -> rebuild both modality-specific graphs
+  -> GAT2
+```
+
+Use `--cell-interaction bridge` to remove only the cell-cell RAG-GCN, or
+`--cell-interaction none` for the matched no-cell ablation. This initial
+interactive version uses one cell interaction after GAT1; it does not yet
+use spectral/height-weighted cell edges, a second post-GAT2 cell interaction,
+a pixel-level cell descriptor, or a third cell classification branch. It
+currently requires exactly one superpixel scale so that the cells form a
+true image partition.
 
 ## Original HGCN-HL
 

@@ -4,7 +4,8 @@ The fixed hypergraph/HGCN path is replaced by GSDG graph/GAT propagation.
 The default uses independent HSI and LiDAR graphs; the previous concatenated
 node graph remains selectable. The LiDAR graph can additionally restrict its
 dynamic neighbors with a local RAG and an elevation-similarity KNN. The
-original joint CNN and fusion remain.
+original joint CNN and fusion remain. An intersection-cell RAG can be inserted
+after GAT1, but is disabled by default.
 """
 
 import argparse
@@ -19,6 +20,7 @@ from scipy.sparse import hstack, issparse
 from sklearn.decomposition import PCA
 
 from train import (
+    CommonRefinementCellLayer,
     DATASET_CONFIG,
     DynamicGraphBuilder,
     FDSM,
@@ -26,6 +28,7 @@ from train import (
     OriginalSSConv,
     WMF,
     build_common_boundary_strength,
+    build_common_refinement_cells,
     build_rag_hop_candidates,
     build_superpixel_spatial_prior,
     minmax_normalize,
@@ -153,6 +156,17 @@ def parse_args():
             "Cross-modal superpixel correspondence. 'iou' uses "
             "intersection over union; 'coverage' preserves the earlier "
             "directional intersection/target-area weighting."
+        ),
+    )
+    parser.add_argument(
+        "--cell-interaction",
+        choices=("none", "rag"),
+        default="none",
+        help=(
+            "Optional intersection-cell interaction after GAT1. "
+            "'rag' performs parent-to-cell fusion, one sparse 1-hop "
+            "cell RAG-GCN, and gated cell-to-parent feedback before "
+            "the existing second-layer graph construction. Default: none."
         ),
     )
     parser.add_argument(
@@ -1085,6 +1099,8 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         cross_modal_interaction="none",
         cross_attention_d_k=16,
         overlap_metric="iou",
+        cell_interaction="none",
+        cell_data=None,
         fdsm_scope="none",
         lidar_modulation="none",
         lidar_rag_adjacency=None,
@@ -1097,6 +1113,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.fusion_lambda = fusion_lambda
         self.cross_modal_interaction = cross_modal_interaction
         self.overlap_metric = overlap_metric
+        self.cell_interaction = cell_interaction
         use_qk_condition = (
             cross_modal_interaction == "overlap-qk-condition"
         )
@@ -1188,6 +1205,22 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 mode=cross_modal_interaction,
                 attention_d_k=cross_attention_d_k,
             )
+        if cell_interaction == "rag":
+            if cell_data is None:
+                raise ValueError(
+                    "cell_data is required for cell interaction."
+                )
+            self.cell_layer = CommonRefinementCellLayer(
+                hidden_dim,
+                cell_data,
+                use_cell_rag=True,
+            )
+        elif cell_interaction == "none":
+            self.cell_layer = None
+        else:
+            raise ValueError(
+                "cell_interaction must be none or rag."
+            )
 
         # This is intentionally still the original joint-input CNN path.
         self.joint_feature_mapping = nn.Sequential(
@@ -1209,7 +1242,62 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.classifier = nn.Linear(hidden_dim, class_count)
 
     def forward(self, hsi, lidar, joint_input):
-        if self.cross_modal_interaction == "none":
+        if self.cell_layer is not None:
+            hsi_nodes = self.hsi_graph.encode_nodes(hsi)
+            lidar_nodes = self.lidar_graph.encode_nodes(lidar)
+            hsi_features, _ = self.hsi_graph.apply_gat1(hsi_nodes)
+            lidar_features, _ = self.lidar_graph.apply_gat1(
+                lidar_nodes
+            )
+            hsi_features, lidar_features = self.cell_layer(
+                hsi_nodes,
+                lidar_nodes,
+                hsi_features,
+                lidar_features,
+            )
+            if (
+                self.cross_modal_interaction
+                == "overlap-qk-condition"
+            ):
+                hsi_cross_context = (
+                    self.hsi_to_lidar_overlap @ lidar_features
+                )
+                lidar_cross_context = (
+                    self.lidar_to_hsi_overlap @ hsi_features
+                )
+                hsi_graph_features = (
+                    self.hsi_graph.apply_gat2_and_project(
+                        hsi_features,
+                        cross_context=hsi_cross_context,
+                    )
+                )
+                lidar_graph_features = (
+                    self.lidar_graph.apply_gat2_and_project(
+                        lidar_features,
+                        cross_context=lidar_cross_context,
+                    )
+                )
+            else:
+                if self.cross_interaction is not None:
+                    hsi_features, lidar_features = (
+                        self.cross_interaction(
+                            hsi_features,
+                            lidar_features,
+                        )
+                    )
+                hsi_graph_features = (
+                    self.hsi_graph.apply_gat2_and_project(
+                        hsi_features,
+                        rebuild_graph=True,
+                    )
+                )
+                lidar_graph_features = (
+                    self.lidar_graph.apply_gat2_and_project(
+                        lidar_features,
+                        rebuild_graph=True,
+                    )
+                )
+        elif self.cross_modal_interaction == "none":
             # Preserve the original Stage-3 path exactly.
             hsi_graph_features = self.hsi_graph(hsi)
             lidar_graph_features = self.lidar_graph(lidar)
@@ -1352,6 +1440,14 @@ def prepare_data(args, config):
         hsi.shape[1],
         args.spatial_prior_k,
     )
+    cell_data = None
+    if args.cell_interaction == "rag":
+        cell_data = build_common_refinement_cells(
+            hsi_assignment,
+            lidar_assignment,
+            hsi.shape[0],
+            hsi.shape[1],
+        )
 
     height, width, bands = hsi.shape
     component_count = min(args.pca_components, bands)
@@ -1383,6 +1479,7 @@ def prepare_data(args, config):
         lidar_candidate_mask,
         lidar_rag_adjacency,
         lidar_geometry_descriptors,
+        cell_data,
         joint_spatial_prior,
     )
 
@@ -1402,6 +1499,7 @@ def train_one_run(
     lidar_candidate_mask,
     lidar_rag_adjacency,
     lidar_geometry_descriptors,
+    cell_data,
     joint_spatial_prior,
     run_index,
 ):
@@ -1454,6 +1552,8 @@ def train_one_run(
             cross_modal_interaction=args.cross_modal_interaction,
             cross_attention_d_k=args.cross_attention_dk,
             overlap_metric=args.overlap_metric,
+            cell_interaction=args.cell_interaction,
+            cell_data=cell_data,
             fdsm_scope=args.fdsm_scope,
             **common_options,
         ).to(device)
@@ -1535,6 +1635,7 @@ def train_one_run(
         f"prior-{args.lidar_graph_prior}_"
         f"cross-{args.cross_modal_interaction}_"
         f"overlap-{args.overlap_metric}_"
+        f"cell-{args.cell_interaction}_"
         f"fdsm-{args.fdsm_scope}_"
         f"lidarmod-{args.lidar_modulation}_"
         f"run{run_index + 1}.pt"
@@ -1597,6 +1698,21 @@ def validate_args(args):
         raise ValueError(
             "--lidar-modulation requires --graph-layout separate."
         )
+    if (
+        args.graph_layout == "joint"
+        and args.cell_interaction != "none"
+    ):
+        raise ValueError(
+            "--cell-interaction requires --graph-layout separate."
+        )
+    if (
+        args.cell_interaction != "none"
+        and len(args.scales) != 1
+    ):
+        raise ValueError(
+            "--cell-interaction rag currently requires exactly one "
+            "superpixel scale."
+        )
     if args.hidden_dim <= 0:
         raise ValueError("--hidden-dim must be positive.")
     if not 0.0 <= args.dropout < 1.0:
@@ -1622,6 +1738,7 @@ def main():
         lidar_candidate_mask,
         lidar_rag_adjacency,
         lidar_geometry_descriptors,
+        cell_data,
         joint_spatial_prior,
     ) = prepare_data(args, config)
 
@@ -1666,7 +1783,17 @@ def main():
         ):
             print(
                 "Cross condition: C_HL @ L and C_LH @ H modify "
-                "both modalities' second-layer Q/K; no feature gate"
+                "both modalities' second-layer Q/K; no direct "
+                "overlap feature gate"
+            )
+        print(f"Intersection-cell interaction: {args.cell_interaction}")
+        if args.cell_interaction == "rag":
+            print(
+                "Cell path: parent-to-cell -> sparse 1-hop RAG-GCN "
+                "-> gated cell-to-parent; cells="
+                f"{cell_data['cell_count']}, directed RAG entries "
+                "excluding self="
+                f"{cell_data['cell_rag_edge_count']}"
             )
         print(f"HSI FDSM: {args.fdsm_scope}")
         print(f"LiDAR modulation: {args.lidar_modulation}")
@@ -1709,6 +1836,7 @@ def main():
             lidar_candidate_mask,
             lidar_rag_adjacency,
             lidar_geometry_descriptors,
+            cell_data,
             joint_spatial_prior,
             run_index,
         )
@@ -1742,6 +1870,7 @@ def main():
         f"prior-{args.lidar_graph_prior}_"
         f"cross-{args.cross_modal_interaction}_"
         f"overlap-{args.overlap_metric}_"
+        f"cell-{args.cell_interaction}_"
         f"fdsm-{args.fdsm_scope}_"
         f"lidarmod-{args.lidar_modulation}_results.json"
     )

@@ -79,6 +79,50 @@ def normalized_sparse_assignments(assignment):
     return pooling, projection
 
 
+def scipy_sparse_to_torch(sparse_matrix):
+    """Convert a SciPy sparse matrix to a coalesced float tensor."""
+    sparse_matrix = sparse_matrix.tocoo()
+    indices = torch.from_numpy(
+        np.vstack([sparse_matrix.row, sparse_matrix.col])
+    ).long()
+    values = torch.from_numpy(
+        sparse_matrix.data.astype(np.float32)
+    )
+    with torch.sparse.check_sparse_tensor_invariants():
+        return torch.sparse_coo_tensor(
+            indices,
+            values,
+            sparse_matrix.shape,
+        ).coalesce()
+
+
+def symmetrically_normalize_sparse_adjacency(adjacency):
+    """Return D^-1/2 A D^-1/2 without densifying the graph."""
+    adjacency = adjacency.tocoo().astype(np.float32)
+    degree = np.asarray(
+        adjacency.tocsr().sum(axis=1)
+    ).reshape(-1)
+    inverse_sqrt_degree = np.zeros_like(degree)
+    positive = degree > 0
+    inverse_sqrt_degree[positive] = np.power(
+        degree[positive],
+        -0.5,
+    )
+    normalized_values = (
+        adjacency.data
+        * inverse_sqrt_degree[adjacency.row]
+        * inverse_sqrt_degree[adjacency.col]
+    )
+    return coo_matrix(
+        (
+            normalized_values.astype(np.float32),
+            (adjacency.row, adjacency.col),
+        ),
+        shape=adjacency.shape,
+        dtype=np.float32,
+    ).tocsr()
+
+
 def standardize_feature_cube(features):
     features = np.asarray(features, dtype=np.float32)
     flat_features = features.reshape(-1, features.shape[-1])
@@ -437,6 +481,165 @@ def build_cross_modal_relation_data(
             [hsi_to_lidar_distance, hsi_to_lidar_delta],
             axis=-1,
         ).astype(np.float32),
+    }
+
+
+def build_common_refinement_cells(
+    hsi_assignment,
+    lidar_assignment,
+    height,
+    width,
+):
+    """Create one explicit cell for every nonempty HSI/LiDAR overlap."""
+    hsi_memberships = np.asarray(
+        hsi_assignment.sum(axis=1)
+    ).reshape(-1)
+    lidar_memberships = np.asarray(
+        lidar_assignment.sum(axis=1)
+    ).reshape(-1)
+    if not (
+        np.allclose(hsi_memberships, 1.0)
+        and np.allclose(lidar_memberships, 1.0)
+    ):
+        raise ValueError(
+            "Common-refinement cells currently require one HSI and "
+            "one LiDAR superpixel membership per pixel. Use one scale."
+        )
+
+    hsi_labels = np.asarray(
+        hsi_assignment.argmax(axis=1)
+    ).reshape(-1).astype(np.int64)
+    lidar_labels = np.asarray(
+        lidar_assignment.argmax(axis=1)
+    ).reshape(-1).astype(np.int64)
+    parent_pairs, pixel_cell_index, cell_area = np.unique(
+        np.stack([hsi_labels, lidar_labels], axis=1),
+        axis=0,
+        return_inverse=True,
+        return_counts=True,
+    )
+    hsi_parent = parent_pairs[:, 0].astype(np.int64)
+    lidar_parent = parent_pairs[:, 1].astype(np.int64)
+    cell_area = cell_area.astype(np.float32)
+
+    intersection = hsi_assignment.transpose() @ lidar_assignment
+    if issparse(intersection):
+        intersection = intersection.toarray()
+    intersection = np.asarray(intersection, dtype=np.float32)
+    positive_pair_count = int(np.count_nonzero(intersection))
+    if positive_pair_count != cell_area.size:
+        raise RuntimeError(
+            "Cell count does not match nonempty overlap pairs."
+        )
+    if not np.allclose(
+        intersection[hsi_parent, lidar_parent],
+        cell_area,
+    ):
+        raise RuntimeError(
+            "Cell areas do not match Q_h^T Q_l intersections."
+        )
+    if not np.isclose(cell_area.sum(), height * width):
+        raise RuntimeError(
+            "Single-scale common-refinement cells must partition "
+            "the complete image."
+        )
+
+    hsi_area = np.asarray(
+        hsi_assignment.sum(axis=0)
+    ).reshape(-1).astype(np.float32)
+    lidar_area = np.asarray(
+        lidar_assignment.sum(axis=0)
+    ).reshape(-1).astype(np.float32)
+    hsi_coverage = cell_area / np.maximum(
+        hsi_area[hsi_parent],
+        1.0,
+    )
+    lidar_coverage = cell_area / np.maximum(
+        lidar_area[lidar_parent],
+        1.0,
+    )
+    union = (
+        hsi_area[hsi_parent]
+        + lidar_area[lidar_parent]
+        - cell_area
+    )
+    cell_iou = cell_area / np.maximum(union, 1.0)
+
+    hsi_centroids = superpixel_centroids(
+        hsi_assignment,
+        height,
+        width,
+    )
+    lidar_centroids = superpixel_centroids(
+        lidar_assignment,
+        height,
+        width,
+    )
+    centroid_delta = (
+        lidar_centroids[lidar_parent]
+        - hsi_centroids[hsi_parent]
+    )
+    centroid_distance = np.linalg.norm(
+        centroid_delta,
+        axis=1,
+    )
+    raw_attributes = np.stack(
+        [
+            np.log1p(cell_area),
+            hsi_coverage,
+            lidar_coverage,
+            cell_iou,
+            centroid_distance,
+            centroid_delta[:, 0],
+            centroid_delta[:, 1],
+        ],
+        axis=1,
+    ).astype(np.float32)
+    attribute_mean = raw_attributes.mean(axis=0, keepdims=True)
+    attribute_std = raw_attributes.std(axis=0, keepdims=True)
+    attributes = (
+        (raw_attributes - attribute_mean)
+        / np.maximum(attribute_std, 1e-6)
+    ).astype(np.float32)
+
+    hsi_coverage_sum = np.zeros(
+        hsi_assignment.shape[1],
+        dtype=np.float32,
+    )
+    lidar_coverage_sum = np.zeros(
+        lidar_assignment.shape[1],
+        dtype=np.float32,
+    )
+    np.add.at(hsi_coverage_sum, hsi_parent, hsi_coverage)
+    np.add.at(lidar_coverage_sum, lidar_parent, lidar_coverage)
+    if not (
+        np.allclose(hsi_coverage_sum, 1.0, atol=1e-5)
+        and np.allclose(lidar_coverage_sum, 1.0, atol=1e-5)
+    ):
+        raise RuntimeError(
+            "Cell-to-parent coverage weights must sum to one."
+        )
+
+    cell_segments = pixel_cell_index.reshape(height, width)
+    cell_rag_adjacency = symmetrically_normalize_sparse_adjacency(
+        build_rag_hop_candidates(cell_segments, hops=1)
+    )
+
+    return {
+        "hsi_parent": hsi_parent,
+        "lidar_parent": lidar_parent,
+        "pixel_cell_index": pixel_cell_index.astype(np.int64),
+        "cell_area": cell_area,
+        "hsi_coverage": hsi_coverage.astype(np.float32),
+        "lidar_coverage": lidar_coverage.astype(np.float32),
+        "cell_iou": cell_iou.astype(np.float32),
+        "raw_attributes": raw_attributes,
+        "attributes": attributes,
+        "cell_rag_adjacency": cell_rag_adjacency,
+        "cell_rag_edge_count": int(
+            cell_rag_adjacency.nnz - cell_area.size
+        ),
+        "cell_count": int(cell_area.size),
     }
 
 
@@ -2097,6 +2300,430 @@ class FourRelationHeterogeneousNetwork(nn.Module):
         return self.classifier(fused)
 
 
+class CommonRefinementCellLayer(nn.Module):
+    """Coarse-to-fine-to-coarse interaction through intersection cells."""
+
+    def __init__(self, channels, cell_data, use_cell_rag=False):
+        super().__init__()
+        self.use_cell_rag = use_cell_rag
+        self.hsi_node_count = int(
+            np.max(cell_data["hsi_parent"])
+        ) + 1
+        self.lidar_node_count = int(
+            np.max(cell_data["lidar_parent"])
+        ) + 1
+        self.register_buffer(
+            "hsi_parent",
+            torch.as_tensor(
+                cell_data["hsi_parent"],
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "lidar_parent",
+            torch.as_tensor(
+                cell_data["lidar_parent"],
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "hsi_coverage",
+            torch.as_tensor(
+                cell_data["hsi_coverage"],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "lidar_coverage",
+            torch.as_tensor(
+                cell_data["lidar_coverage"],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "cell_attributes",
+            torch.as_tensor(
+                cell_data["attributes"],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        attribute_channels = cell_data["attributes"].shape[1]
+        self.cell_encoder = nn.Sequential(
+            nn.Linear(
+                2 * channels + attribute_channels,
+                channels,
+            ),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+            nn.LeakyReLU(),
+        )
+        if use_cell_rag:
+            self.register_buffer(
+                "cell_rag_adjacency",
+                scipy_sparse_to_torch(
+                    cell_data["cell_rag_adjacency"]
+                ),
+                persistent=False,
+            )
+            self.cell_graph_projection = nn.Linear(
+                channels,
+                channels,
+                bias=False,
+            )
+            self.cell_graph_norm = nn.LayerNorm(channels)
+        else:
+            self.cell_rag_adjacency = None
+            self.cell_graph_projection = None
+            self.cell_graph_norm = None
+        self.hsi_gate = nn.Sequential(
+            nn.Linear(3 * channels, channels),
+            nn.Sigmoid(),
+        )
+        self.lidar_gate = nn.Sequential(
+            nn.Linear(3 * channels, channels),
+            nn.Sigmoid(),
+        )
+        self.hsi_norm = nn.LayerNorm(channels)
+        self.lidar_norm = nn.LayerNorm(channels)
+        self.last_cell_features = None
+        self.last_hsi_gate = None
+        self.last_lidar_gate = None
+
+    def forward(
+        self,
+        hsi_nodes,
+        lidar_nodes,
+        hsi_intra,
+        lidar_intra,
+    ):
+        if hsi_nodes.shape[0] != self.hsi_node_count:
+            raise ValueError("Unexpected number of HSI parent nodes.")
+        if lidar_nodes.shape[0] != self.lidar_node_count:
+            raise ValueError("Unexpected number of LiDAR parent nodes.")
+        cell_features = self.cell_encoder(
+            torch.cat(
+                [
+                    hsi_intra.index_select(0, self.hsi_parent),
+                    lidar_intra.index_select(
+                        0,
+                        self.lidar_parent,
+                    ),
+                    self.cell_attributes,
+                ],
+                dim=-1,
+            )
+        )
+        if self.use_cell_rag:
+            cell_graph_message = torch.sparse.mm(
+                self.cell_rag_adjacency,
+                self.cell_graph_projection(cell_features),
+            )
+            cell_features = self.cell_graph_norm(
+                cell_features + F.leaky_relu(cell_graph_message)
+            )
+
+        hsi_message = torch.zeros_like(hsi_nodes)
+        hsi_message.index_add_(
+            0,
+            self.hsi_parent,
+            cell_features * self.hsi_coverage.unsqueeze(1),
+        )
+        lidar_message = torch.zeros_like(lidar_nodes)
+        lidar_message.index_add_(
+            0,
+            self.lidar_parent,
+            cell_features * self.lidar_coverage.unsqueeze(1),
+        )
+        hsi_gate = self.hsi_gate(
+            torch.cat(
+                [hsi_nodes, hsi_intra, hsi_message],
+                dim=-1,
+            )
+        )
+        lidar_gate = self.lidar_gate(
+            torch.cat(
+                [lidar_nodes, lidar_intra, lidar_message],
+                dim=-1,
+            )
+        )
+        self.last_cell_features = cell_features.detach()
+        self.last_hsi_gate = hsi_gate.detach()
+        self.last_lidar_gate = lidar_gate.detach()
+        return (
+            self.hsi_norm(
+                hsi_nodes + hsi_intra + hsi_gate * hsi_message
+            ),
+            self.lidar_norm(
+                lidar_nodes
+                + lidar_intra
+                + lidar_gate * lidar_message
+            ),
+        )
+
+
+class CommonRefinementCellNetwork(nn.Module):
+    """HSI/LiDAR GSDG with an optional explicit intersection-cell bridge."""
+
+    def __init__(
+        self,
+        height,
+        width,
+        hsi_channels,
+        lidar_channels,
+        class_count,
+        hsi_assignment,
+        lidar_assignment,
+        hsi_superpixel_spatial_prior,
+        lidar_height_descriptors,
+        lidar_geometry_descriptors,
+        lidar_rag_candidates,
+        lidar_structure_prior,
+        dynamic_d_k=16,
+        dynamic_topk=8,
+        dynamic_tau=1.0,
+        gsdg_fusion_lambda=0.95,
+        modality_fusion_lambda=0.5,
+        hidden_dim=128,
+        graph_dim=64,
+        dropout=0.4,
+        lidar_edge_weight_beta=1.0,
+        cell_interaction="none",
+        cell_data=None,
+    ):
+        super().__init__()
+        if cell_interaction not in {"none", "bridge", "rag"}:
+            raise ValueError(
+                "cell_interaction must be none, bridge, or rag."
+            )
+        self.height = height
+        self.width = width
+        self.cell_interaction = cell_interaction
+        self.gsdg_fusion_lambda = gsdg_fusion_lambda
+        self.modality_fusion_lambda = modality_fusion_lambda
+
+        self.hsi_gsdg = ModalitySuperpixelBranch(
+            height=height,
+            width=width,
+            in_channels=hsi_channels,
+            assignment=hsi_assignment,
+            superpixel_spatial_prior=hsi_superpixel_spatial_prior,
+            backbone="gsdg-graph",
+            graph_mode="dynamic",
+            dynamic_d_k=dynamic_d_k,
+            dynamic_topk=dynamic_topk,
+            dynamic_tau=dynamic_tau,
+            class_count=class_count,
+            use_prototype_hyperedges=False,
+            use_fdsm=True,
+            cnn_style="gsdg",
+            fusion_lambda=gsdg_fusion_lambda,
+            hidden_dim=hidden_dim,
+            graph_dim=graph_dim,
+            dropout=dropout,
+        )
+        for gat in (self.hsi_gsdg.gat1, self.hsi_gsdg.gat2):
+            for attention_layer in [
+                *gat.heads,
+                gat.output_attention,
+            ]:
+                attention_layer.use_edge_weights = True
+        self.hsi_graph_builder2 = DynamicGraphBuilder(
+            graph_dim,
+            hsi_assignment.shape[1],
+            d_k=dynamic_d_k,
+            topk=dynamic_topk,
+            tau=dynamic_tau,
+        )
+        self.lidar_gsdg = LiDARGeometryGSDGBranch(
+            height=height,
+            width=width,
+            in_channels=lidar_channels,
+            assignment=lidar_assignment,
+            height_descriptors=lidar_height_descriptors,
+            geometry_descriptors=lidar_geometry_descriptors,
+            rag_candidates=lidar_rag_candidates,
+            structure_prior=lidar_structure_prior,
+            dynamic_d_k=dynamic_d_k,
+            dynamic_topk=dynamic_topk,
+            dynamic_tau=dynamic_tau,
+            fusion_lambda=gsdg_fusion_lambda,
+            hidden_dim=hidden_dim,
+            graph_dim=graph_dim,
+            edge_weight_beta=lidar_edge_weight_beta,
+        )
+        self.hsi_input_projection = nn.Linear(
+            hidden_dim,
+            graph_dim,
+        )
+        self.lidar_input_projection = nn.Linear(
+            hidden_dim,
+            graph_dim,
+        )
+        self.hsi_first_norm = nn.LayerNorm(graph_dim)
+        self.lidar_first_norm = nn.LayerNorm(graph_dim)
+        self.hsi_second_norm = nn.LayerNorm(graph_dim)
+        self.lidar_second_norm = nn.LayerNorm(graph_dim)
+
+        if cell_interaction in {"bridge", "rag"}:
+            if cell_data is None:
+                cell_data = build_common_refinement_cells(
+                    hsi_assignment,
+                    lidar_assignment,
+                    height,
+                    width,
+                )
+            self.cell_layer = CommonRefinementCellLayer(
+                graph_dim,
+                cell_data,
+                use_cell_rag=cell_interaction == "rag",
+            )
+            self.cell_count = cell_data["cell_count"]
+        else:
+            self.cell_layer = None
+            self.cell_count = 0
+        self.classifier = nn.Linear(graph_dim, class_count)
+
+    def _encode_hsi(self, hsi):
+        branch = self.hsi_gsdg
+        mapped = branch.feature_mapping(
+            hsi.permute(2, 0, 1).unsqueeze(0)
+        )
+        cnn_features = (
+            branch.cnn_branch(mapped)
+            .squeeze(0)
+            .permute(1, 2, 0)
+            .reshape(self.height * self.width, -1)
+        )
+        pixel_features = (
+            mapped.squeeze(0)
+            .permute(1, 2, 0)
+            .reshape(self.height * self.width, -1)
+        )
+        node_features = torch.sparse.mm(
+            branch.pooling_assignment.transpose(0, 1),
+            pixel_features,
+        )
+        return branch.frequency_modulation(node_features), cnn_features
+
+    def _encode_lidar(self, lidar):
+        branch = self.lidar_gsdg
+        mapped = branch.feature_mapping(
+            lidar.permute(2, 0, 1).unsqueeze(0)
+        )
+        cnn_features = branch.cnn_scale_fusion(
+            torch.cat(
+                [cnn_branch(mapped) for cnn_branch in branch.cnn_scales],
+                dim=1,
+            )
+        )
+        cnn_features = (
+            cnn_features.squeeze(0)
+            .permute(1, 2, 0)
+            .reshape(self.height * self.width, -1)
+        )
+        node_features = branch.height_descriptor_encoder(
+            branch.height_descriptors
+        )
+        return node_features, cnn_features
+
+    @staticmethod
+    def _project_nodes(branch, node_features):
+        return branch.graph_projection(
+            torch.sparse.mm(
+                branch.projection_assignment,
+                node_features,
+            )
+        )
+
+    def forward(self, hsi, lidar):
+        hsi_raw, hsi_cnn = self._encode_hsi(hsi)
+        lidar_raw, lidar_cnn = self._encode_lidar(lidar)
+
+        hsi_adjacency1 = self.hsi_gsdg.dynamic_graph_builder(
+            hsi_raw,
+            self.hsi_gsdg.superpixel_spatial_prior,
+        )
+        hsi_intra1 = self.hsi_gsdg.gat1(
+            hsi_raw,
+            hsi_adjacency1,
+        )
+        lidar_adjacency1 = self.lidar_gsdg.graph_builder1(
+            lidar_raw
+        )
+        lidar_intra1 = self.lidar_gsdg.gat1(
+            lidar_raw,
+            lidar_adjacency1,
+        )
+        hsi_base = self.hsi_input_projection(hsi_raw)
+        lidar_base = self.lidar_input_projection(lidar_raw)
+        if self.cell_layer is not None:
+            hsi_nodes, lidar_nodes = self.cell_layer(
+                hsi_base,
+                lidar_base,
+                hsi_intra1,
+                lidar_intra1,
+            )
+        else:
+            hsi_nodes = self.hsi_first_norm(
+                hsi_base + hsi_intra1
+            )
+            lidar_nodes = self.lidar_first_norm(
+                lidar_base + lidar_intra1
+            )
+
+        # Cell-updated features rebuild both modality-specific graphs.
+        hsi_adjacency2 = self.hsi_graph_builder2(
+            hsi_nodes,
+            self.hsi_gsdg.superpixel_spatial_prior,
+        )
+        hsi_intra2 = self.hsi_gsdg.gat2(
+            hsi_nodes,
+            hsi_adjacency2,
+        )
+        lidar_adjacency2 = self.lidar_gsdg.graph_builder2(
+            lidar_nodes
+        )
+        lidar_intra2 = self.lidar_gsdg.gat2(
+            lidar_nodes,
+            lidar_adjacency2,
+        )
+        hsi_nodes = self.hsi_second_norm(
+            hsi_nodes + hsi_intra2
+        )
+        lidar_nodes = self.lidar_second_norm(
+            lidar_nodes + lidar_intra2
+        )
+
+        hsi_graph = self._project_nodes(
+            self.hsi_gsdg,
+            hsi_nodes,
+        )
+        lidar_graph = self._project_nodes(
+            self.lidar_gsdg,
+            lidar_nodes,
+        )
+        hsi_pixels = (
+            self.gsdg_fusion_lambda * hsi_graph
+            + (1.0 - self.gsdg_fusion_lambda) * hsi_cnn
+        )
+        lidar_pixels = (
+            self.gsdg_fusion_lambda * lidar_graph
+            + (1.0 - self.gsdg_fusion_lambda) * lidar_cnn
+        )
+        fused = (
+            self.modality_fusion_lambda * hsi_pixels
+            + (1.0 - self.modality_fusion_lambda)
+            * lidar_pixels
+        )
+        return self.classifier(fused)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -2112,13 +2739,15 @@ def parse_args():
             "dual-superpixel",
             "dual-gsdg-hgcn-fusion",
             "four-relation-hetero",
+            "common-refinement-cell",
         ),
         default="dual-superpixel",
         help=(
             "Keep the configurable dual-superpixel model, or use HSI "
             "GSDG plus LiDAR Geometry-GSDG followed by HGCN-style "
             "weighted fusion or layer-wise four-relation heterogeneous "
-            "message passing."
+            "message passing, or an explicit common-refinement cell "
+            "bridge."
         ),
     )
     parser.add_argument(
@@ -2146,7 +2775,7 @@ def parse_args():
         help=(
             "Segmentation used to construct LiDAR superpixels. Defaults "
             "to Geometry-SLIC for dual-gsdg-hgcn-fusion and "
-            "four-relation-hetero, and "
+            "the heterogeneous/common-refinement architectures, and "
             "Felzenszwalb for the existing architecture."
         ),
     )
@@ -2299,6 +2928,17 @@ def parse_args():
             "for four-relation-hetero."
         ),
     )
+    parser.add_argument(
+        "--cell-interaction",
+        choices=("none", "bridge", "rag"),
+        default="none",
+        help=(
+            "Explicit common-refinement interaction used only by "
+            "common-refinement-cell. 'bridge' creates one node per "
+            "nonempty HSI/LiDAR superpixel intersection; 'rag' also "
+            "runs one sparse GCN over the cell 1-hop RAG. Default: none."
+        ),
+    )
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--graph-dim", type=int, default=64)
     parser.add_argument(
@@ -2332,6 +2972,7 @@ def resolve_dataset_options(args):
             in {
                 "dual-gsdg-hgcn-fusion",
                 "four-relation-hetero",
+                "common-refinement-cell",
             }
             else "felzenszwalb"
         )
@@ -2342,6 +2983,7 @@ def resolve_dataset_options(args):
             in {
                 "dual-gsdg-hgcn-fusion",
                 "four-relation-hetero",
+                "common-refinement-cell",
             }
             else 0.5
         )
@@ -2550,6 +3192,7 @@ def prepare_data(args):
     if args.architecture in {
         "dual-gsdg-hgcn-fusion",
         "four-relation-hetero",
+        "common-refinement-cell",
     }:
         lidar_features, lidar_structure = (
             prepare_lidar_geometry_structure(lidar, args)
@@ -2562,6 +3205,16 @@ def prepare_data(args):
             args,
         )
         lidar_features = lidar[:, :, np.newaxis].astype(np.float32)
+    if (
+        args.architecture == "common-refinement-cell"
+        and args.cell_interaction != "none"
+    ):
+        hsi_structure["cell_data"] = build_common_refinement_cells(
+            hsi_structure["assignment"],
+            lidar_structure["assignment"],
+            hsi.shape[0],
+            hsi.shape[1],
+        )
 
     height, width, bands = hsi.shape
     component_count = min(args.pca_components, bands)
@@ -2606,6 +3259,15 @@ def experiment_name(args):
             f"rag-{args.lidar_rag_hops}hop_"
             f"topk-{args.dynamic_topk}_"
             f"gsdg-lambda-{args.fusion_lambda:g}"
+        )
+    if args.architecture == "common-refinement-cell":
+        return (
+            f"{prefix}common_refinement_cell_"
+            f"interaction-{args.cell_interaction}_"
+            f"rag-{args.lidar_rag_hops}hop_"
+            f"topk-{args.dynamic_topk}_"
+            f"gsdg-lambda-{args.fusion_lambda:g}_"
+            f"modality-lambda-{args.modality_fusion_lambda:g}"
         )
     return (
         f"{prefix}dual_superpixel_{args.lidar_segmentation}_"
@@ -2701,6 +3363,27 @@ def train_one_run(
             hetero_layers=args.hetero_layers,
             cross_d_k=args.hetero_cross_dk,
             pixel_fusion=args.pixel_fusion,
+            **common_model_options,
+        ).to(device)
+    elif args.architecture == "common-refinement-cell":
+        model = CommonRefinementCellNetwork(
+            lidar_height_descriptors=(
+                lidar_structure["height_descriptors"]
+            ),
+            lidar_geometry_descriptors=(
+                lidar_structure["geometry_descriptors"]
+            ),
+            lidar_rag_candidates=(
+                lidar_structure["rag_candidates"]
+            ),
+            lidar_structure_prior=(
+                lidar_structure["structure_prior"]
+            ),
+            gsdg_fusion_lambda=args.fusion_lambda,
+            modality_fusion_lambda=args.modality_fusion_lambda,
+            lidar_edge_weight_beta=args.lidar_edge_weight_beta,
+            cell_interaction=args.cell_interaction,
+            cell_data=hsi_structure.get("cell_data"),
             **common_model_options,
         ).to(device)
     else:
@@ -2857,6 +3540,7 @@ def main():
         in {
             "dual-gsdg-hgcn-fusion",
             "four-relation-hetero",
+            "common-refinement-cell",
         }
         and args.prototype_scope != "none"
     ):
@@ -2869,6 +3553,7 @@ def main():
         in {
             "dual-gsdg-hgcn-fusion",
             "four-relation-hetero",
+            "common-refinement-cell",
         }
         and args.lidar_segmentation != "slic"
     ):
@@ -2878,10 +3563,26 @@ def main():
         )
     if args.hetero_cross_dk <= 0:
         raise ValueError("--hetero-cross-dk must be positive.")
+    if (
+        args.cell_interaction != "none"
+        and args.architecture != "common-refinement-cell"
+    ):
+        raise ValueError(
+            "--cell-interaction is only available with "
+            "--architecture common-refinement-cell."
+        )
     if args.pca_components <= 0:
         raise ValueError("--pca-components must be positive.")
     if not args.scales or any(scale <= 0 for scale in args.scales):
         raise ValueError("--scales must contain positive integers.")
+    if (
+        args.architecture == "common-refinement-cell"
+        and len(args.scales) != 1
+    ):
+        raise ValueError(
+            "common-refinement-cell currently requires exactly one "
+            "superpixel scale so that cells form a true partition."
+        )
 
     set_seed(args.seed)
     (
@@ -2948,6 +3649,38 @@ def main():
         print(
             f"Within-branch GSDG graph/CNN lambda={args.fusion_lambda}"
         )
+    elif args.architecture == "common-refinement-cell":
+        print(
+            "Branches: HSI GSDG + LiDAR Geometry-GSDG + explicit "
+            "common-refinement cells"
+        )
+        print(
+            f"Cell interaction: {args.cell_interaction}; "
+            "GAT1 -> optional Cell interaction -> rebuild both graphs "
+            "-> GAT2"
+        )
+        if args.cell_interaction != "none":
+            print(
+                "Cell nodes: "
+                f"{hsi_structure['cell_data']['cell_count']} "
+                "(one per nonempty HSI/LiDAR overlap)"
+            )
+            print(
+                "Cell attributes: log-area, HSI/LiDAR coverage, IoU, "
+                "centroid distance, relative y/x"
+            )
+            if args.cell_interaction == "rag":
+                print(
+                    "Cell graph: normalized binary 1-hop RAG + one "
+                    "sparse residual GCN; directed entries excluding "
+                    "self="
+                    f"{hsi_structure['cell_data']['cell_rag_edge_count']}"
+                )
+        print(
+            "Final modality fusion: fixed lambda; "
+            f"HSI={args.modality_fusion_lambda}, "
+            f"LiDAR={1.0 - args.modality_fusion_lambda}"
+        )
     else:
         print(f"Architecture backbone: {args.backbone}")
         print(f"Topology mode: {args.graph_mode}")
@@ -2968,12 +3701,14 @@ def main():
         in {
             "dual-gsdg-hgcn-fusion",
             "four-relation-hetero",
+            "common-refinement-cell",
         }
         or args.graph_mode == "dynamic"
     ):
         if args.architecture in {
             "dual-gsdg-hgcn-fusion",
             "four-relation-hetero",
+            "common-refinement-cell",
         }:
             print(
                 f"Dynamic graph: d_k={args.dynamic_dk}, "
