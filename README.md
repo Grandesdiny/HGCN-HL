@@ -46,7 +46,9 @@ Four enhancements can be independently enabled on top of that command:
 --cell-edge-mode spectral-height-boundary \
 --cell-interaction-stages 2 \
 --cell-output-branch fixed \
---cell-output-weight 0.3333333333
+--cell-output-weight 0.3333333333 \
+--cell-conflict-weight 1.0 \
+--cell-topology-veto soft
 ```
 
 `mean` adds the mean HSI-PCA vector and mean LiDAR value of the pixels
@@ -56,13 +58,33 @@ difference, and average DSM gradient along the shared cell boundary. Two
 interaction stages run separate parent-cell-parent layers after GAT1 and
 GAT2. The fixed output branch projects the latest cell features back with
 the pixel-to-cell assignment and mixes them with the already fused
-HSI/LiDAR graph output. The three edge terms can be controlled with
+HSI/LiDAR graph output. The HSI boundary strength is the average spectral
+angle of pixel pairs across the shared boundary, while the LiDAR boundary
+strength is its average DSM gradient. After separate robust normalization,
+`--cell-conflict-weight` adds their absolute disagreement
+`abs(B_HSI - B_LiDAR)` to the edge penalty. It defaults to `0`, so this
+additional term is disabled unless explicitly requested. The other three
+edge terms can be controlled with
 `--cell-sam-weight`, `--cell-height-weight`, and
 `--cell-boundary-weight`.
 
-All four enhancements are disabled by default: descriptor `none`, edge
-mode `binary`, one interaction stage, and cell output `none`. They require
-`--cell-interaction rag`.
+Cell-derived topology veto is separately disabled by default. It maps the
+cell adjacency back to both parent graphs:
+
+```text
+S_h = R_h<-c A_c R_c<-h
+S_l = R_l<-c A_c R_c<-l
+```
+
+`--cell-topology-veto soft` applies independent learnable sigmoid gates to
+these support matrices and inserts them into the second-layer Q/K logits
+before Top-K. `hard` masks support below `--cell-veto-threshold` before
+softmax and Top-K; self-loops are always retained. The veto combines with,
+rather than replaces, the LiDAR RAG-height-KNN candidate mask.
+
+All optional enhancements are disabled by default: descriptor `none`, edge
+mode `binary`, one interaction stage, cell output `none`, conflict weight
+`0`, and topology veto `none`. They require `--cell-interaction rag`.
 
 The demo keeps the original
 joint `PCA(HSI)+LiDAR` input, two WMF blocks, original `5x5/5x5` CNN,
