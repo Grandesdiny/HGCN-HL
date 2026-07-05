@@ -23,6 +23,28 @@ python demo_train.py \
   --device cuda
 ```
 
+An optional training-only contrastive objective can be added to this exact
+Stage-8 pipeline:
+
+```bash
+--contrastive-mode overlap-soft \
+--contrastive-weight 0.05 \
+--contrastive-temperature 0.2 \
+--contrastive-dim 32
+```
+
+It is inserted after the two modality-specific GAT2 layers and immediately
+before their node features are projected back to pixels. The supervision
+target is the row-normalized shared-pixel count `Q_H^T Q_L`, not a hard
+one-to-one match and not the IoU graph prior. Both HSI-to-LiDAR and
+LiDAR-to-HSI cross-entropies are weighted by
+`1 - entropy(q) / log(number_of_overlapping_nodes)`. Independent projectors
+align only a low-dimensional shared subspace; pixel projection and
+classification continue to use the unprojected modality-private GAT2 node
+features. The projectors and contrastive similarity matrix are skipped in
+evaluation.
+`--contrastive-mode none` is the default.
+
 Intersection-cell RAG interaction is an optional addition to this exact
 pipeline and is disabled by default. Enable it by appending:
 

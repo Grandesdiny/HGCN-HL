@@ -9,6 +9,7 @@ after GAT1, but is disabled by default.
 """
 
 import argparse
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -161,6 +162,34 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--contrastive-mode",
+        choices=("none", "overlap-soft"),
+        default="none",
+        help=(
+            "Training-only cross-modal contrastive alignment of GAT2 "
+            "node features before pixel projection, using soft "
+            "overlap-count targets. Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--contrastive-weight",
+        type=float,
+        default=0.05,
+        help="Lambda of the cross-modal contrastive loss. Default: 0.05.",
+    )
+    parser.add_argument(
+        "--contrastive-temperature",
+        type=float,
+        default=0.2,
+        help="Cosine-similarity temperature. Default: 0.2.",
+    )
+    parser.add_argument(
+        "--contrastive-dim",
+        type=int,
+        default=32,
+        help="Shared projector output dimension. Default: 32.",
+    )
+    parser.add_argument(
         "--cell-interaction",
         choices=("none", "rag"),
         default="none",
@@ -311,6 +340,28 @@ def cell_configuration_tag(args):
         f"tv-{args.cell_topology_veto}-"
         f"{args.cell_veto_threshold:g}"
     )
+
+
+def contrastive_configuration_tag(args):
+    if args.contrastive_mode == "none":
+        return "cm-none"
+    return (
+        f"cm-soft-w{args.contrastive_weight:g}-"
+        f"t{args.contrastive_temperature:g}-"
+        f"d{args.contrastive_dim}"
+    )
+
+
+def safe_output_filename(stem, suffix, maximum_bytes=240):
+    """Keep experiment filenames below common filesystem limits."""
+    filename = f"{stem}{suffix}"
+    if len(filename.encode("utf-8")) <= maximum_bytes:
+        return filename
+    digest = hashlib.sha1(
+        stem.encode("utf-8")
+    ).hexdigest()[:12]
+    available = maximum_bytes - len(suffix) - len(digest) - 1
+    return f"{stem[:available]}-{digest}{suffix}"
 
 
 def build_modality_superpixel_assignments(
@@ -724,6 +775,128 @@ def build_cross_modal_overlap(
         hsi_to_lidar.astype(np.float32),
         lidar_to_hsi.astype(np.float32),
     )
+
+
+def build_overlap_distribution_targets(
+    hsi_assignment,
+    lidar_assignment,
+):
+    """Build count-normalized overlap targets and entropy confidence."""
+    overlap = hsi_assignment.transpose() @ lidar_assignment
+    if issparse(overlap):
+        overlap = overlap.toarray()
+    overlap = np.asarray(overlap, dtype=np.float32)
+
+    def directional_targets(counts):
+        row_sum = counts.sum(axis=1, keepdims=True)
+        targets = counts / np.maximum(row_sum, 1e-6)
+        positive_count = np.count_nonzero(counts, axis=1)
+        entropy = -np.sum(
+            np.where(
+                targets > 0,
+                targets * np.log(np.maximum(targets, 1e-12)),
+                0.0,
+            ),
+            axis=1,
+        )
+        confidence = np.ones(counts.shape[0], dtype=np.float32)
+        ambiguous = positive_count > 1
+        confidence[ambiguous] = (
+            1.0
+            - entropy[ambiguous]
+            / np.log(positive_count[ambiguous])
+        )
+        confidence[positive_count == 0] = 0.0
+        return (
+            targets.astype(np.float32),
+            np.clip(confidence, 0.0, 1.0).astype(np.float32),
+        )
+
+    hsi_to_lidar, hsi_confidence = directional_targets(overlap)
+    lidar_to_hsi, lidar_confidence = directional_targets(
+        overlap.transpose()
+    )
+    return {
+        "hsi_to_lidar": hsi_to_lidar,
+        "lidar_to_hsi": lidar_to_hsi,
+        "hsi_confidence": hsi_confidence,
+        "lidar_confidence": lidar_confidence,
+    }
+
+
+class OverlapDistributionContrastiveLoss(nn.Module):
+    """Multi-positive cross-modal alignment in a small shared subspace."""
+
+    def __init__(
+        self,
+        channels,
+        projection_dim,
+        temperature,
+        target_data,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.hsi_projector = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, projection_dim),
+        )
+        self.lidar_projector = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, projection_dim),
+        )
+        for name, value in target_data.items():
+            self.register_buffer(
+                name,
+                torch.as_tensor(value, dtype=torch.float32),
+                persistent=False,
+            )
+        self.last_hsi_to_lidar_loss = None
+        self.last_lidar_to_hsi_loss = None
+
+    @staticmethod
+    def _directional_loss(logits, targets, confidence):
+        log_probability = F.log_softmax(logits, dim=1)
+        per_anchor = -torch.sum(
+            targets * log_probability,
+            dim=1,
+        )
+        return torch.sum(confidence * per_anchor) / (
+            confidence.sum() + 1e-6
+        )
+
+    def forward(self, hsi_features, lidar_features):
+        hsi_shared = F.normalize(
+            self.hsi_projector(hsi_features),
+            dim=1,
+        )
+        lidar_shared = F.normalize(
+            self.lidar_projector(lidar_features),
+            dim=1,
+        )
+        logits = (
+            hsi_shared @ lidar_shared.transpose(0, 1)
+        ) / self.temperature
+        hsi_to_lidar_loss = self._directional_loss(
+            logits,
+            self.hsi_to_lidar,
+            self.hsi_confidence,
+        )
+        lidar_to_hsi_loss = self._directional_loss(
+            logits.transpose(0, 1),
+            self.lidar_to_hsi,
+            self.lidar_confidence,
+        )
+        self.last_hsi_to_lidar_loss = (
+            hsi_to_lidar_loss.detach()
+        )
+        self.last_lidar_to_hsi_loss = (
+            lidar_to_hsi_loss.detach()
+        )
+        return 0.5 * (
+            hsi_to_lidar_loss + lidar_to_hsi_loss
+        )
 
 
 def aggregate_cell_pixel_means(
@@ -1831,6 +2004,9 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         cross_modal_interaction="none",
         cross_attention_d_k=16,
         overlap_metric="iou",
+        contrastive_mode="none",
+        contrastive_temperature=0.2,
+        contrastive_dim=32,
         cell_interaction="none",
         cell_data=None,
         cell_pixel_descriptor="none",
@@ -1852,6 +2028,8 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.fusion_lambda = fusion_lambda
         self.cross_modal_interaction = cross_modal_interaction
         self.overlap_metric = overlap_metric
+        self.contrastive_mode = contrastive_mode
+        self.last_contrastive_loss = None
         self.cell_interaction = cell_interaction
         self.cell_interaction_stages = cell_interaction_stages
         self.cell_output_branch = cell_output_branch
@@ -1860,6 +2038,19 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.cell_veto_threshold = cell_veto_threshold
         use_qk_condition = (
             cross_modal_interaction == "overlap-qk-condition"
+        )
+        self.contrastive_module = (
+            OverlapDistributionContrastiveLoss(
+                hidden_dim,
+                contrastive_dim,
+                contrastive_temperature,
+                build_overlap_distribution_targets(
+                    hsi_assignment,
+                    lidar_assignment,
+                ),
+            )
+            if contrastive_mode == "overlap-soft"
+            else None
         )
         self.hsi_graph = ModalityGSDGGraphEncoder(
             in_channels=hsi_channels,
@@ -2093,6 +2284,19 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         )
         self.classifier = nn.Linear(hidden_dim, class_count)
 
+    def _update_contrastive_loss(
+        self,
+        hsi_features,
+        lidar_features,
+    ):
+        if self.training and self.contrastive_module is not None:
+            self.last_contrastive_loss = self.contrastive_module(
+                hsi_features,
+                lidar_features,
+            )
+        else:
+            self.last_contrastive_loss = None
+
     def _cell_topology_constraints(self):
         if self.cell_topology_veto == "none":
             return None, None, None, None
@@ -2118,6 +2322,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         )
 
     def forward(self, hsi, lidar, joint_input):
+        self.last_contrastive_loss = None
         if self.cell_layer is not None:
             hsi_nodes = self.hsi_graph.encode_nodes(hsi)
             lidar_nodes = self.lidar_graph.encode_nodes(lidar)
@@ -2197,6 +2402,10 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             else:
                 hsi_final_nodes = hsi_features + hsi_intra2
                 lidar_final_nodes = lidar_features + lidar_intra2
+            self._update_contrastive_loss(
+                hsi_final_nodes,
+                lidar_final_nodes,
+            )
             hsi_graph_features = self.hsi_graph.project_nodes(
                 hsi_final_nodes
             )
@@ -2204,9 +2413,41 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 lidar_final_nodes
             )
         elif self.cross_modal_interaction == "none":
-            # Preserve the original Stage-3 path exactly.
-            hsi_graph_features = self.hsi_graph(hsi)
-            lidar_graph_features = self.lidar_graph(lidar)
+            if self.contrastive_module is None:
+                # Preserve the original Stage-3 path exactly.
+                hsi_graph_features = self.hsi_graph(hsi)
+                lidar_graph_features = self.lidar_graph(lidar)
+            else:
+                hsi_nodes = self.hsi_graph.encode_nodes(hsi)
+                lidar_nodes = self.lidar_graph.encode_nodes(lidar)
+                (
+                    hsi_features,
+                    hsi_adjacency,
+                ) = self.hsi_graph.apply_gat1(hsi_nodes)
+                (
+                    lidar_features,
+                    lidar_adjacency,
+                ) = self.lidar_graph.apply_gat1(lidar_nodes)
+                hsi_final_nodes = self.hsi_graph.apply_gat2_nodes(
+                    hsi_features,
+                    adjacency=hsi_adjacency,
+                )
+                lidar_final_nodes = (
+                    self.lidar_graph.apply_gat2_nodes(
+                        lidar_features,
+                        adjacency=lidar_adjacency,
+                    )
+                )
+                self._update_contrastive_loss(
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                )
+                hsi_graph_features = self.hsi_graph.project_nodes(
+                    hsi_final_nodes
+                )
+                lidar_graph_features = self.lidar_graph.project_nodes(
+                    lidar_final_nodes
+                )
         elif (
             self.cross_modal_interaction
             == "overlap-qk-condition"
@@ -2223,18 +2464,40 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             lidar_cross_context = (
                 self.lidar_to_hsi_overlap @ hsi_features
             )
-            hsi_graph_features = (
-                self.hsi_graph.apply_gat2_and_project(
+            if self.contrastive_module is None:
+                hsi_graph_features = (
+                    self.hsi_graph.apply_gat2_and_project(
+                        hsi_features,
+                        cross_context=hsi_cross_context,
+                    )
+                )
+                lidar_graph_features = (
+                    self.lidar_graph.apply_gat2_and_project(
+                        lidar_features,
+                        cross_context=lidar_cross_context,
+                    )
+                )
+            else:
+                hsi_final_nodes = self.hsi_graph.apply_gat2_nodes(
                     hsi_features,
                     cross_context=hsi_cross_context,
                 )
-            )
-            lidar_graph_features = (
-                self.lidar_graph.apply_gat2_and_project(
-                    lidar_features,
-                    cross_context=lidar_cross_context,
+                lidar_final_nodes = (
+                    self.lidar_graph.apply_gat2_nodes(
+                        lidar_features,
+                        cross_context=lidar_cross_context,
+                    )
                 )
-            )
+                self._update_contrastive_loss(
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                )
+                hsi_graph_features = self.hsi_graph.project_nodes(
+                    hsi_final_nodes
+                )
+                lidar_graph_features = self.lidar_graph.project_nodes(
+                    lidar_final_nodes
+                )
         else:
             hsi_nodes = self.hsi_graph.encode_nodes(hsi)
             lidar_nodes = self.lidar_graph.encode_nodes(lidar)
@@ -2247,18 +2510,40 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 lidar_features,
             )
             # Cross-modal information participates in the second graph.
-            hsi_graph_features = (
-                self.hsi_graph.apply_gat2_and_project(
+            if self.contrastive_module is None:
+                hsi_graph_features = (
+                    self.hsi_graph.apply_gat2_and_project(
+                        hsi_features,
+                        rebuild_graph=True,
+                    )
+                )
+                lidar_graph_features = (
+                    self.lidar_graph.apply_gat2_and_project(
+                        lidar_features,
+                        rebuild_graph=True,
+                    )
+                )
+            else:
+                hsi_final_nodes = self.hsi_graph.apply_gat2_nodes(
                     hsi_features,
                     rebuild_graph=True,
                 )
-            )
-            lidar_graph_features = (
-                self.lidar_graph.apply_gat2_and_project(
-                    lidar_features,
-                    rebuild_graph=True,
+                lidar_final_nodes = (
+                    self.lidar_graph.apply_gat2_nodes(
+                        lidar_features,
+                        rebuild_graph=True,
+                    )
                 )
-            )
+                self._update_contrastive_loss(
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                )
+                hsi_graph_features = self.hsi_graph.project_nodes(
+                    hsi_final_nodes
+                )
+                lidar_graph_features = self.lidar_graph.project_nodes(
+                    lidar_final_nodes
+                )
         graph_features = (
             self.graph_modality_lambda * hsi_graph_features
             + (1.0 - self.graph_modality_lambda)
@@ -2496,6 +2781,11 @@ def train_one_run(
             cross_modal_interaction=args.cross_modal_interaction,
             cross_attention_d_k=args.cross_attention_dk,
             overlap_metric=args.overlap_metric,
+            contrastive_mode=args.contrastive_mode,
+            contrastive_temperature=(
+                args.contrastive_temperature
+            ),
+            contrastive_dim=args.contrastive_dim,
             cell_interaction=args.cell_interaction,
             cell_data=cell_data,
             cell_pixel_descriptor=args.cell_pixel_descriptor,
@@ -2536,9 +2826,20 @@ def train_one_run(
         model.train()
         optimizer.zero_grad()
         logits = forward_model()
-        loss = criterion(
+        classification_loss = criterion(
             logits.index_select(0, train_index),
             train_labels,
+        )
+        contrastive_loss = getattr(
+            model,
+            "last_contrastive_loss",
+            None,
+        )
+        if contrastive_loss is None:
+            contrastive_loss = classification_loss.new_zeros(())
+        loss = (
+            classification_loss
+            + args.contrastive_weight * contrastive_loss
         )
         loss.backward()
         optimizer.step()
@@ -2558,7 +2859,10 @@ def train_one_run(
             print(
                 f"Run {run_index + 1}/{args.runs} | "
                 f"Epoch {epoch:4d}/{args.epochs} | "
-                f"loss={loss.item():.6f} | train_OA={train_oa:.4f}"
+                f"loss={loss.item():.6f} | "
+                f"cls={classification_loss.item():.6f} | "
+                f"cm={contrastive_loss.item():.6f} | "
+                f"train_OA={train_oa:.4f}"
             )
 
     training_time = time.perf_counter() - start_time
@@ -2579,17 +2883,22 @@ def train_one_run(
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint = args.output_dir / (
+    checkpoint_stem = (
         f"{args.dataset}_{args.train_samples_per_class}px_"
         f"{STAGE}_{args.graph_layout}_"
         f"lidar-{args.lidar_segmentation}_"
         f"prior-{args.lidar_graph_prior}_"
         f"cross-{args.cross_modal_interaction}_"
         f"overlap-{args.overlap_metric}_"
+        f"{contrastive_configuration_tag(args)}_"
         f"{cell_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
         f"lidarmod-{args.lidar_modulation}_"
-        f"run{run_index + 1}.pt"
+        f"run{run_index + 1}"
+    )
+    checkpoint = args.output_dir / safe_output_filename(
+        checkpoint_stem,
+        ".pt",
     )
     torch.save(best_state, checkpoint)
     print(
@@ -2630,6 +2939,21 @@ def validate_args(args):
         raise ValueError("--lidar-height-knn-k must be positive.")
     if args.cross_attention_dk <= 0:
         raise ValueError("--cross-attention-dk must be positive.")
+    if args.contrastive_weight < 0:
+        raise ValueError("--contrastive-weight must be nonnegative.")
+    if args.contrastive_temperature <= 0:
+        raise ValueError(
+            "--contrastive-temperature must be positive."
+        )
+    if args.contrastive_dim <= 0:
+        raise ValueError("--contrastive-dim must be positive.")
+    if (
+        args.graph_layout == "joint"
+        and args.contrastive_mode != "none"
+    ):
+        raise ValueError(
+            "--contrastive-mode requires --graph-layout separate."
+        )
     if (
         args.graph_layout == "joint"
         and args.cross_modal_interaction != "none"
@@ -2787,6 +3111,17 @@ def main():
                 "both modalities' second-layer Q/K; no direct "
                 "overlap feature gate"
             )
+        print(
+            "Post-GAT2 overlap-distribution contrastive loss: "
+            f"{args.contrastive_mode}"
+        )
+        if args.contrastive_mode != "none":
+            print(
+                "Contrastive configuration: lambda="
+                f"{args.contrastive_weight:g}, tau="
+                f"{args.contrastive_temperature:g}, projection dim="
+                f"{args.contrastive_dim}; entropy confidence enabled"
+            )
         print(f"Intersection-cell interaction: {args.cell_interaction}")
         if args.cell_interaction == "rag":
             print(
@@ -2916,16 +3251,21 @@ def main():
         "summary": summary,
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    result_path = args.output_dir / (
+    result_stem = (
         f"{args.dataset}_{args.train_samples_per_class}px_"
         f"{STAGE}_{args.graph_layout}_"
         f"lidar-{args.lidar_segmentation}_"
         f"prior-{args.lidar_graph_prior}_"
         f"cross-{args.cross_modal_interaction}_"
         f"overlap-{args.overlap_metric}_"
+        f"{contrastive_configuration_tag(args)}_"
         f"{cell_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
-        f"lidarmod-{args.lidar_modulation}_results.json"
+        f"lidarmod-{args.lidar_modulation}_results"
+    )
+    result_path = args.output_dir / safe_output_filename(
+        result_stem,
+        ".json",
     )
     result_path.write_text(
         json.dumps(output, indent=2),
