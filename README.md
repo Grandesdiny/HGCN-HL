@@ -28,6 +28,7 @@ Stage-8 pipeline:
 
 ```bash
 --contrastive-mode overlap-prototype \
+--prototype-objective cosine \
 --contrastive-weight 0.05 \
 --contrastive-temperature 0.2 \
 --contrastive-dim 32
@@ -37,16 +38,17 @@ It is inserted after the two modality-specific GAT2 layers and immediately
 before their node features are projected back to pixels. Row-normalized
 shared-pixel counts `q_HL` and `q_LH` construct an opposite-modal structural
 prototype for every node: `prototype_L = q_HL @ z_L` and
-`prototype_H = q_LH @ z_H`. Each node contrasts against its own prototype
-as the positive and the other same-direction regional prototypes as
-in-batch negatives. Both directions are weighted by
+`prototype_H = q_LH @ z_H`. The default prototype objective minimizes
+`1 - cosine(node, own_opposite_modal_prototype)` in both directions, without
+using other nodes or prototypes as global negatives. Both directions are
+weighted by
 `1 - entropy(q) / log(number_of_overlapping_nodes)`. Independent projectors
 align only a low-dimensional shared subspace; pixel projection and
 classification continue to use the unprojected modality-private GAT2 node
 features. The projectors and contrastive similarity matrix are skipped in
-evaluation. `overlap-soft` remains available as the earlier
-distribution-cross-entropy ablation. `--contrastive-mode none` is the
-default.
+evaluation. `--prototype-objective infonce` retains the earlier global
+prototype-negative formulation, while `overlap-soft` remains the
+distribution-cross-entropy ablation. `--contrastive-mode none` is the default.
 
 Intersection-cell RAG interaction is an optional addition to this exact
 pipeline and is disabled by default. Enable it by appending:

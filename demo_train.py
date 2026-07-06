@@ -181,13 +181,27 @@ def parse_args():
         "--contrastive-temperature",
         type=float,
         default=0.2,
-        help="Cosine-similarity temperature. Default: 0.2.",
+        help=(
+            "Similarity temperature for overlap-soft and prototype "
+            "InfoNCE; unused by prototype cosine consistency. Default: 0.2."
+        ),
     )
     parser.add_argument(
         "--contrastive-dim",
         type=int,
         default=32,
         help="Shared projector output dimension. Default: 32.",
+    )
+    parser.add_argument(
+        "--prototype-objective",
+        choices=("cosine", "infonce"),
+        default="cosine",
+        help=(
+            "Objective used by overlap-prototype. 'cosine' performs "
+            "bidirectional node-prototype consistency without global "
+            "negatives; 'infonce' retains the earlier prototype "
+            "classification ablation. Default: cosine."
+        ),
     )
     parser.add_argument(
         "--cell-interaction",
@@ -350,8 +364,14 @@ def contrastive_configuration_tag(args):
         if args.contrastive_mode == "overlap-prototype"
         else "soft"
     )
+    objective_tag = (
+        f"-p{args.prototype_objective}"
+        if args.contrastive_mode == "overlap-prototype"
+        else ""
+    )
     return (
-        f"cm-{mode_tag}-w{args.contrastive_weight:g}-"
+        f"cm-{mode_tag}{objective_tag}-"
+        f"w{args.contrastive_weight:g}-"
         f"t{args.contrastive_temperature:g}-"
         f"d{args.contrastive_dim}"
     )
@@ -913,9 +933,11 @@ class OverlapPrototypeContrastiveLoss(nn.Module):
         projection_dim,
         temperature,
         target_data,
+        objective="cosine",
     ):
         super().__init__()
         self.temperature = temperature
+        self.objective = objective
         self.hsi_projector = nn.Sequential(
             nn.Linear(channels, channels),
             nn.LeakyReLU(),
@@ -943,18 +965,24 @@ class OverlapPrototypeContrastiveLoss(nn.Module):
         prototypes,
         confidence,
     ):
-        logits = (
-            anchors @ prototypes.transpose(0, 1)
-        ) / self.temperature
-        labels = torch.arange(
-            anchors.shape[0],
-            device=anchors.device,
-        )
-        per_anchor = F.cross_entropy(
-            logits,
-            labels,
-            reduction="none",
-        )
+        if self.objective == "cosine":
+            per_anchor = 1.0 - torch.sum(
+                anchors * prototypes,
+                dim=1,
+            )
+        else:
+            logits = (
+                anchors @ prototypes.transpose(0, 1)
+            ) / self.temperature
+            labels = torch.arange(
+                anchors.shape[0],
+                device=anchors.device,
+            )
+            per_anchor = F.cross_entropy(
+                logits,
+                labels,
+                reduction="none",
+            )
         return torch.sum(confidence * per_anchor) / (
             confidence.sum() + 1e-6
         )
@@ -2107,6 +2135,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         contrastive_mode="none",
         contrastive_temperature=0.2,
         contrastive_dim=32,
+        prototype_objective="cosine",
         cell_interaction="none",
         cell_data=None,
         cell_pixel_descriptor="none",
@@ -2142,20 +2171,31 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         if contrastive_mode == "none":
             self.contrastive_module = None
         else:
-            contrastive_class = (
-                OverlapPrototypeContrastiveLoss
-                if contrastive_mode == "overlap-prototype"
-                else OverlapDistributionContrastiveLoss
-            )
-            self.contrastive_module = contrastive_class(
-                hidden_dim,
-                contrastive_dim,
-                contrastive_temperature,
+            contrastive_targets = (
                 build_overlap_distribution_targets(
                     hsi_assignment,
                     lidar_assignment,
-                ),
+                )
             )
+            if contrastive_mode == "overlap-prototype":
+                self.contrastive_module = (
+                    OverlapPrototypeContrastiveLoss(
+                        hidden_dim,
+                        contrastive_dim,
+                        contrastive_temperature,
+                        contrastive_targets,
+                        objective=prototype_objective,
+                    )
+                )
+            else:
+                self.contrastive_module = (
+                    OverlapDistributionContrastiveLoss(
+                        hidden_dim,
+                        contrastive_dim,
+                        contrastive_temperature,
+                        contrastive_targets,
+                    )
+                )
         self.hsi_graph = ModalityGSDGGraphEncoder(
             in_channels=hsi_channels,
             assignment=hsi_assignment,
@@ -2890,6 +2930,7 @@ def train_one_run(
                 args.contrastive_temperature
             ),
             contrastive_dim=args.contrastive_dim,
+            prototype_objective=args.prototype_objective,
             cell_interaction=args.cell_interaction,
             cell_data=cell_data,
             cell_pixel_descriptor=args.cell_pixel_descriptor,
@@ -3225,12 +3266,25 @@ def main():
                 if args.contrastive_mode == "overlap-prototype"
                 else "soft overlap distribution"
             )
+            prototype_detail = (
+                f", prototype objective={args.prototype_objective}"
+                if args.contrastive_mode == "overlap-prototype"
+                else ""
+            )
+            temperature_detail = (
+                ""
+                if (
+                    args.contrastive_mode == "overlap-prototype"
+                    and args.prototype_objective == "cosine"
+                )
+                else f", tau={args.contrastive_temperature:g}"
+            )
             print(
                 "Contrastive configuration: lambda="
-                f"{args.contrastive_weight:g}, tau="
-                f"{args.contrastive_temperature:g}, projection dim="
+                f"{args.contrastive_weight:g}"
+                f"{temperature_detail}, projection dim="
                 f"{args.contrastive_dim}; entropy confidence enabled; "
-                f"target={contrastive_target}"
+                f"target={contrastive_target}{prototype_detail}"
             )
         print(f"Intersection-cell interaction: {args.cell_interaction}")
         if args.cell_interaction == "rag":
