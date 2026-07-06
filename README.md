@@ -50,6 +50,43 @@ evaluation. `--prototype-objective infonce` retains the earlier global
 prototype-negative formulation, while `overlap-soft` remains the
 distribution-cross-entropy ablation. `--contrastive-mode none` is the default.
 
+Overlap-constrained semantic transport distillation is available as a larger
+training-only ablation and is also disabled by default:
+
+```bash
+--contrastive-mode overlap-transport \
+--transport-semantic-weight 1.0 \
+--transport-iterations 10 \
+--transport-warmup-epochs 50 \
+--contrastive-weight 0.05 \
+--variance-weight 0.01 \
+--variance-target 1.0 \
+--contrastive-temperature 0.2 \
+--contrastive-dim 32
+```
+
+The raw shared-pixel matrix `M = Q_H^T Q_L`, normalized by the image pixel
+count, is already a feasible transport plan with HSI/LiDAR superpixel-area
+marginals. For the first `transport-warmup-epochs`, this fixed plan is used
+exactly. Semantic cosine similarity is then linearly introduced over the same
+number of epochs. Log-domain Sinkhorn scaling preserves the area marginals,
+and entries outside the true overlap support remain exactly zero. The
+transport produces bidirectional opposite-modal structural prototypes.
+Independent SimSiam-style predictors match each node to a stop-gradient
+prototype; a small per-dimension variance penalty protects the projected
+shared spaces from collapse. Projectors, predictors, transport, and losses
+are absent from inference. This mode requires one superpixel scale so each
+assignment matrix is a true pixel partition and its area marginals are
+well-defined.
+
+At each logging epoch, the result JSON stores both modalities' full
+per-dimension projector standard deviations, bidirectional and mean
+node-prototype cosine, maximum Sinkhorn row/column marginal errors, transport
+entropy, and semantic-ramp progress. OA, AA, and Kappa remain recorded for
+every run. The retained comparison modes are `none`, `overlap-soft`,
+`overlap-prototype` with either `infonce` or `cosine`, and
+`overlap-transport`.
+
 Intersection-cell RAG interaction is an optional addition to this exact
 pipeline and is disabled by default. Enable it by appending:
 

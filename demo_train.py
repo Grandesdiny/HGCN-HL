@@ -163,12 +163,18 @@ def parse_args():
     )
     parser.add_argument(
         "--contrastive-mode",
-        choices=("none", "overlap-soft", "overlap-prototype"),
+        choices=(
+            "none",
+            "overlap-soft",
+            "overlap-prototype",
+            "overlap-transport",
+        ),
         default="none",
         help=(
             "Training-only cross-modal contrastive alignment of GAT2 "
-            "node features before pixel projection, using soft "
-            "overlap-count targets. Default: none."
+            "node features before pixel projection. overlap-transport "
+            "uses overlap-supported semantic transport and SimSiam-style "
+            "distillation. Default: none."
         ),
     )
     parser.add_argument(
@@ -182,8 +188,9 @@ def parse_args():
         type=float,
         default=0.2,
         help=(
-            "Similarity temperature for overlap-soft and prototype "
-            "InfoNCE; unused by prototype cosine consistency. Default: 0.2."
+            "Similarity temperature for overlap-soft, prototype "
+            "InfoNCE, and transport semantics; unused by prototype "
+            "cosine consistency. Default: 0.2."
         ),
     )
     parser.add_argument(
@@ -201,6 +208,49 @@ def parse_args():
             "bidirectional node-prototype consistency without global "
             "negatives; 'infonce' retains the earlier prototype "
             "classification ablation. Default: cosine."
+        ),
+    )
+    parser.add_argument(
+        "--transport-semantic-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Beta multiplying semantic cosine similarity inside the "
+            "overlap-supported Sinkhorn kernel. Default: 1.0."
+        ),
+    )
+    parser.add_argument(
+        "--transport-iterations",
+        type=int,
+        default=10,
+        help="Number of log-domain Sinkhorn iterations. Default: 10.",
+    )
+    parser.add_argument(
+        "--transport-warmup-epochs",
+        type=int,
+        default=50,
+        help=(
+            "Epochs using fixed normalized overlap M before linearly "
+            "introducing semantic transport over the same duration. "
+            "Default: 50."
+        ),
+    )
+    parser.add_argument(
+        "--variance-weight",
+        type=float,
+        default=0.01,
+        help=(
+            "Lambda of the overlap-transport projector variance "
+            "regularizer. Ignored by other modes. Default: 0.01."
+        ),
+    )
+    parser.add_argument(
+        "--variance-target",
+        type=float,
+        default=1.0,
+        help=(
+            "Minimum per-dimension projector standard deviation gamma "
+            "for overlap-transport. Default: 1.0."
         ),
     )
     parser.add_argument(
@@ -359,18 +409,27 @@ def cell_configuration_tag(args):
 def contrastive_configuration_tag(args):
     if args.contrastive_mode == "none":
         return "cm-none"
-    mode_tag = (
-        "proto"
-        if args.contrastive_mode == "overlap-prototype"
-        else "soft"
-    )
+    mode_tag = {
+        "overlap-soft": "soft",
+        "overlap-prototype": "proto",
+        "overlap-transport": "transport",
+    }[args.contrastive_mode]
     objective_tag = (
         f"-p{args.prototype_objective}"
         if args.contrastive_mode == "overlap-prototype"
         else ""
     )
+    transport_tag = (
+        f"-b{args.transport_semantic_weight:g}"
+        f"-i{args.transport_iterations}"
+        f"-wu{args.transport_warmup_epochs}"
+        f"-vw{args.variance_weight:g}"
+        f"-vg{args.variance_target:g}"
+        if args.contrastive_mode == "overlap-transport"
+        else ""
+    )
     return (
-        f"cm-{mode_tag}{objective_tag}-"
+        f"cm-{mode_tag}{objective_tag}{transport_tag}-"
         f"w{args.contrastive_weight:g}-"
         f"t{args.contrastive_temperature:g}-"
         f"d{args.contrastive_dim}"
@@ -849,6 +908,34 @@ def build_overlap_distribution_targets(
     }
 
 
+def build_overlap_transport_targets(
+    hsi_assignment,
+    lidar_assignment,
+):
+    """Build a feasible overlap transport plan and its area marginals."""
+    overlap = hsi_assignment.transpose() @ lidar_assignment
+    if issparse(overlap):
+        overlap = overlap.toarray()
+    overlap = np.asarray(overlap, dtype=np.float32)
+    pixel_count = float(overlap.sum())
+    if pixel_count <= 0:
+        raise ValueError("Cross-modal overlap matrix is empty.")
+    row_marginal = overlap.sum(axis=1) / pixel_count
+    column_marginal = overlap.sum(axis=0) / pixel_count
+    if np.any(row_marginal <= 0) or np.any(column_marginal <= 0):
+        raise ValueError(
+            "Every superpixel must overlap at least one opposite-modal "
+            "superpixel."
+        )
+    return {
+        "overlap_count": overlap,
+        "overlap_mass": overlap / pixel_count,
+        "overlap_support": overlap > 0,
+        "row_marginal": row_marginal.astype(np.float32),
+        "column_marginal": column_marginal.astype(np.float32),
+    }
+
+
 class OverlapDistributionContrastiveLoss(nn.Module):
     """Multi-positive cross-modal alignment in a small shared subspace."""
 
@@ -1025,6 +1112,230 @@ class OverlapPrototypeContrastiveLoss(nn.Module):
         return 0.5 * (
             hsi_to_lidar_loss + lidar_to_hsi_loss
         )
+
+
+class OverlapTransportDistillationLoss(nn.Module):
+    """Overlap-supported semantic transport with SimSiam distillation."""
+
+    def __init__(
+        self,
+        channels,
+        projection_dim,
+        temperature,
+        target_data,
+        semantic_weight=1.0,
+        sinkhorn_iterations=10,
+        warmup_epochs=50,
+        variance_target=1.0,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.semantic_weight = semantic_weight
+        self.sinkhorn_iterations = sinkhorn_iterations
+        self.warmup_epochs = warmup_epochs
+        self.variance_target = variance_target
+        self.current_epoch = 0
+        self.hsi_projector = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, projection_dim),
+        )
+        self.lidar_projector = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, projection_dim),
+        )
+        self.hsi_predictor = nn.Sequential(
+            nn.Linear(projection_dim, projection_dim),
+            nn.LeakyReLU(),
+            nn.Linear(projection_dim, projection_dim),
+        )
+        self.lidar_predictor = nn.Sequential(
+            nn.Linear(projection_dim, projection_dim),
+            nn.LeakyReLU(),
+            nn.Linear(projection_dim, projection_dim),
+        )
+        for name, value in target_data.items():
+            tensor = torch.as_tensor(value)
+            if tensor.dtype != torch.bool:
+                tensor = tensor.to(dtype=torch.float32)
+            self.register_buffer(name, tensor, persistent=False)
+        self.last_variance_loss = None
+        self.last_diagnostics = None
+        self.last_transport = None
+
+    def set_epoch(self, epoch):
+        self.current_epoch = int(epoch)
+
+    def _semantic_progress(self):
+        if self.warmup_epochs == 0:
+            return 1.0
+        if self.current_epoch <= self.warmup_epochs:
+            return 0.0
+        return min(
+            1.0,
+            (self.current_epoch - self.warmup_epochs)
+            / float(self.warmup_epochs),
+        )
+
+    def _sinkhorn(self, semantic_similarity, semantic_progress):
+        if semantic_progress == 0.0 or self.semantic_weight == 0.0:
+            return self.overlap_mass
+        negative_infinity = torch.full_like(
+            self.overlap_count,
+            -torch.inf,
+        )
+        log_kernel = torch.where(
+            self.overlap_support,
+            torch.log(self.overlap_count.clamp_min(1e-12))
+            + self.semantic_weight
+            * semantic_progress
+            * semantic_similarity,
+            negative_infinity,
+        )
+        log_row = torch.log(self.row_marginal.clamp_min(1e-12))
+        log_column = torch.log(
+            self.column_marginal.clamp_min(1e-12)
+        )
+        log_u = torch.zeros_like(log_row)
+        log_v = torch.zeros_like(log_column)
+        for _ in range(self.sinkhorn_iterations):
+            log_u = log_row - torch.logsumexp(
+                log_kernel + log_v.unsqueeze(0),
+                dim=1,
+            )
+            log_v = log_column - torch.logsumexp(
+                log_kernel + log_u.unsqueeze(1),
+                dim=0,
+            )
+        return torch.exp(
+            log_kernel
+            + log_u.unsqueeze(1)
+            + log_v.unsqueeze(0)
+        )
+
+    def _variance_loss(self, hsi_projection, lidar_projection):
+        hsi_std = torch.sqrt(
+            hsi_projection.var(dim=0, unbiased=False) + 1e-4
+        )
+        lidar_std = torch.sqrt(
+            lidar_projection.var(dim=0, unbiased=False) + 1e-4
+        )
+        loss = 0.5 * (
+            F.relu(self.variance_target - hsi_std).mean()
+            + F.relu(self.variance_target - lidar_std).mean()
+        )
+        return loss, hsi_std, lidar_std
+
+    def forward(self, hsi_features, lidar_features):
+        hsi_projection = self.hsi_projector(hsi_features)
+        lidar_projection = self.lidar_projector(lidar_features)
+        hsi_shared = F.normalize(hsi_projection, dim=1)
+        lidar_shared = F.normalize(lidar_projection, dim=1)
+        semantic_similarity = (
+            hsi_shared @ lidar_shared.transpose(0, 1)
+        ) / self.temperature
+        semantic_progress = self._semantic_progress()
+        transport = self._sinkhorn(
+            semantic_similarity.detach(),
+            semantic_progress,
+        )
+        lidar_prototypes = F.normalize(
+            (
+                transport @ lidar_shared
+            )
+            / self.row_marginal.unsqueeze(1).clamp_min(1e-12),
+            dim=1,
+        )
+        hsi_prototypes = F.normalize(
+            (
+                transport.transpose(0, 1) @ hsi_shared
+            )
+            / self.column_marginal.unsqueeze(1).clamp_min(1e-12),
+            dim=1,
+        )
+        hsi_prediction = F.normalize(
+            self.hsi_predictor(hsi_projection),
+            dim=1,
+        )
+        lidar_prediction = F.normalize(
+            self.lidar_predictor(lidar_projection),
+            dim=1,
+        )
+        hsi_to_lidar_cosine = torch.sum(
+            hsi_prediction * lidar_prototypes.detach(),
+            dim=1,
+        )
+        lidar_to_hsi_cosine = torch.sum(
+            lidar_prediction * hsi_prototypes.detach(),
+            dim=1,
+        )
+        distillation_loss = 0.5 * (
+            (1.0 - hsi_to_lidar_cosine).mean()
+            + (1.0 - lidar_to_hsi_cosine).mean()
+        )
+        (
+            variance_loss,
+            hsi_std,
+            lidar_std,
+        ) = self._variance_loss(
+            hsi_projection,
+            lidar_projection,
+        )
+        row_error = torch.max(
+            torch.abs(
+                transport.sum(dim=1) - self.row_marginal
+            )
+        )
+        column_error = torch.max(
+            torch.abs(
+                transport.sum(dim=0) - self.column_marginal
+            )
+        )
+        transport_entropy = -torch.sum(
+            transport
+            * torch.log(transport.clamp_min(1e-12))
+        )
+        self.last_variance_loss = variance_loss
+        self.last_transport = transport.detach()
+        self.last_diagnostics = {
+            "semantic_progress": float(semantic_progress),
+            "hsi_projector_std": hsi_std.detach(),
+            "lidar_projector_std": lidar_std.detach(),
+            "hsi_to_lidar_cosine": (
+                hsi_to_lidar_cosine.mean().detach()
+            ),
+            "lidar_to_hsi_cosine": (
+                lidar_to_hsi_cosine.mean().detach()
+            ),
+            "mean_node_prototype_cosine": (
+                0.5
+                * (
+                    hsi_to_lidar_cosine.mean()
+                    + lidar_to_hsi_cosine.mean()
+                )
+            ).detach(),
+            "sinkhorn_row_max_error": row_error.detach(),
+            "sinkhorn_column_max_error": column_error.detach(),
+            "transport_entropy": transport_entropy.detach(),
+        }
+        return distillation_loss
+
+    def diagnostics(self):
+        if self.last_diagnostics is None:
+            return None
+        output = {}
+        for name, value in self.last_diagnostics.items():
+            if torch.is_tensor(value):
+                value = value.detach().cpu()
+                output[name] = (
+                    value.tolist()
+                    if value.ndim > 0
+                    else float(value.item())
+                )
+            else:
+                output[name] = value
+        return output
 
 
 def aggregate_cell_pixel_means(
@@ -2136,6 +2447,10 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         contrastive_temperature=0.2,
         contrastive_dim=32,
         prototype_objective="cosine",
+        transport_semantic_weight=1.0,
+        transport_iterations=10,
+        transport_warmup_epochs=50,
+        variance_target=1.0,
         cell_interaction="none",
         cell_data=None,
         cell_pixel_descriptor="none",
@@ -2159,6 +2474,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.overlap_metric = overlap_metric
         self.contrastive_mode = contrastive_mode
         self.last_contrastive_loss = None
+        self.last_variance_loss = None
         self.cell_interaction = cell_interaction
         self.cell_interaction_stages = cell_interaction_stages
         self.cell_output_branch = cell_output_branch
@@ -2171,13 +2487,32 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         if contrastive_mode == "none":
             self.contrastive_module = None
         else:
-            contrastive_targets = (
-                build_overlap_distribution_targets(
+            if contrastive_mode == "overlap-transport":
+                transport_targets = build_overlap_transport_targets(
                     hsi_assignment,
                     lidar_assignment,
                 )
-            )
-            if contrastive_mode == "overlap-prototype":
+                self.contrastive_module = (
+                    OverlapTransportDistillationLoss(
+                        hidden_dim,
+                        contrastive_dim,
+                        contrastive_temperature,
+                        transport_targets,
+                        semantic_weight=(
+                            transport_semantic_weight
+                        ),
+                        sinkhorn_iterations=transport_iterations,
+                        warmup_epochs=transport_warmup_epochs,
+                        variance_target=variance_target,
+                    )
+                )
+            elif contrastive_mode == "overlap-prototype":
+                contrastive_targets = (
+                    build_overlap_distribution_targets(
+                        hsi_assignment,
+                        lidar_assignment,
+                    )
+                )
                 self.contrastive_module = (
                     OverlapPrototypeContrastiveLoss(
                         hidden_dim,
@@ -2188,6 +2523,12 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     )
                 )
             else:
+                contrastive_targets = (
+                    build_overlap_distribution_targets(
+                        hsi_assignment,
+                        lidar_assignment,
+                    )
+                )
                 self.contrastive_module = (
                     OverlapDistributionContrastiveLoss(
                         hidden_dim,
@@ -2425,8 +2766,15 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 hidden_dim,
                 kernel_size=5,
             ),
-        )
+            )
         self.classifier = nn.Linear(hidden_dim, class_count)
+
+    def set_contrastive_epoch(self, epoch):
+        if (
+            self.contrastive_module is not None
+            and hasattr(self.contrastive_module, "set_epoch")
+        ):
+            self.contrastive_module.set_epoch(epoch)
 
     def _update_contrastive_loss(
         self,
@@ -2438,8 +2786,14 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 hsi_features,
                 lidar_features,
             )
+            self.last_variance_loss = getattr(
+                self.contrastive_module,
+                "last_variance_loss",
+                None,
+            )
         else:
             self.last_contrastive_loss = None
+            self.last_variance_loss = None
 
     def _cell_topology_constraints(self):
         if self.cell_topology_veto == "none":
@@ -2467,6 +2821,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
 
     def forward(self, hsi, lidar, joint_input):
         self.last_contrastive_loss = None
+        self.last_variance_loss = None
         if self.cell_layer is not None:
             hsi_nodes = self.hsi_graph.encode_nodes(hsi)
             lidar_nodes = self.lidar_graph.encode_nodes(lidar)
@@ -2931,6 +3286,14 @@ def train_one_run(
             ),
             contrastive_dim=args.contrastive_dim,
             prototype_objective=args.prototype_objective,
+            transport_semantic_weight=(
+                args.transport_semantic_weight
+            ),
+            transport_iterations=args.transport_iterations,
+            transport_warmup_epochs=(
+                args.transport_warmup_epochs
+            ),
+            variance_target=args.variance_target,
             cell_interaction=args.cell_interaction,
             cell_data=cell_data,
             cell_pixel_descriptor=args.cell_pixel_descriptor,
@@ -2965,10 +3328,13 @@ def train_one_run(
     criterion = nn.CrossEntropyLoss()
     best_loss = float("inf")
     best_state = None
+    transport_diagnostics = []
     start_time = time.perf_counter()
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+        if hasattr(model, "set_contrastive_epoch"):
+            model.set_contrastive_epoch(epoch)
         optimizer.zero_grad()
         logits = forward_model()
         classification_loss = criterion(
@@ -2982,9 +3348,17 @@ def train_one_run(
         )
         if contrastive_loss is None:
             contrastive_loss = classification_loss.new_zeros(())
+        variance_loss = getattr(
+            model,
+            "last_variance_loss",
+            None,
+        )
+        if variance_loss is None:
+            variance_loss = classification_loss.new_zeros(())
         loss = (
             classification_loss
             + args.contrastive_weight * contrastive_loss
+            + args.variance_weight * variance_loss
         )
         loss.backward()
         optimizer.step()
@@ -2995,6 +3369,27 @@ def train_one_run(
                 for key, value in model.state_dict().items()
             }
         if epoch == 1 or epoch % args.log_interval == 0:
+            transport_record = None
+            contrastive_module = getattr(
+                model,
+                "contrastive_module",
+                None,
+            )
+            if (
+                contrastive_module is not None
+                and hasattr(contrastive_module, "diagnostics")
+            ):
+                transport_record = (
+                    contrastive_module.diagnostics()
+                )
+                if transport_record is not None:
+                    transport_record = {
+                        "epoch": epoch,
+                        **transport_record,
+                    }
+                    transport_diagnostics.append(
+                        transport_record
+                    )
             train_predictions = (
                 logits.index_select(0, train_index).argmax(dim=1)
             )
@@ -3007,8 +3402,32 @@ def train_one_run(
                 f"loss={loss.item():.6f} | "
                 f"cls={classification_loss.item():.6f} | "
                 f"cm={contrastive_loss.item():.6f} | "
+                f"var={variance_loss.item():.6f} | "
                 f"train_OA={train_oa:.4f}"
             )
+            if transport_record is not None:
+                hsi_std = np.asarray(
+                    transport_record["hsi_projector_std"]
+                )
+                lidar_std = np.asarray(
+                    transport_record["lidar_projector_std"]
+                )
+                print(
+                    "  transport | semantic-progress="
+                    f"{transport_record['semantic_progress']:.3f} | "
+                    "node-prototype-cos="
+                    f"{transport_record['mean_node_prototype_cosine']:.4f} | "
+                    "row-error="
+                    f"{transport_record['sinkhorn_row_max_error']:.2e} | "
+                    "column-error="
+                    f"{transport_record['sinkhorn_column_max_error']:.2e} | "
+                    "entropy="
+                    f"{transport_record['transport_entropy']:.4f} | "
+                    "projector-std H/L mean="
+                    f"{hsi_std.mean():.4f}/{lidar_std.mean():.4f}, "
+                    "min="
+                    f"{hsi_std.min():.4f}/{lidar_std.min():.4f}"
+                )
 
     training_time = time.perf_counter() - start_time
     model.load_state_dict(best_state)
@@ -3058,6 +3477,7 @@ def train_one_run(
         "class_accuracy": class_accuracy.tolist(),
         "training_time": training_time,
         "checkpoint": str(checkpoint),
+        "transport_diagnostics": transport_diagnostics,
     }
 
 
@@ -3092,12 +3512,34 @@ def validate_args(args):
         )
     if args.contrastive_dim <= 0:
         raise ValueError("--contrastive-dim must be positive.")
+    if args.transport_semantic_weight < 0:
+        raise ValueError(
+            "--transport-semantic-weight must be nonnegative."
+        )
+    if args.transport_iterations <= 0:
+        raise ValueError("--transport-iterations must be positive.")
+    if args.transport_warmup_epochs < 0:
+        raise ValueError(
+            "--transport-warmup-epochs must be nonnegative."
+        )
+    if args.variance_weight < 0:
+        raise ValueError("--variance-weight must be nonnegative.")
+    if args.variance_target <= 0:
+        raise ValueError("--variance-target must be positive.")
     if (
         args.graph_layout == "joint"
         and args.contrastive_mode != "none"
     ):
         raise ValueError(
             "--contrastive-mode requires --graph-layout separate."
+        )
+    if (
+        args.contrastive_mode == "overlap-transport"
+        and len(args.scales) != 1
+    ):
+        raise ValueError(
+            "--contrastive-mode overlap-transport requires exactly "
+            "one superpixel scale so Q_H and Q_L are partitions."
         )
     if (
         args.graph_layout == "joint"
@@ -3261,14 +3703,30 @@ def main():
             f"{args.contrastive_mode}"
         )
         if args.contrastive_mode != "none":
-            contrastive_target = (
-                "opposite-modal overlap prototype"
-                if args.contrastive_mode == "overlap-prototype"
-                else "soft overlap distribution"
-            )
+            contrastive_target = {
+                "overlap-soft": "soft overlap distribution",
+                "overlap-prototype": (
+                    "opposite-modal overlap prototype"
+                ),
+                "overlap-transport": (
+                    "overlap-supported semantic transport prototype"
+                ),
+            }[args.contrastive_mode]
             prototype_detail = (
                 f", prototype objective={args.prototype_objective}"
                 if args.contrastive_mode == "overlap-prototype"
+                else ""
+            )
+            transport_detail = (
+                ", semantic beta="
+                f"{args.transport_semantic_weight:g}, Sinkhorn "
+                f"iterations={args.transport_iterations}, fixed-overlap "
+                f"warmup={args.transport_warmup_epochs} epochs, "
+                "linear semantic ramp="
+                f"{args.transport_warmup_epochs} epochs, variance "
+                f"lambda={args.variance_weight:g}, gamma="
+                f"{args.variance_target:g}"
+                if args.contrastive_mode == "overlap-transport"
                 else ""
             )
             temperature_detail = (
@@ -3283,8 +3741,9 @@ def main():
                 "Contrastive configuration: lambda="
                 f"{args.contrastive_weight:g}"
                 f"{temperature_detail}, projection dim="
-                f"{args.contrastive_dim}; entropy confidence enabled; "
-                f"target={contrastive_target}{prototype_detail}"
+                f"{args.contrastive_dim}; target="
+                f"{contrastive_target}{prototype_detail}"
+                f"{transport_detail}"
             )
         print(f"Intersection-cell interaction: {args.cell_interaction}")
         if args.cell_interaction == "rag":
