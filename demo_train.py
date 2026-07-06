@@ -23,6 +23,7 @@ from sklearn.decomposition import PCA
 
 from train import (
     DATASET_CONFIG,
+    DwsConv,
     DynamicGraphBuilder,
     FDSM,
     MultiHeadGAT,
@@ -211,6 +212,70 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--post-gat-prototype-fusion",
+        choices=("none", "spsn-correlation"),
+        default="none",
+        help=(
+            "Optional SPSN-inspired prototype selection, correlation "
+            "maps, and pixel-wise modality reliability fusion after "
+            "GAT2. Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--post-gat-consensus",
+        choices=("none", "mssagf-anchor"),
+        default="none",
+        help=(
+            "Optional single post-GAT2 cross-modal interaction through "
+            "shared consensus anchors. Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-anchor-count",
+        type=int,
+        default=0,
+        help=(
+            "Number of shared consensus anchors. Zero resolves to twice "
+            "the dataset class count. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-temperature",
+        type=float,
+        default=0.2,
+        help=(
+            "Soft node-to-consensus-anchor assignment temperature. "
+            "Default: 0.2."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-gamma-init",
+        type=float,
+        default=0.0,
+        help=(
+            "Initial learnable residual write-back scale for both "
+            "modalities. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--spsn-prototype-count",
+        type=int,
+        default=32,
+        help=(
+            "Number of independently selected GAT2 prototypes per "
+            "modality for spsn-correlation. Default: 32."
+        ),
+    )
+    parser.add_argument(
+        "--spsn-correlation-temperature",
+        type=float,
+        default=0.2,
+        help=(
+            "Cosine-correlation softmax temperature for the selected "
+            "post-GAT prototypes. Default: 0.2."
+        ),
+    )
+    parser.add_argument(
         "--transport-semantic-weight",
         type=float,
         default=1.0,
@@ -357,6 +422,17 @@ def parse_args():
             "a geometry-conditioned gate. Default: none."
         ),
     )
+    parser.add_argument(
+        "--cnn-branch",
+        choices=("original", "gsdg"),
+        default="original",
+        help=(
+            "Joint pixel CNN fused with the graph output. 'original' "
+            "keeps HGCN-HL 5x5/5x5 SSConv; 'gsdg' uses GSDG 3x3/7x7 "
+            "depthwise-separable convolution at the same hidden width. "
+            "Default: original."
+        ),
+    )
     parser.add_argument("--fusion-lambda", type=float, default=0.5)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.4)
@@ -433,6 +509,30 @@ def contrastive_configuration_tag(args):
         f"w{args.contrastive_weight:g}-"
         f"t{args.contrastive_temperature:g}-"
         f"d{args.contrastive_dim}"
+    )
+
+
+def prototype_fusion_configuration_tag(args):
+    if args.post_gat_prototype_fusion == "none":
+        return "pgpf-none"
+    return (
+        f"pgpf-spsn-k{args.spsn_prototype_count}-"
+        f"t{args.spsn_correlation_temperature:g}"
+    )
+
+
+def consensus_configuration_tag(args, class_count):
+    if args.post_gat_consensus == "none":
+        return "consensus-none"
+    anchor_count = (
+        args.consensus_anchor_count
+        if args.consensus_anchor_count > 0
+        else 2 * class_count
+    )
+    return (
+        f"consensus-anchor-k{anchor_count}-"
+        f"t{args.consensus_temperature:g}-"
+        f"g{args.consensus_gamma_init:g}"
     )
 
 
@@ -1336,6 +1436,359 @@ class OverlapTransportDistillationLoss(nn.Module):
             else:
                 output[name] = value
         return output
+
+
+class PostGATPrototypeCorrelationFusion(nn.Module):
+    """SPSN-inspired selected-prototype correlation and reliability fusion."""
+
+    def __init__(
+        self,
+        channels,
+        prototype_count,
+        temperature,
+        initial_hsi_weight=0.5,
+    ):
+        super().__init__()
+        self.prototype_count = prototype_count
+        self.temperature = temperature
+        selector_hidden = max(channels // 2, 16)
+
+        def make_selector():
+            return nn.Sequential(
+                nn.LayerNorm(channels),
+                nn.Linear(channels, selector_hidden),
+                nn.LeakyReLU(),
+                nn.Linear(selector_hidden, 1),
+            )
+
+        self.hsi_selector = make_selector()
+        self.lidar_selector = make_selector()
+        self.hsi_correlation_adapter = nn.Linear(
+            prototype_count,
+            channels,
+        )
+        self.lidar_correlation_adapter = nn.Linear(
+            prototype_count,
+            channels,
+        )
+        reliability_hidden = max(prototype_count, 16)
+        self.reliability_gate = nn.Sequential(
+            nn.Linear(2 * prototype_count, reliability_hidden),
+            nn.LeakyReLU(),
+            nn.Linear(reliability_hidden, 2),
+        )
+        for adapter in (
+            self.hsi_correlation_adapter,
+            self.lidar_correlation_adapter,
+        ):
+            nn.init.normal_(adapter.weight, std=1e-3)
+            nn.init.zeros_(adapter.bias)
+        output_layer = self.reliability_gate[-1]
+        nn.init.zeros_(output_layer.weight)
+        clipped_hsi_weight = min(
+            max(float(initial_hsi_weight), 1e-4),
+            1.0 - 1e-4,
+        )
+        with torch.no_grad():
+            output_layer.bias.copy_(
+                torch.log(
+                    torch.tensor(
+                        [
+                            clipped_hsi_weight,
+                            1.0 - clipped_hsi_weight,
+                        ],
+                        dtype=output_layer.bias.dtype,
+                    )
+                )
+            )
+        self.last_diagnostics = None
+
+    def _correlation_map(
+        self,
+        node_features,
+        projection_assignment,
+        selector,
+    ):
+        selection_scores = torch.sigmoid(
+            selector(node_features).squeeze(-1)
+        )
+        selected_scores, selected_indices = torch.topk(
+            selection_scores,
+            k=self.prototype_count,
+            dim=0,
+            sorted=True,
+        )
+        selected_prototypes = node_features.index_select(
+            0,
+            selected_indices,
+        )
+        normalized_nodes = F.normalize(node_features, dim=1)
+        normalized_prototypes = F.normalize(
+            selected_prototypes,
+            dim=1,
+        )
+        correlation_logits = (
+            normalized_nodes @ normalized_prototypes.transpose(0, 1)
+        ) / self.temperature
+        correlation_logits = (
+            correlation_logits
+            + torch.log(selected_scores.clamp_min(1e-6)).unsqueeze(0)
+        )
+        node_correlation = F.softmax(
+            correlation_logits,
+            dim=1,
+        )
+        pixel_correlation = torch.sparse.mm(
+            projection_assignment,
+            node_correlation,
+        )
+        return (
+            pixel_correlation,
+            selected_scores,
+            selected_indices,
+        )
+
+    def forward(
+        self,
+        hsi_nodes,
+        lidar_nodes,
+        hsi_pixel_features,
+        lidar_pixel_features,
+        hsi_projection_assignment,
+        lidar_projection_assignment,
+    ):
+        (
+            hsi_correlation,
+            hsi_selected_scores,
+            hsi_selected_indices,
+        ) = self._correlation_map(
+            hsi_nodes,
+            hsi_projection_assignment,
+            self.hsi_selector,
+        )
+        (
+            lidar_correlation,
+            lidar_selected_scores,
+            lidar_selected_indices,
+        ) = self._correlation_map(
+            lidar_nodes,
+            lidar_projection_assignment,
+            self.lidar_selector,
+        )
+        hsi_enhanced = (
+            hsi_pixel_features
+            + self.hsi_correlation_adapter(hsi_correlation)
+        )
+        lidar_enhanced = (
+            lidar_pixel_features
+            + self.lidar_correlation_adapter(lidar_correlation)
+        )
+        reliability = F.softmax(
+            self.reliability_gate(
+                torch.cat(
+                    [hsi_correlation, lidar_correlation],
+                    dim=1,
+                )
+            ),
+            dim=1,
+        )
+        fused_features = (
+            reliability[:, :1] * hsi_enhanced
+            + reliability[:, 1:] * lidar_enhanced
+        )
+        self.last_diagnostics = {
+            "hsi_selected_indices": (
+                hsi_selected_indices.detach().cpu().tolist()
+            ),
+            "lidar_selected_indices": (
+                lidar_selected_indices.detach().cpu().tolist()
+            ),
+            "hsi_selected_score_mean": float(
+                hsi_selected_scores.detach().mean().item()
+            ),
+            "lidar_selected_score_mean": float(
+                lidar_selected_scores.detach().mean().item()
+            ),
+            "hsi_reliability_mean": float(
+                reliability[:, 0].detach().mean().item()
+            ),
+            "lidar_reliability_mean": float(
+                reliability[:, 1].detach().mean().item()
+            ),
+        }
+        return fused_features
+
+    def diagnostics(self):
+        return self.last_diagnostics
+
+
+class PostGATConsensusAnchorInteraction(nn.Module):
+    """Area-aware shared anchors with residual write-back to both graphs."""
+
+    def __init__(
+        self,
+        channels,
+        anchor_count,
+        temperature,
+        hsi_area,
+        lidar_area,
+        gamma_init=0.0,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.consensus_anchors = nn.Parameter(
+            torch.empty(anchor_count, channels)
+        )
+        nn.init.xavier_uniform_(self.consensus_anchors)
+        self.hsi_key_projection = nn.Linear(
+            channels,
+            channels,
+            bias=False,
+        )
+        self.lidar_key_projection = nn.Linear(
+            channels,
+            channels,
+            bias=False,
+        )
+        self.hsi_value_projection = nn.Linear(
+            channels,
+            channels,
+            bias=False,
+        )
+        self.lidar_value_projection = nn.Linear(
+            channels,
+            channels,
+            bias=False,
+        )
+        nn.init.eye_(self.hsi_value_projection.weight)
+        nn.init.eye_(self.lidar_value_projection.weight)
+        self.hsi_gamma = nn.Parameter(
+            torch.tensor(float(gamma_init))
+        )
+        self.lidar_gamma = nn.Parameter(
+            torch.tensor(float(gamma_init))
+        )
+        self.register_buffer(
+            "hsi_area",
+            torch.as_tensor(hsi_area, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "lidar_area",
+            torch.as_tensor(lidar_area, dtype=torch.float32),
+            persistent=False,
+        )
+        self.last_diagnostics = None
+
+    def _soft_assignment(self, nodes, projection):
+        node_keys = F.normalize(projection(nodes), dim=1)
+        anchor_keys = F.normalize(
+            self.consensus_anchors,
+            dim=1,
+        )
+        return F.softmax(
+            (
+                node_keys
+                @ anchor_keys.transpose(0, 1)
+            )
+            / self.temperature,
+            dim=1,
+        )
+
+    @staticmethod
+    def _area_weighted_anchor_features(
+        assignment,
+        area,
+        nodes,
+    ):
+        weighted_nodes = area.unsqueeze(1) * nodes
+        numerator = assignment.transpose(0, 1) @ weighted_nodes
+        denominator = (
+            assignment.transpose(0, 1) @ area
+        ).unsqueeze(1)
+        return numerator / denominator.clamp_min(1e-6)
+
+    @staticmethod
+    def _mean_assignment_entropy(assignment):
+        return (
+            -torch.sum(
+                assignment
+                * torch.log(assignment.clamp_min(1e-12)),
+                dim=1,
+            )
+        ).mean()
+
+    def forward(self, hsi_nodes, lidar_nodes):
+        hsi_assignment = self._soft_assignment(
+            hsi_nodes,
+            self.hsi_key_projection,
+        )
+        lidar_assignment = self._soft_assignment(
+            lidar_nodes,
+            self.lidar_key_projection,
+        )
+        hsi_anchor_features = (
+            self._area_weighted_anchor_features(
+                hsi_assignment,
+                self.hsi_area,
+                hsi_nodes,
+            )
+        )
+        lidar_anchor_features = (
+            self._area_weighted_anchor_features(
+                lidar_assignment,
+                self.lidar_area,
+                lidar_nodes,
+            )
+        )
+        consensus = 0.5 * (
+            self.hsi_value_projection(hsi_anchor_features)
+            + self.lidar_value_projection(
+                lidar_anchor_features
+            )
+        )
+        hsi_message = hsi_assignment @ consensus
+        lidar_message = lidar_assignment @ consensus
+        updated_hsi = (
+            hsi_nodes + self.hsi_gamma * hsi_message
+        )
+        updated_lidar = (
+            lidar_nodes + self.lidar_gamma * lidar_message
+        )
+        self.last_diagnostics = {
+            "hsi_gamma": float(
+                self.hsi_gamma.detach().item()
+            ),
+            "lidar_gamma": float(
+                self.lidar_gamma.detach().item()
+            ),
+            "hsi_assignment_entropy": float(
+                self._mean_assignment_entropy(
+                    hsi_assignment
+                ).detach().item()
+            ),
+            "lidar_assignment_entropy": float(
+                self._mean_assignment_entropy(
+                    lidar_assignment
+                ).detach().item()
+            ),
+            "hsi_anchor_mass_min": float(
+                (
+                    hsi_assignment.transpose(0, 1)
+                    @ self.hsi_area
+                ).detach().min().item()
+            ),
+            "lidar_anchor_mass_min": float(
+                (
+                    lidar_assignment.transpose(0, 1)
+                    @ self.lidar_area
+                ).detach().min().item()
+            ),
+        }
+        return updated_hsi, updated_lidar
+
+    def diagnostics(self):
+        return self.last_diagnostics
 
 
 def aggregate_cell_pixel_means(
@@ -2447,6 +2900,13 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         contrastive_temperature=0.2,
         contrastive_dim=32,
         prototype_objective="cosine",
+        post_gat_prototype_fusion="none",
+        spsn_prototype_count=32,
+        spsn_correlation_temperature=0.2,
+        post_gat_consensus="none",
+        consensus_anchor_count=0,
+        consensus_temperature=0.2,
+        consensus_gamma_init=0.0,
         transport_semantic_weight=1.0,
         transport_iterations=10,
         transport_warmup_epochs=50,
@@ -2462,6 +2922,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         cell_veto_threshold=0.05,
         fdsm_scope="none",
         lidar_modulation="none",
+        cnn_branch="original",
         lidar_rag_adjacency=None,
         lidar_geometry_descriptors=None,
     ):
@@ -2475,12 +2936,17 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.contrastive_mode = contrastive_mode
         self.last_contrastive_loss = None
         self.last_variance_loss = None
+        self.post_gat_prototype_fusion = (
+            post_gat_prototype_fusion
+        )
+        self.post_gat_consensus = post_gat_consensus
         self.cell_interaction = cell_interaction
         self.cell_interaction_stages = cell_interaction_stages
         self.cell_output_branch = cell_output_branch
         self.cell_output_weight = cell_output_weight
         self.cell_topology_veto = cell_topology_veto
         self.cell_veto_threshold = cell_veto_threshold
+        self.cnn_branch_mode = cnn_branch
         use_qk_condition = (
             cross_modal_interaction == "overlap-qk-condition"
         )
@@ -2567,6 +3033,25 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             geometry_descriptors=lidar_geometry_descriptors,
             use_cross_conditioned_builder=use_qk_condition,
         )
+        if post_gat_prototype_fusion == "spsn-correlation":
+            if spsn_prototype_count > min(
+                hsi_assignment.shape[1],
+                lidar_assignment.shape[1],
+            ):
+                raise ValueError(
+                    "--spsn-prototype-count cannot exceed either "
+                    "modality's superpixel count."
+                )
+            self.prototype_correlation_fusion = (
+                PostGATPrototypeCorrelationFusion(
+                    hidden_dim,
+                    spsn_prototype_count,
+                    spsn_correlation_temperature,
+                    initial_hsi_weight=graph_modality_lambda,
+                )
+            )
+        else:
+            self.prototype_correlation_fusion = None
         if cross_modal_interaction == "overlap-qk-condition":
             hsi_to_lidar, lidar_to_hsi = build_cross_modal_overlap(
                 hsi_assignment,
@@ -2750,24 +3235,67 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 "cell_interaction must be none or rag."
             )
 
-        # This is intentionally still the original joint-input CNN path.
+        # Both choices retain the same joint PCA(HSI)+LiDAR input stem.
         self.joint_feature_mapping = nn.Sequential(
             WMF(hsi_channels + 1, hidden_dim),
             WMF(hidden_dim, hidden_dim),
         )
-        self.cnn_branch = nn.Sequential(
-            OriginalSSConv(
-                hidden_dim,
-                hidden_dim,
-                kernel_size=5,
-            ),
-            OriginalSSConv(
-                hidden_dim,
-                hidden_dim,
-                kernel_size=5,
-            ),
+        if cnn_branch == "original":
+            self.cnn_branch = nn.Sequential(
+                OriginalSSConv(
+                    hidden_dim,
+                    hidden_dim,
+                    kernel_size=5,
+                ),
+                OriginalSSConv(
+                    hidden_dim,
+                    hidden_dim,
+                    kernel_size=5,
+                ),
+            )
+        elif cnn_branch == "gsdg":
+            self.cnn_branch = nn.Sequential(
+                DwsConv(
+                    hidden_dim,
+                    hidden_dim,
+                    kernel_size=3,
+                ),
+                DwsConv(
+                    hidden_dim,
+                    hidden_dim,
+                    kernel_size=7,
+                ),
+            )
+        else:
+            raise ValueError(
+                "cnn_branch must be 'original' or 'gsdg'."
             )
         self.classifier = nn.Linear(hidden_dim, class_count)
+        if post_gat_consensus == "mssagf-anchor":
+            resolved_anchor_count = (
+                consensus_anchor_count
+                if consensus_anchor_count > 0
+                else 2 * class_count
+            )
+            hsi_area = np.asarray(
+                hsi_assignment.sum(axis=0)
+            ).reshape(-1)
+            lidar_area = np.asarray(
+                lidar_assignment.sum(axis=0)
+            ).reshape(-1)
+            with torch.random.fork_rng(devices=[]):
+                self.consensus_anchor_interaction = (
+                    PostGATConsensusAnchorInteraction(
+                        hidden_dim,
+                        resolved_anchor_count,
+                        consensus_temperature,
+                        hsi_area,
+                        lidar_area,
+                        gamma_init=consensus_gamma_init,
+                    )
+                )
+        else:
+            self.consensus_anchor_interaction = None
 
     def set_contrastive_epoch(self, epoch):
         if (
@@ -2912,40 +3440,44 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 lidar_final_nodes
             )
         elif self.cross_modal_interaction == "none":
-            if self.contrastive_module is None:
+            if (
+                self.contrastive_module is None
+                and self.prototype_correlation_fusion is None
+                and self.consensus_anchor_interaction is None
+            ):
                 # Preserve the original Stage-3 path exactly.
                 hsi_graph_features = self.hsi_graph(hsi)
                 lidar_graph_features = self.lidar_graph(lidar)
             else:
                 hsi_nodes = self.hsi_graph.encode_nodes(hsi)
-                lidar_nodes = self.lidar_graph.encode_nodes(lidar)
                 (
                     hsi_features,
                     hsi_adjacency,
                 ) = self.hsi_graph.apply_gat1(hsi_nodes)
-                (
-                    lidar_features,
-                    lidar_adjacency,
-                ) = self.lidar_graph.apply_gat1(lidar_nodes)
                 hsi_final_nodes = self.hsi_graph.apply_gat2_nodes(
                     hsi_features,
                     adjacency=hsi_adjacency,
                 )
+                hsi_graph_features = self.hsi_graph.project_nodes(
+                    hsi_final_nodes
+                )
+                lidar_nodes = self.lidar_graph.encode_nodes(lidar)
+                (
+                    lidar_features,
+                    lidar_adjacency,
+                ) = self.lidar_graph.apply_gat1(lidar_nodes)
                 lidar_final_nodes = (
                     self.lidar_graph.apply_gat2_nodes(
                         lidar_features,
                         adjacency=lidar_adjacency,
                     )
                 )
+                lidar_graph_features = self.lidar_graph.project_nodes(
+                    lidar_final_nodes
+                )
                 self._update_contrastive_loss(
                     hsi_final_nodes,
                     lidar_final_nodes,
-                )
-                hsi_graph_features = self.hsi_graph.project_nodes(
-                    hsi_final_nodes
-                )
-                lidar_graph_features = self.lidar_graph.project_nodes(
-                    lidar_final_nodes
                 )
         elif (
             self.cross_modal_interaction
@@ -2963,7 +3495,11 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             lidar_cross_context = (
                 self.lidar_to_hsi_overlap @ hsi_features
             )
-            if self.contrastive_module is None:
+            if (
+                self.contrastive_module is None
+                and self.prototype_correlation_fusion is None
+                and self.consensus_anchor_interaction is None
+            ):
                 hsi_graph_features = (
                     self.hsi_graph.apply_gat2_and_project(
                         hsi_features,
@@ -3009,7 +3545,11 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 lidar_features,
             )
             # Cross-modal information participates in the second graph.
-            if self.contrastive_module is None:
+            if (
+                self.contrastive_module is None
+                and self.prototype_correlation_fusion is None
+                and self.consensus_anchor_interaction is None
+            ):
                 hsi_graph_features = (
                     self.hsi_graph.apply_gat2_and_project(
                         hsi_features,
@@ -3043,11 +3583,40 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 lidar_graph_features = self.lidar_graph.project_nodes(
                     lidar_final_nodes
                 )
-        graph_features = (
-            self.graph_modality_lambda * hsi_graph_features
-            + (1.0 - self.graph_modality_lambda)
-            * lidar_graph_features
-        )
+        if self.consensus_anchor_interaction is not None:
+            (
+                hsi_final_nodes,
+                lidar_final_nodes,
+            ) = self.consensus_anchor_interaction(
+                hsi_final_nodes,
+                lidar_final_nodes,
+            )
+            hsi_graph_features = self.hsi_graph.project_nodes(
+                hsi_final_nodes
+            )
+            lidar_graph_features = self.lidar_graph.project_nodes(
+                lidar_final_nodes
+            )
+            graph_features = (
+                self.graph_modality_lambda * hsi_graph_features
+                + (1.0 - self.graph_modality_lambda)
+                * lidar_graph_features
+            )
+        elif self.prototype_correlation_fusion is None:
+            graph_features = (
+                self.graph_modality_lambda * hsi_graph_features
+                + (1.0 - self.graph_modality_lambda)
+                * lidar_graph_features
+            )
+        else:
+            graph_features = self.prototype_correlation_fusion(
+                hsi_final_nodes,
+                lidar_final_nodes,
+                hsi_graph_features,
+                lidar_graph_features,
+                self.hsi_graph.projection_assignment,
+                self.lidar_graph.projection_assignment,
+            )
         if self.cell_projection_assignment is not None:
             cell_pixel_features = torch.sparse.mm(
                 self.cell_projection_assignment,
@@ -3286,6 +3855,19 @@ def train_one_run(
             ),
             contrastive_dim=args.contrastive_dim,
             prototype_objective=args.prototype_objective,
+            post_gat_prototype_fusion=(
+                args.post_gat_prototype_fusion
+            ),
+            spsn_prototype_count=args.spsn_prototype_count,
+            spsn_correlation_temperature=(
+                args.spsn_correlation_temperature
+            ),
+            post_gat_consensus=args.post_gat_consensus,
+            consensus_anchor_count=(
+                args.consensus_anchor_count
+            ),
+            consensus_temperature=args.consensus_temperature,
+            consensus_gamma_init=args.consensus_gamma_init,
             transport_semantic_weight=(
                 args.transport_semantic_weight
             ),
@@ -3304,6 +3886,7 @@ def train_one_run(
             cell_topology_veto=args.cell_topology_veto,
             cell_veto_threshold=args.cell_veto_threshold,
             fdsm_scope=args.fdsm_scope,
+            cnn_branch=args.cnn_branch,
             **common_options,
         ).to(device)
 
@@ -3329,6 +3912,8 @@ def train_one_run(
     best_loss = float("inf")
     best_state = None
     transport_diagnostics = []
+    prototype_fusion_diagnostics = []
+    consensus_diagnostics = []
     start_time = time.perf_counter()
 
     for epoch in range(1, args.epochs + 1):
@@ -3390,6 +3975,40 @@ def train_one_run(
                     transport_diagnostics.append(
                         transport_record
                     )
+            prototype_fusion_record = None
+            prototype_fusion_module = getattr(
+                model,
+                "prototype_correlation_fusion",
+                None,
+            )
+            if prototype_fusion_module is not None:
+                prototype_fusion_record = (
+                    prototype_fusion_module.diagnostics()
+                )
+                if prototype_fusion_record is not None:
+                    prototype_fusion_record = {
+                        "epoch": epoch,
+                        **prototype_fusion_record,
+                    }
+                    prototype_fusion_diagnostics.append(
+                        prototype_fusion_record
+                    )
+            consensus_record = None
+            consensus_module = getattr(
+                model,
+                "consensus_anchor_interaction",
+                None,
+            )
+            if consensus_module is not None:
+                consensus_record = consensus_module.diagnostics()
+                if consensus_record is not None:
+                    consensus_record = {
+                        "epoch": epoch,
+                        **consensus_record,
+                    }
+                    consensus_diagnostics.append(
+                        consensus_record
+                    )
             train_predictions = (
                 logits.index_select(0, train_index).argmax(dim=1)
             )
@@ -3428,6 +4047,27 @@ def train_one_run(
                     "min="
                     f"{hsi_std.min():.4f}/{lidar_std.min():.4f}"
                 )
+            if prototype_fusion_record is not None:
+                print(
+                    "  SPSN correlation | selected-score H/L="
+                    f"{prototype_fusion_record['hsi_selected_score_mean']:.4f}/"
+                    f"{prototype_fusion_record['lidar_selected_score_mean']:.4f} | "
+                    "reliability H/L="
+                    f"{prototype_fusion_record['hsi_reliability_mean']:.4f}/"
+                    f"{prototype_fusion_record['lidar_reliability_mean']:.4f}"
+                )
+            if consensus_record is not None:
+                print(
+                    "  consensus anchors | gamma H/L="
+                    f"{consensus_record['hsi_gamma']:.5f}/"
+                    f"{consensus_record['lidar_gamma']:.5f} | "
+                    "assignment entropy H/L="
+                    f"{consensus_record['hsi_assignment_entropy']:.4f}/"
+                    f"{consensus_record['lidar_assignment_entropy']:.4f} | "
+                    "minimum anchor mass H/L="
+                    f"{consensus_record['hsi_anchor_mass_min']:.2f}/"
+                    f"{consensus_record['lidar_anchor_mass_min']:.2f}"
+                )
 
     training_time = time.perf_counter() - start_time
     model.load_state_dict(best_state)
@@ -3455,8 +4095,11 @@ def train_one_run(
         f"cross-{args.cross_modal_interaction}_"
         f"overlap-{args.overlap_metric}_"
         f"{contrastive_configuration_tag(args)}_"
+        f"{prototype_fusion_configuration_tag(args)}_"
+        f"{consensus_configuration_tag(args, class_count)}_"
         f"{cell_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
+        f"cnn-{args.cnn_branch}_"
         f"lidarmod-{args.lidar_modulation}_"
         f"run{run_index + 1}"
     )
@@ -3478,6 +4121,10 @@ def train_one_run(
         "training_time": training_time,
         "checkpoint": str(checkpoint),
         "transport_diagnostics": transport_diagnostics,
+        "prototype_fusion_diagnostics": (
+            prototype_fusion_diagnostics
+        ),
+        "consensus_diagnostics": consensus_diagnostics,
     }
 
 
@@ -3512,6 +4159,24 @@ def validate_args(args):
         )
     if args.contrastive_dim <= 0:
         raise ValueError("--contrastive-dim must be positive.")
+    if args.spsn_prototype_count <= 0:
+        raise ValueError("--spsn-prototype-count must be positive.")
+    if args.spsn_correlation_temperature <= 0:
+        raise ValueError(
+            "--spsn-correlation-temperature must be positive."
+        )
+    if args.consensus_anchor_count < 0:
+        raise ValueError(
+            "--consensus-anchor-count must be nonnegative."
+        )
+    if args.consensus_temperature <= 0:
+        raise ValueError(
+            "--consensus-temperature must be positive."
+        )
+    if args.consensus_gamma_init < 0:
+        raise ValueError(
+            "--consensus-gamma-init must be nonnegative."
+        )
     if args.transport_semantic_weight < 0:
         raise ValueError(
             "--transport-semantic-weight must be nonnegative."
@@ -3547,6 +4212,53 @@ def validate_args(args):
     ):
         raise ValueError(
             "--cross-modal-interaction requires "
+            "--graph-layout separate."
+        )
+    if (
+        args.graph_layout == "joint"
+        and args.post_gat_prototype_fusion != "none"
+    ):
+        raise ValueError(
+            "--post-gat-prototype-fusion requires "
+            "--graph-layout separate."
+        )
+    if (
+        args.graph_layout == "joint"
+        and args.post_gat_consensus != "none"
+    ):
+        raise ValueError(
+            "--post-gat-consensus requires "
+            "--graph-layout separate."
+        )
+    if args.post_gat_consensus != "none":
+        if args.cross_modal_interaction != "none":
+            raise ValueError(
+                "--post-gat-consensus requires "
+                "--cross-modal-interaction none so both GAT stages "
+                "remain modality-private."
+            )
+        if args.contrastive_mode != "none":
+            raise ValueError(
+                "--post-gat-consensus first ablation requires "
+                "--contrastive-mode none."
+            )
+        if args.cell_interaction != "none":
+            raise ValueError(
+                "--post-gat-consensus first ablation requires "
+                "--cell-interaction none."
+            )
+        if args.post_gat_prototype_fusion != "none":
+            raise ValueError(
+                "--post-gat-consensus and "
+                "--post-gat-prototype-fusion are alternative "
+                "single-interaction ablations."
+            )
+    if (
+        args.graph_layout == "joint"
+        and args.cnn_branch != "original"
+    ):
+        raise ValueError(
+            "--cnn-branch gsdg currently requires "
             "--graph-layout separate."
         )
     if args.graph_layout == "joint" and args.fdsm_scope != "none":
@@ -3658,20 +4370,36 @@ def main():
     print(
         "demo_train | Stage 8: overlap-conditioned second-layer Q/K"
     )
-    print(
-        "Unchanged CNN: joint PCA(HSI)+LiDAR -> WMF -> "
-        "original 5x5/5x5 CNN"
-    )
+    if args.cnn_branch == "original":
+        print(
+            "CNN branch: original joint PCA(HSI)+LiDAR -> WMF -> "
+            "HGCN-HL 5x5/5x5 SSConv (default)"
+        )
+    else:
+        print(
+            "CNN branch: joint PCA(HSI)+LiDAR -> GSDG stem -> "
+            f"equal-width {args.hidden_dim}->"
+            f"{args.hidden_dim}->{args.hidden_dim} "
+            "3x3/7x7 DwsConv"
+        )
     if args.graph_layout == "separate":
         print(
             "Graph layout: independent HSI-SLIC and "
             f"LiDAR-{args.lidar_segmentation} GSDG graphs"
         )
-        print(
-            "Graph fusion after pixel projection: "
-            f"HSI={args.graph_modality_lambda:g}, "
-            f"LiDAR={1.0 - args.graph_modality_lambda:g}"
-        )
+        if args.post_gat_prototype_fusion == "none":
+            print(
+                "Graph fusion after pixel projection: "
+                f"HSI={args.graph_modality_lambda:g}, "
+                f"LiDAR={1.0 - args.graph_modality_lambda:g}"
+            )
+        else:
+            print(
+                "Graph fusion after pixel projection: adaptive "
+                "pixel-wise HSI/LiDAR reliability, initialized at "
+                f"{args.graph_modality_lambda:g}/"
+                f"{1.0 - args.graph_modality_lambda:g}"
+            )
         if args.lidar_graph_prior == "rag-height-knn":
             print(
                 "LiDAR prior: hard "
@@ -3745,6 +4473,41 @@ def main():
                 f"{contrastive_target}{prototype_detail}"
                 f"{transport_detail}"
             )
+        print(
+            "Post-GAT2 prototype correlation fusion: "
+            f"{args.post_gat_prototype_fusion}"
+        )
+        if (
+            args.post_gat_prototype_fusion
+            == "spsn-correlation"
+        ):
+            print(
+                "SPSN-style path: independent HSI/LiDAR GAT2 "
+                f"prototype Top-{args.spsn_prototype_count} -> "
+                "node correlation -> sparse pixel projection -> "
+                "pixel-wise reliability -> unchanged CNN fusion; "
+                "correlation tau="
+                f"{args.spsn_correlation_temperature:g}"
+            )
+        print(
+            "Post-GAT2 consensus interaction: "
+            f"{args.post_gat_consensus}"
+        )
+        if args.post_gat_consensus == "mssagf-anchor":
+            resolved_anchor_count = (
+                args.consensus_anchor_count
+                if args.consensus_anchor_count > 0
+                else 2 * class_count
+            )
+            print(
+                "Consensus path: pure modality-private GAT1/GAT2 "
+                f"-> {resolved_anchor_count} shared anchors -> "
+                "area-weighted fixed 0.5/0.5 anchor fusion -> "
+                "zero-initialized learnable residual write-back -> "
+                "separate pixel projection; tau="
+                f"{args.consensus_temperature:g}, gamma-init="
+                f"{args.consensus_gamma_init:g}"
+            )
         print(f"Intersection-cell interaction: {args.cell_interaction}")
         if args.cell_interaction == "rag":
             print(
@@ -3813,7 +4576,7 @@ def main():
             "Graph layout: retained concatenated-node joint graph "
             f"(HSI-SLIC + LiDAR-{args.lidar_segmentation})"
         )
-    print("Not enabled: hypergraph or GSDG CNN")
+    print("Not enabled: fixed-incidence hypergraph")
     print("=" * 72)
     print(
         f"Dataset: {config['loader_name']} | "
@@ -3882,8 +4645,11 @@ def main():
         f"cross-{args.cross_modal_interaction}_"
         f"overlap-{args.overlap_metric}_"
         f"{contrastive_configuration_tag(args)}_"
+        f"{prototype_fusion_configuration_tag(args)}_"
+        f"{consensus_configuration_tag(args, class_count)}_"
         f"{cell_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
+        f"cnn-{args.cnn_branch}_"
         f"lidarmod-{args.lidar_modulation}_results"
     )
     result_path = args.output_dir / safe_output_filename(

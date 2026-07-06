@@ -23,6 +23,82 @@ python demo_train.py \
   --device cuda
 ```
 
+An SPSN-inspired post-GAT prototype-correlation branch can be enabled on
+this base pipeline:
+
+```bash
+--post-gat-prototype-fusion spsn-correlation \
+--spsn-prototype-count 32 \
+--spsn-correlation-temperature 0.2
+```
+
+It is disabled by default with `--post-gat-prototype-fusion none`. HSI and
+LiDAR GAT2 nodes already represent modality-specific superpixel prototypes,
+so no second SLIC/GAP stage is added. Independent classification-trained
+selectors retain a fixed number of prototypes per modality. Node-to-selected-
+prototype cosine correlations are computed before pixel projection and then
+mapped through the sparse HSI/LiDAR assignment matrices. Two small residual
+adapters inject the correlation maps into the corresponding pixel graph
+features. A pixel-wise two-way reliability gate replaces fixed HSI/LiDAR
+graph fusion and is initialized from `--graph-modality-lambda`; its output
+continues through the unchanged graph/CNN `--fusion-lambda` fusion.
+
+Unlike the original saliency-oriented SPSN, this branch does not copy
+foreground-superpixel BCE or reliability pseudo-label losses. Pixel
+classification supervision trains the selectors, correlation adapters, and
+reliability gate end to end. The selected indices, mean selection scores, and
+mean modality reliabilities are stored in each run's result JSON at logging
+epochs.
+
+A separate MSSAGF-inspired post-graph consensus interaction is available:
+
+```bash
+--post-gat-consensus mssagf-anchor \
+--consensus-anchor-count 0 \
+--consensus-temperature 0.2 \
+--consensus-gamma-init 0
+```
+
+It is disabled by default with `--post-gat-consensus none`. An anchor count
+of zero resolves to twice the dataset class count. After both modality-private
+GAT2 layers, HSI and LiDAR nodes independently obtain soft assignments to one
+learnable shared anchor bank. The one-layer modality projections and shared
+anchor queries are L2-normalized before assignment so HSI and LiDAR feature
+scales cannot make one assignment uniformly diffuse and the other collapse.
+Each modality forms anchor features with raw superpixel-area weighting, the
+two anchor sets are averaged with fixed
+0.5/0.5 weights, and the shared messages are written back to their own node
+sets through independent learnable scalar residuals. Both residual scales
+start at zero by default, so the initial forward pass exactly recovers the
+existing graph branch. Updated nodes are projected with their original sparse
+assignment matrices, combined by `graph-modality-lambda`, and then follow the
+unchanged graph/CNN fusion.
+
+This first ablation has no node gate, extra contrastive loss, or dense
+HSI-by-LiDAR attention. To preserve exactly one cross-modal interaction and
+pure modality-private graph construction, it requires `cross-modal-interaction
+none`, `contrastive-mode none`, `cell-interaction none`, and
+`post-gat-prototype-fusion none`. The implementation adapts the multiview
+anchor-consensus principle of
+[MSSAGF](https://github.com/W-Xinxin/MSSAGF); the reference repository itself
+is a MATLAB clustering method rather than a neural fusion layer.
+
+The joint pixel CNN is independently selectable:
+
+```bash
+--cnn-branch original  # default HGCN-HL 5x5/5x5 SSConv
+--cnn-branch gsdg      # GSDG 3x3/7x7 depthwise-separable CNN
+```
+
+Both choices use the existing joint `PCA(HSI)+LiDAR` input and two-layer
+1x1 WMF stem, which is structurally equivalent to the GSDG stem. The GSDG
+choice uses equal-width `hidden_dim -> hidden_dim -> hidden_dim` DwsConv
+blocks with kernel sizes 3 and 7. Thus it retains the GSDG spatial operator
+but removes its 64-channel bottleneck and the former 64-to-hidden adapter,
+making the comparison against the original 5x5/5x5 branch primarily a
+kernel-layout comparison. The option is currently available with
+`--graph-layout separate`; `original` remains the default.
+
 An optional training-only contrastive objective can be added to this exact
 Stage-8 pipeline:
 
