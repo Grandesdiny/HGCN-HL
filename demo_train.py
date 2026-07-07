@@ -258,6 +258,34 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--consensus-fusion",
+        choices=("fixed", "adaptive"),
+        default="fixed",
+        help=(
+            "Fuse modality-specific anchor features with fixed 0.5/0.5 "
+            "or detached reconstruction-error reliability. "
+            "Default: fixed."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-writeback",
+        choices=("direct", "difference"),
+        default="direct",
+        help=(
+            "Write the consensus anchor directly or write only its "
+            "difference from each modality anchor. Default: direct."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-reliability-temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "Temperature tau_r of adaptive per-anchor modality "
+            "reliability. Default: 1.0."
+        ),
+    )
+    parser.add_argument(
         "--spsn-prototype-count",
         type=int,
         default=32,
@@ -532,7 +560,10 @@ def consensus_configuration_tag(args, class_count):
     return (
         f"consensus-anchor-k{anchor_count}-"
         f"t{args.consensus_temperature:g}-"
-        f"g{args.consensus_gamma_init:g}"
+        f"g{args.consensus_gamma_init:g}-"
+        f"f{args.consensus_fusion}-"
+        f"w{args.consensus_writeback}-"
+        f"rt{args.consensus_reliability_temperature:g}"
     )
 
 
@@ -1633,9 +1664,16 @@ class PostGATConsensusAnchorInteraction(nn.Module):
         hsi_area,
         lidar_area,
         gamma_init=0.0,
+        fusion_mode="fixed",
+        writeback_mode="direct",
+        reliability_temperature=1.0,
     ):
         super().__init__()
         self.temperature = temperature
+        self.fusion_mode = fusion_mode
+        self.writeback_mode = writeback_mode
+        self.reliability_temperature = reliability_temperature
+        self.empty_anchor_mass_threshold = 1.0
         self.consensus_anchors = nn.Parameter(
             torch.empty(anchor_count, channels)
         )
@@ -1706,7 +1744,42 @@ class PostGATConsensusAnchorInteraction(nn.Module):
         denominator = (
             assignment.transpose(0, 1) @ area
         ).unsqueeze(1)
-        return numerator / denominator.clamp_min(1e-6)
+        return (
+            numerator / denominator.clamp_min(1e-6),
+            denominator.squeeze(1),
+        )
+
+    @staticmethod
+    def _anchor_reconstruction_error(
+        assignment,
+        area,
+        node_features,
+        anchor_features,
+        anchor_mass,
+    ):
+        node_norm = torch.sum(
+            node_features * node_features,
+            dim=1,
+            keepdim=True,
+        )
+        anchor_norm = torch.sum(
+            anchor_features * anchor_features,
+            dim=1,
+        ).unsqueeze(0)
+        squared_distance = (
+            node_norm
+            + anchor_norm
+            - 2.0
+            * (
+                node_features
+                @ anchor_features.transpose(0, 1)
+            )
+        ).clamp_min(0.0)
+        weighted_assignment = area.unsqueeze(1) * assignment
+        return torch.sum(
+            weighted_assignment * squared_distance,
+            dim=0,
+        ) / anchor_mass.clamp_min(1e-6)
 
     @staticmethod
     def _mean_assignment_entropy(assignment):
@@ -1727,35 +1800,125 @@ class PostGATConsensusAnchorInteraction(nn.Module):
             lidar_nodes,
             self.lidar_key_projection,
         )
-        hsi_anchor_features = (
+        (
+            hsi_anchor_features,
+            hsi_anchor_mass,
+        ) = (
             self._area_weighted_anchor_features(
                 hsi_assignment,
                 self.hsi_area,
                 hsi_nodes,
             )
         )
-        lidar_anchor_features = (
+        (
+            lidar_anchor_features,
+            lidar_anchor_mass,
+        ) = (
             self._area_weighted_anchor_features(
                 lidar_assignment,
                 self.lidar_area,
                 lidar_nodes,
             )
         )
-        consensus = 0.5 * (
-            self.hsi_value_projection(hsi_anchor_features)
-            + self.lidar_value_projection(
-                lidar_anchor_features
-            )
+        hsi_shared_nodes = self.hsi_value_projection(hsi_nodes)
+        lidar_shared_nodes = self.lidar_value_projection(
+            lidar_nodes
         )
-        hsi_message = hsi_assignment @ consensus
-        lidar_message = lidar_assignment @ consensus
+        hsi_shared_anchors = self.hsi_value_projection(
+            hsi_anchor_features
+        )
+        lidar_shared_anchors = self.lidar_value_projection(
+            lidar_anchor_features
+        )
+        hsi_reliability_nodes = F.normalize(
+            hsi_shared_nodes,
+            dim=1,
+        )
+        lidar_reliability_nodes = F.normalize(
+            lidar_shared_nodes,
+            dim=1,
+        )
+        (
+            hsi_reliability_anchors,
+            _,
+        ) = self._area_weighted_anchor_features(
+            hsi_assignment,
+            self.hsi_area,
+            hsi_reliability_nodes,
+        )
+        (
+            lidar_reliability_anchors,
+            _,
+        ) = self._area_weighted_anchor_features(
+            lidar_assignment,
+            self.lidar_area,
+            lidar_reliability_nodes,
+        )
+        hsi_error = self._anchor_reconstruction_error(
+            hsi_assignment,
+            self.hsi_area,
+            hsi_reliability_nodes,
+            hsi_reliability_anchors,
+            hsi_anchor_mass,
+        ).detach()
+        lidar_error = self._anchor_reconstruction_error(
+            lidar_assignment,
+            self.lidar_area,
+            lidar_reliability_nodes,
+            lidar_reliability_anchors,
+            lidar_anchor_mass,
+        ).detach()
+        if self.fusion_mode == "fixed":
+            reliability = torch.full(
+                (
+                    hsi_shared_anchors.shape[0],
+                    2,
+                ),
+                0.5,
+                dtype=hsi_nodes.dtype,
+                device=hsi_nodes.device,
+            )
+        else:
+            reliability = F.softmax(
+                -torch.stack(
+                    [hsi_error, lidar_error],
+                    dim=1,
+                )
+                / self.reliability_temperature,
+                dim=1,
+            )
+        consensus = (
+            reliability[:, :1] * hsi_shared_anchors
+            + reliability[:, 1:] * lidar_shared_anchors
+        )
+        if self.writeback_mode == "difference":
+            hsi_anchor_message = (
+                consensus - hsi_shared_anchors
+            )
+            lidar_anchor_message = (
+                consensus - lidar_shared_anchors
+            )
+        else:
+            hsi_anchor_message = consensus
+            lidar_anchor_message = consensus
+        hsi_message = hsi_assignment @ hsi_anchor_message
+        lidar_message = (
+            lidar_assignment @ lidar_anchor_message
+        )
         updated_hsi = (
             hsi_nodes + self.hsi_gamma * hsi_message
         )
         updated_lidar = (
             lidar_nodes + self.lidar_gamma * lidar_message
         )
+        reliability_entropy = -torch.sum(
+            reliability
+            * torch.log(reliability.clamp_min(1e-12)),
+            dim=1,
+        )
         self.last_diagnostics = {
+            "fusion_mode": self.fusion_mode,
+            "writeback_mode": self.writeback_mode,
             "hsi_gamma": float(
                 self.hsi_gamma.detach().item()
             ),
@@ -1772,17 +1935,50 @@ class PostGATConsensusAnchorInteraction(nn.Module):
                     lidar_assignment
                 ).detach().item()
             ),
+            "hsi_anchor_reliability": (
+                reliability[:, 0].detach().cpu().tolist()
+            ),
+            "lidar_anchor_reliability": (
+                reliability[:, 1].detach().cpu().tolist()
+            ),
+            "reliability_entropy": (
+                reliability_entropy.detach().cpu().tolist()
+            ),
+            "mean_reliability_entropy": float(
+                reliability_entropy.detach().mean().item()
+            ),
+            "hsi_reconstruction_error": (
+                hsi_error.cpu().tolist()
+            ),
+            "lidar_reconstruction_error": (
+                lidar_error.cpu().tolist()
+            ),
+            "hsi_anchor_mass": (
+                hsi_anchor_mass.detach().cpu().tolist()
+            ),
+            "lidar_anchor_mass": (
+                lidar_anchor_mass.detach().cpu().tolist()
+            ),
             "hsi_anchor_mass_min": float(
-                (
-                    hsi_assignment.transpose(0, 1)
-                    @ self.hsi_area
-                ).detach().min().item()
+                hsi_anchor_mass.detach().min().item()
             ),
             "lidar_anchor_mass_min": float(
+                lidar_anchor_mass.detach().min().item()
+            ),
+            "empty_anchor_mass_threshold": (
+                self.empty_anchor_mass_threshold
+            ),
+            "hsi_empty_anchor_count": int(
                 (
-                    lidar_assignment.transpose(0, 1)
-                    @ self.lidar_area
-                ).detach().min().item()
+                    hsi_anchor_mass
+                    < self.empty_anchor_mass_threshold
+                ).detach().sum().item()
+            ),
+            "lidar_empty_anchor_count": int(
+                (
+                    lidar_anchor_mass
+                    < self.empty_anchor_mass_threshold
+                ).detach().sum().item()
             ),
         }
         return updated_hsi, updated_lidar
@@ -2907,6 +3103,9 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         consensus_anchor_count=0,
         consensus_temperature=0.2,
         consensus_gamma_init=0.0,
+        consensus_fusion="fixed",
+        consensus_writeback="direct",
+        consensus_reliability_temperature=1.0,
         transport_semantic_weight=1.0,
         transport_iterations=10,
         transport_warmup_epochs=50,
@@ -3292,6 +3491,11 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                         hsi_area,
                         lidar_area,
                         gamma_init=consensus_gamma_init,
+                        fusion_mode=consensus_fusion,
+                        writeback_mode=consensus_writeback,
+                        reliability_temperature=(
+                            consensus_reliability_temperature
+                        ),
                     )
                 )
         else:
@@ -3433,12 +3637,15 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 hsi_final_nodes,
                 lidar_final_nodes,
             )
-            hsi_graph_features = self.hsi_graph.project_nodes(
-                hsi_final_nodes
-            )
-            lidar_graph_features = self.lidar_graph.project_nodes(
-                lidar_final_nodes
-            )
+            if self.consensus_anchor_interaction is None:
+                hsi_graph_features = self.hsi_graph.project_nodes(
+                    hsi_final_nodes
+                )
+                lidar_graph_features = (
+                    self.lidar_graph.project_nodes(
+                        lidar_final_nodes
+                    )
+                )
         elif self.cross_modal_interaction == "none":
             if (
                 self.contrastive_module is None
@@ -3458,9 +3665,12 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     hsi_features,
                     adjacency=hsi_adjacency,
                 )
-                hsi_graph_features = self.hsi_graph.project_nodes(
-                    hsi_final_nodes
-                )
+                if self.consensus_anchor_interaction is None:
+                    hsi_graph_features = (
+                        self.hsi_graph.project_nodes(
+                            hsi_final_nodes
+                        )
+                    )
                 lidar_nodes = self.lidar_graph.encode_nodes(lidar)
                 (
                     lidar_features,
@@ -3472,9 +3682,12 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                         adjacency=lidar_adjacency,
                     )
                 )
-                lidar_graph_features = self.lidar_graph.project_nodes(
-                    lidar_final_nodes
-                )
+                if self.consensus_anchor_interaction is None:
+                    lidar_graph_features = (
+                        self.lidar_graph.project_nodes(
+                            lidar_final_nodes
+                        )
+                    )
                 self._update_contrastive_loss(
                     hsi_final_nodes,
                     lidar_final_nodes,
@@ -3527,12 +3740,17 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     hsi_final_nodes,
                     lidar_final_nodes,
                 )
-                hsi_graph_features = self.hsi_graph.project_nodes(
-                    hsi_final_nodes
-                )
-                lidar_graph_features = self.lidar_graph.project_nodes(
-                    lidar_final_nodes
-                )
+                if self.consensus_anchor_interaction is None:
+                    hsi_graph_features = (
+                        self.hsi_graph.project_nodes(
+                            hsi_final_nodes
+                        )
+                    )
+                    lidar_graph_features = (
+                        self.lidar_graph.project_nodes(
+                            lidar_final_nodes
+                        )
+                    )
         else:
             hsi_nodes = self.hsi_graph.encode_nodes(hsi)
             lidar_nodes = self.lidar_graph.encode_nodes(lidar)
@@ -3577,12 +3795,17 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     hsi_final_nodes,
                     lidar_final_nodes,
                 )
-                hsi_graph_features = self.hsi_graph.project_nodes(
-                    hsi_final_nodes
-                )
-                lidar_graph_features = self.lidar_graph.project_nodes(
-                    lidar_final_nodes
-                )
+                if self.consensus_anchor_interaction is None:
+                    hsi_graph_features = (
+                        self.hsi_graph.project_nodes(
+                            hsi_final_nodes
+                        )
+                    )
+                    lidar_graph_features = (
+                        self.lidar_graph.project_nodes(
+                            lidar_final_nodes
+                        )
+                    )
         if self.consensus_anchor_interaction is not None:
             (
                 hsi_final_nodes,
@@ -3868,6 +4091,11 @@ def train_one_run(
             ),
             consensus_temperature=args.consensus_temperature,
             consensus_gamma_init=args.consensus_gamma_init,
+            consensus_fusion=args.consensus_fusion,
+            consensus_writeback=args.consensus_writeback,
+            consensus_reliability_temperature=(
+                args.consensus_reliability_temperature
+            ),
             transport_semantic_weight=(
                 args.transport_semantic_weight
             ),
@@ -4057,16 +4285,31 @@ def train_one_run(
                     f"{prototype_fusion_record['lidar_reliability_mean']:.4f}"
                 )
             if consensus_record is not None:
+                hsi_reliability = np.asarray(
+                    consensus_record[
+                        "hsi_anchor_reliability"
+                    ]
+                )
+                lidar_reliability = np.asarray(
+                    consensus_record[
+                        "lidar_anchor_reliability"
+                    ]
+                )
                 print(
                     "  consensus anchors | gamma H/L="
                     f"{consensus_record['hsi_gamma']:.5f}/"
                     f"{consensus_record['lidar_gamma']:.5f} | "
+                    "anchor reliability H/L mean="
+                    f"{hsi_reliability.mean():.4f}/"
+                    f"{lidar_reliability.mean():.4f} | "
+                    "reliability entropy="
+                    f"{consensus_record['mean_reliability_entropy']:.4f} | "
                     "assignment entropy H/L="
                     f"{consensus_record['hsi_assignment_entropy']:.4f}/"
                     f"{consensus_record['lidar_assignment_entropy']:.4f} | "
-                    "minimum anchor mass H/L="
-                    f"{consensus_record['hsi_anchor_mass_min']:.2f}/"
-                    f"{consensus_record['lidar_anchor_mass_min']:.2f}"
+                    "empty anchors H/L="
+                    f"{consensus_record['hsi_empty_anchor_count']}/"
+                    f"{consensus_record['lidar_empty_anchor_count']}"
                 )
 
     training_time = time.perf_counter() - start_time
@@ -4177,6 +4420,10 @@ def validate_args(args):
         raise ValueError(
             "--consensus-gamma-init must be nonnegative."
         )
+    if args.consensus_reliability_temperature <= 0:
+        raise ValueError(
+            "--consensus-reliability-temperature must be positive."
+        )
     if args.transport_semantic_weight < 0:
         raise ValueError(
             "--transport-semantic-weight must be nonnegative."
@@ -4231,6 +4478,14 @@ def validate_args(args):
             "--graph-layout separate."
         )
     if args.post_gat_consensus != "none":
+        if (
+            args.consensus_writeback == "difference"
+            and args.consensus_fusion != "adaptive"
+        ):
+            raise ValueError(
+                "--consensus-writeback difference requires "
+                "--consensus-fusion adaptive."
+            )
         if args.cross_modal_interaction != "none":
             raise ValueError(
                 "--post-gat-consensus requires "
@@ -4502,11 +4757,14 @@ def main():
             print(
                 "Consensus path: pure modality-private GAT1/GAT2 "
                 f"-> {resolved_anchor_count} shared anchors -> "
-                "area-weighted fixed 0.5/0.5 anchor fusion -> "
+                "area-weighted "
+                f"{args.consensus_fusion} anchor fusion -> "
+                f"{args.consensus_writeback} "
                 "zero-initialized learnable residual write-back -> "
                 "separate pixel projection; tau="
                 f"{args.consensus_temperature:g}, gamma-init="
-                f"{args.consensus_gamma_init:g}"
+                f"{args.consensus_gamma_init:g}, reliability-tau="
+                f"{args.consensus_reliability_temperature:g}"
             )
         print(f"Intersection-cell interaction: {args.cell_interaction}")
         if args.cell_interaction == "rag":

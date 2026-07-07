@@ -56,7 +56,10 @@ A separate MSSAGF-inspired post-graph consensus interaction is available:
 --post-gat-consensus mssagf-anchor \
 --consensus-anchor-count 0 \
 --consensus-temperature 0.2 \
---consensus-gamma-init 0
+--consensus-gamma-init 0 \
+--consensus-fusion fixed \
+--consensus-writeback direct \
+--consensus-reliability-temperature 1.0
 ```
 
 It is disabled by default with `--post-gat-consensus none`. An anchor count
@@ -66,13 +69,45 @@ learnable shared anchor bank. The one-layer modality projections and shared
 anchor queries are L2-normalized before assignment so HSI and LiDAR feature
 scales cannot make one assignment uniformly diffuse and the other collapse.
 Each modality forms anchor features with raw superpixel-area weighting, the
-two anchor sets are averaged with fixed
-0.5/0.5 weights, and the shared messages are written back to their own node
-sets through independent learnable scalar residuals. Both residual scales
+two anchor sets are fused either with fixed 0.5/0.5 weights or per-anchor
+modality reliability. Adaptive reliability is the softmax of the negative
+area-weighted within-anchor reconstruction errors. The shared node features
+are L2-normalized only in this error-estimation path so HSI FDSM and LiDAR
+geometry features have comparable error units; the consensus values
+themselves remain unchanged. These errors are detached before the softmax,
+preventing the feature encoders from manipulating them to collapse the
+weights. `direct` writes the consensus anchor itself back;
+`difference` writes `consensus - modality_anchor`, removing self-copy and
+making the message an explicit cross-modal correction. Both residual scales
 start at zero by default, so the initial forward pass exactly recovers the
-existing graph branch. Updated nodes are projected with their original sparse
-assignment matrices, combined by `graph-modality-lambda`, and then follow the
-unchanged graph/CNN fusion.
+existing graph branch. Updated nodes are projected exactly once with their
+original sparse assignment matrices, combined by `graph-modality-lambda`, and
+then follow the unchanged graph/CNN fusion.
+
+The three intended ablations are:
+
+```bash
+# Fixed 0.5 consensus + direct write-back
+--post-gat-consensus mssagf-anchor \
+--consensus-fusion fixed \
+--consensus-writeback direct
+
+# Adaptive reliability + direct write-back
+--post-gat-consensus mssagf-anchor \
+--consensus-fusion adaptive \
+--consensus-writeback direct \
+--consensus-reliability-temperature 1.0
+
+# Adaptive reliability + difference write-back
+--post-gat-consensus mssagf-anchor \
+--consensus-fusion adaptive \
+--consensus-writeback difference \
+--consensus-reliability-temperature 1.0
+```
+
+Each logging record stores both per-anchor modality weights, per-anchor
+weight entropy, detached reconstruction errors, both gamma values, and the
+full area mass of every anchor plus empty-anchor counts.
 
 This first ablation has no node gate, extra contrastive loss, or dense
 HSI-by-LiDAR attention. To preserve exactly one cross-modal interaction and
