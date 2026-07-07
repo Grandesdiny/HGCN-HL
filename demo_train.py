@@ -286,6 +286,57 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--consensus-anchor-reasoning",
+        choices=("none", "unified-gcn"),
+        default="none",
+        help=(
+            "Optional post-GAT2 reasoning on the shared consensus "
+            "anchors. 'unified-gcn' builds one unified anchor graph "
+            "and runs a lightweight GCN before write-back. "
+            "Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-structure-fusion",
+        choices=("none", "modality-graphs"),
+        default="none",
+        help=(
+            "How to build the unified anchor graph for anchor "
+            "reasoning. 'none' uses only a learned anchor relation; "
+            "'modality-graphs' fuses HSI/LiDAR anchor graphs with "
+            "adaptive reliability. Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-anchor-graph-topk",
+        type=int,
+        default=8,
+        help=(
+            "Top-K neighbors per anchor when building HSI/LiDAR "
+            "anchor graphs. Used by modality-graphs. Default: 8."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-learned-graph-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight of the learned anchor relation bias inside the "
+            "unified anchor graph. Default: 1.0."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-selective-writeback",
+        choices=("none", "gate"),
+        default="none",
+        help=(
+            "Optional node-level gate for consensus write-back. "
+            "'gate' uses [node, message, |node-message|, assignment "
+            "entropy] to decide which nodes receive correction. "
+            "Default: none."
+        ),
+    )
+    parser.add_argument(
         "--spsn-prototype-count",
         type=int,
         default=32,
@@ -557,7 +608,7 @@ def consensus_configuration_tag(args, class_count):
         if args.consensus_anchor_count > 0
         else 2 * class_count
     )
-    return (
+    tag = (
         f"consensus-anchor-k{anchor_count}-"
         f"t{args.consensus_temperature:g}-"
         f"g{args.consensus_gamma_init:g}-"
@@ -565,6 +616,18 @@ def consensus_configuration_tag(args, class_count):
         f"w{args.consensus_writeback}-"
         f"rt{args.consensus_reliability_temperature:g}"
     )
+    if args.consensus_anchor_reasoning != "none":
+        tag = (
+            f"{tag}-ar{args.consensus_anchor_reasoning}-"
+            f"sf{args.consensus_structure_fusion}-"
+            f"k{args.consensus_anchor_graph_topk}-"
+            f"lg{args.consensus_learned_graph_weight:g}"
+        )
+    if args.consensus_selective_writeback != "none":
+        tag = (
+            f"{tag}-sw{args.consensus_selective_writeback}"
+        )
+    return tag
 
 
 def safe_output_filename(stem, suffix, maximum_bytes=240):
@@ -1654,7 +1717,7 @@ class PostGATPrototypeCorrelationFusion(nn.Module):
 
 
 class PostGATConsensusAnchorInteraction(nn.Module):
-    """Area-aware shared anchors with residual write-back to both graphs."""
+    """Post-GAT2 shared anchors with optional unified-anchor graph reasoning."""
 
     def __init__(
         self,
@@ -1667,12 +1730,22 @@ class PostGATConsensusAnchorInteraction(nn.Module):
         fusion_mode="fixed",
         writeback_mode="direct",
         reliability_temperature=1.0,
+        anchor_reasoning="none",
+        structure_fusion="none",
+        anchor_graph_topk=8,
+        learned_graph_weight=1.0,
+        selective_writeback="none",
     ):
         super().__init__()
         self.temperature = temperature
         self.fusion_mode = fusion_mode
         self.writeback_mode = writeback_mode
         self.reliability_temperature = reliability_temperature
+        self.anchor_reasoning = anchor_reasoning
+        self.structure_fusion = structure_fusion
+        self.anchor_graph_topk = anchor_graph_topk
+        self.learned_graph_weight = learned_graph_weight
+        self.selective_writeback = selective_writeback
         self.empty_anchor_mass_threshold = 1.0
         self.consensus_anchors = nn.Parameter(
             torch.empty(anchor_count, channels)
@@ -1698,8 +1771,53 @@ class PostGATConsensusAnchorInteraction(nn.Module):
             channels,
             bias=False,
         )
-        nn.init.eye_(self.hsi_value_projection.weight)
-        nn.init.eye_(self.lidar_value_projection.weight)
+        self.hsi_structure_projection = nn.Linear(
+            channels,
+            channels,
+            bias=False,
+        )
+        self.lidar_structure_projection = nn.Linear(
+            channels,
+            channels,
+            bias=False,
+        )
+        for projection in (
+            self.hsi_value_projection,
+            self.lidar_value_projection,
+            self.hsi_structure_projection,
+            self.lidar_structure_projection,
+        ):
+            nn.init.eye_(projection.weight)
+        self.anchor_relation_bias = nn.Parameter(
+            torch.zeros(anchor_count, anchor_count)
+        )
+        if anchor_reasoning == "unified-gcn":
+            self.anchor_graph_projection = nn.Linear(
+                channels,
+                channels,
+                bias=False,
+            )
+            nn.init.eye_(self.anchor_graph_projection.weight)
+            self.anchor_graph_norm = nn.LayerNorm(channels)
+        else:
+            self.anchor_graph_projection = None
+            self.anchor_graph_norm = None
+        if selective_writeback == "gate":
+            self.hsi_writeback_gate = nn.Sequential(
+                nn.Linear(3 * channels + 1, channels),
+                nn.LeakyReLU(),
+                nn.Linear(channels, channels),
+                nn.Sigmoid(),
+            )
+            self.lidar_writeback_gate = nn.Sequential(
+                nn.Linear(3 * channels + 1, channels),
+                nn.LeakyReLU(),
+                nn.Linear(channels, channels),
+                nn.Sigmoid(),
+            )
+        else:
+            self.hsi_writeback_gate = None
+            self.lidar_writeback_gate = None
         self.hsi_gamma = nn.Parameter(
             torch.tensor(float(gamma_init))
         )
@@ -1782,14 +1900,158 @@ class PostGATConsensusAnchorInteraction(nn.Module):
         ) / anchor_mass.clamp_min(1e-6)
 
     @staticmethod
+    def _node_assignment_entropy(assignment):
+        return -torch.sum(
+            assignment * torch.log(assignment.clamp_min(1e-12)),
+            dim=1,
+            keepdim=True,
+        )
+
+    @staticmethod
     def _mean_assignment_entropy(assignment):
         return (
-            -torch.sum(
-                assignment
-                * torch.log(assignment.clamp_min(1e-12)),
-                dim=1,
+            PostGATConsensusAnchorInteraction
+            ._node_assignment_entropy(assignment)
+            .mean()
+        )
+
+    @staticmethod
+    def _row_entropy(graph):
+        return -torch.sum(
+            graph * torch.log(graph.clamp_min(1e-12)),
+            dim=1,
+        )
+
+    @staticmethod
+    def _topk_row_softmax(logits, topk):
+        if topk <= 0 or topk >= logits.shape[1]:
+            return F.softmax(logits, dim=1)
+        values, indices = torch.topk(
+            logits,
+            k=min(topk, logits.shape[1]),
+            dim=1,
+        )
+        masked_logits = torch.full_like(
+            logits,
+            torch.finfo(logits.dtype).min,
+        )
+        masked_logits.scatter_(1, indices, values)
+        return F.softmax(masked_logits, dim=1)
+
+    def _anchor_graph_from_features(self, anchor_features):
+        normalized = F.normalize(anchor_features, dim=1)
+        logits = normalized @ normalized.transpose(0, 1)
+        return self._topk_row_softmax(
+            logits,
+            self.anchor_graph_topk,
+        )
+
+    def _learned_anchor_graph(self):
+        identity_bias = torch.eye(
+            self.anchor_relation_bias.shape[0],
+            dtype=self.anchor_relation_bias.dtype,
+            device=self.anchor_relation_bias.device,
+        )
+        return F.softmax(
+            self.anchor_relation_bias + 2.0 * identity_bias,
+            dim=1,
+        )
+
+    def _unified_anchor_graph(
+        self,
+        hsi_structure_anchors,
+        lidar_structure_anchors,
+        reliability,
+    ):
+        learned_graph = self._learned_anchor_graph()
+        hsi_graph = None
+        lidar_graph = None
+        if self.structure_fusion == "modality-graphs":
+            hsi_graph = self._anchor_graph_from_features(
+                hsi_structure_anchors
             )
-        ).mean()
+            lidar_graph = self._anchor_graph_from_features(
+                lidar_structure_anchors
+            )
+            unified_graph = (
+                reliability[:, :1] * hsi_graph
+                + reliability[:, 1:] * lidar_graph
+                + self.learned_graph_weight * learned_graph
+            )
+        else:
+            unified_graph = (
+                self.learned_graph_weight * learned_graph
+            )
+        if (
+            self.structure_fusion == "none"
+            and self.learned_graph_weight == 0
+        ):
+            unified_graph = torch.eye(
+                learned_graph.shape[0],
+                dtype=learned_graph.dtype,
+                device=learned_graph.device,
+            )
+        identity = torch.eye(
+            unified_graph.shape[0],
+            dtype=unified_graph.dtype,
+            device=unified_graph.device,
+        )
+        unified_graph = unified_graph + 1e-6 * identity
+        unified_graph = unified_graph / unified_graph.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-6)
+        return unified_graph, hsi_graph, lidar_graph, learned_graph
+
+    def _apply_anchor_reasoning(
+        self,
+        hsi_structure_anchors,
+        lidar_structure_anchors,
+        reliability,
+    ):
+        anchor_consensus = (
+            reliability[:, :1] * hsi_structure_anchors
+            + reliability[:, 1:] * lidar_structure_anchors
+        )
+        if self.anchor_reasoning == "none":
+            return anchor_consensus, None, None, None, None
+        (
+            unified_graph,
+            hsi_graph,
+            lidar_graph,
+            learned_graph,
+        ) = self._unified_anchor_graph(
+            hsi_structure_anchors,
+            lidar_structure_anchors,
+            reliability,
+        )
+        propagated = unified_graph @ anchor_consensus
+        reasoned = self.anchor_graph_norm(
+            anchor_consensus
+            + F.gelu(self.anchor_graph_projection(propagated))
+        )
+        return reasoned, unified_graph, hsi_graph, lidar_graph, learned_graph
+
+    def _writeback_gate(
+        self,
+        nodes,
+        message,
+        assignment,
+        gate_module,
+    ):
+        if gate_module is None:
+            return None
+        entropy = self._node_assignment_entropy(assignment)
+        gate_input = torch.cat(
+            [
+                nodes,
+                message,
+                torch.abs(nodes - message),
+                entropy,
+            ],
+            dim=1,
+        )
+        return gate_module(gate_input)
 
     def forward(self, hsi_nodes, lidar_nodes):
         hsi_assignment = self._soft_assignment(
@@ -1803,22 +2065,18 @@ class PostGATConsensusAnchorInteraction(nn.Module):
         (
             hsi_anchor_features,
             hsi_anchor_mass,
-        ) = (
-            self._area_weighted_anchor_features(
-                hsi_assignment,
-                self.hsi_area,
-                hsi_nodes,
-            )
+        ) = self._area_weighted_anchor_features(
+            hsi_assignment,
+            self.hsi_area,
+            hsi_nodes,
         )
         (
             lidar_anchor_features,
             lidar_anchor_mass,
-        ) = (
-            self._area_weighted_anchor_features(
-                lidar_assignment,
-                self.lidar_area,
-                lidar_nodes,
-            )
+        ) = self._area_weighted_anchor_features(
+            lidar_assignment,
+            self.lidar_area,
+            lidar_nodes,
         )
         hsi_shared_nodes = self.hsi_value_projection(hsi_nodes)
         lidar_shared_nodes = self.lidar_value_projection(
@@ -1887,16 +2145,45 @@ class PostGATConsensusAnchorInteraction(nn.Module):
                 / self.reliability_temperature,
                 dim=1,
             )
-        consensus = (
-            reliability[:, :1] * hsi_shared_anchors
-            + reliability[:, 1:] * lidar_shared_anchors
-        )
+        if self.anchor_reasoning == "none":
+            consensus = (
+                reliability[:, :1] * hsi_shared_anchors
+                + reliability[:, 1:] * lidar_shared_anchors
+            )
+            hsi_anchor_reference = hsi_shared_anchors
+            lidar_anchor_reference = lidar_shared_anchors
+            unified_graph = None
+            hsi_anchor_graph = None
+            lidar_anchor_graph = None
+            learned_anchor_graph = None
+        else:
+            hsi_structure_anchors = (
+                self.hsi_structure_projection(hsi_anchor_features)
+            )
+            lidar_structure_anchors = (
+                self.lidar_structure_projection(
+                    lidar_anchor_features
+                )
+            )
+            (
+                consensus,
+                unified_graph,
+                hsi_anchor_graph,
+                lidar_anchor_graph,
+                learned_anchor_graph,
+            ) = self._apply_anchor_reasoning(
+                hsi_structure_anchors,
+                lidar_structure_anchors,
+                reliability,
+            )
+            hsi_anchor_reference = hsi_structure_anchors
+            lidar_anchor_reference = lidar_structure_anchors
         if self.writeback_mode == "difference":
             hsi_anchor_message = (
-                consensus - hsi_shared_anchors
+                consensus - hsi_anchor_reference
             )
             lidar_anchor_message = (
-                consensus - lidar_shared_anchors
+                consensus - lidar_anchor_reference
             )
         else:
             hsi_anchor_message = consensus
@@ -1905,6 +2192,22 @@ class PostGATConsensusAnchorInteraction(nn.Module):
         lidar_message = (
             lidar_assignment @ lidar_anchor_message
         )
+        hsi_gate = self._writeback_gate(
+            hsi_nodes,
+            hsi_message,
+            hsi_assignment,
+            self.hsi_writeback_gate,
+        )
+        lidar_gate = self._writeback_gate(
+            lidar_nodes,
+            lidar_message,
+            lidar_assignment,
+            self.lidar_writeback_gate,
+        )
+        if hsi_gate is not None:
+            hsi_message = hsi_gate * hsi_message
+        if lidar_gate is not None:
+            lidar_message = lidar_gate * lidar_message
         updated_hsi = (
             hsi_nodes + self.hsi_gamma * hsi_message
         )
@@ -1916,9 +2219,32 @@ class PostGATConsensusAnchorInteraction(nn.Module):
             * torch.log(reliability.clamp_min(1e-12)),
             dim=1,
         )
-        self.last_diagnostics = {
+        hsi_gate_mean = 1.0
+        lidar_gate_mean = 1.0
+        hsi_gate_std = 0.0
+        lidar_gate_std = 0.0
+        if hsi_gate is not None:
+            hsi_gate_mean = float(
+                hsi_gate.detach().mean().item()
+            )
+            hsi_gate_std = float(
+                hsi_gate.detach().std(unbiased=False).item()
+            )
+        if lidar_gate is not None:
+            lidar_gate_mean = float(
+                lidar_gate.detach().mean().item()
+            )
+            lidar_gate_std = float(
+                lidar_gate.detach().std(unbiased=False).item()
+            )
+        diagnostics = {
             "fusion_mode": self.fusion_mode,
             "writeback_mode": self.writeback_mode,
+            "anchor_reasoning": self.anchor_reasoning,
+            "structure_fusion": self.structure_fusion,
+            "anchor_graph_topk": self.anchor_graph_topk,
+            "learned_graph_weight": self.learned_graph_weight,
+            "selective_writeback": self.selective_writeback,
             "hsi_gamma": float(
                 self.hsi_gamma.detach().item()
             ),
@@ -1980,7 +2306,64 @@ class PostGATConsensusAnchorInteraction(nn.Module):
                     < self.empty_anchor_mass_threshold
                 ).detach().sum().item()
             ),
+            "hsi_writeback_gate_mean": hsi_gate_mean,
+            "lidar_writeback_gate_mean": lidar_gate_mean,
+            "hsi_writeback_gate_std": hsi_gate_std,
+            "lidar_writeback_gate_std": lidar_gate_std,
+            "hsi_message_norm": float(
+                hsi_message.detach().norm(dim=1).mean().item()
+            ),
+            "lidar_message_norm": float(
+                lidar_message.detach().norm(dim=1).mean().item()
+            ),
         }
+        if unified_graph is not None:
+            diagnostics.update(
+                {
+                    "unified_anchor_graph_entropy": float(
+                        self._row_entropy(unified_graph)
+                        .detach()
+                        .mean()
+                        .item()
+                    ),
+                    "unified_anchor_graph_diag_mean": float(
+                        torch.diagonal(unified_graph)
+                        .detach()
+                        .mean()
+                        .item()
+                    ),
+                    "learned_anchor_graph_entropy": float(
+                        self._row_entropy(learned_anchor_graph)
+                        .detach()
+                        .mean()
+                        .item()
+                    ),
+                }
+            )
+        if hsi_anchor_graph is not None:
+            graph_agreement = torch.mean(
+                torch.abs(hsi_anchor_graph - lidar_anchor_graph)
+            )
+            diagnostics.update(
+                {
+                    "hsi_anchor_graph_entropy": float(
+                        self._row_entropy(hsi_anchor_graph)
+                        .detach()
+                        .mean()
+                        .item()
+                    ),
+                    "lidar_anchor_graph_entropy": float(
+                        self._row_entropy(lidar_anchor_graph)
+                        .detach()
+                        .mean()
+                        .item()
+                    ),
+                    "anchor_graph_l1_gap": float(
+                        graph_agreement.detach().item()
+                    ),
+                }
+            )
+        self.last_diagnostics = diagnostics
         return updated_hsi, updated_lidar
 
     def diagnostics(self):
@@ -3106,6 +3489,11 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         consensus_fusion="fixed",
         consensus_writeback="direct",
         consensus_reliability_temperature=1.0,
+        consensus_anchor_reasoning="none",
+        consensus_structure_fusion="none",
+        consensus_anchor_graph_topk=8,
+        consensus_learned_graph_weight=1.0,
+        consensus_selective_writeback="none",
         transport_semantic_weight=1.0,
         transport_iterations=10,
         transport_warmup_epochs=50,
@@ -3495,6 +3883,21 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                         writeback_mode=consensus_writeback,
                         reliability_temperature=(
                             consensus_reliability_temperature
+                        ),
+                        anchor_reasoning=(
+                            consensus_anchor_reasoning
+                        ),
+                        structure_fusion=(
+                            consensus_structure_fusion
+                        ),
+                        anchor_graph_topk=(
+                            consensus_anchor_graph_topk
+                        ),
+                        learned_graph_weight=(
+                            consensus_learned_graph_weight
+                        ),
+                        selective_writeback=(
+                            consensus_selective_writeback
                         ),
                     )
                 )
@@ -4096,6 +4499,21 @@ def train_one_run(
             consensus_reliability_temperature=(
                 args.consensus_reliability_temperature
             ),
+            consensus_anchor_reasoning=(
+                args.consensus_anchor_reasoning
+            ),
+            consensus_structure_fusion=(
+                args.consensus_structure_fusion
+            ),
+            consensus_anchor_graph_topk=(
+                args.consensus_anchor_graph_topk
+            ),
+            consensus_learned_graph_weight=(
+                args.consensus_learned_graph_weight
+            ),
+            consensus_selective_writeback=(
+                args.consensus_selective_writeback
+            ),
             transport_semantic_weight=(
                 args.transport_semantic_weight
             ),
@@ -4311,6 +4729,39 @@ def train_one_run(
                     f"{consensus_record['hsi_empty_anchor_count']}/"
                     f"{consensus_record['lidar_empty_anchor_count']}"
                 )
+                if (
+                    consensus_record.get("anchor_reasoning")
+                    != "none"
+                    and "unified_anchor_graph_entropy"
+                    in consensus_record
+                ):
+                    graph_message = (
+                        "  unified anchor graph | entropy="
+                        f"{consensus_record['unified_anchor_graph_entropy']:.4f} | "
+                        "diag="
+                        f"{consensus_record['unified_anchor_graph_diag_mean']:.4f}"
+                    )
+                    if "anchor_graph_l1_gap" in consensus_record:
+                        graph_message += (
+                            " | H/L graph gap="
+                            f"{consensus_record['anchor_graph_l1_gap']:.4f}"
+                        )
+                    print(graph_message)
+                if (
+                    consensus_record.get("selective_writeback")
+                    != "none"
+                ):
+                    print(
+                        "  selective writeback | gate H/L mean="
+                        f"{consensus_record['hsi_writeback_gate_mean']:.4f}/"
+                        f"{consensus_record['lidar_writeback_gate_mean']:.4f} | "
+                        "std="
+                        f"{consensus_record['hsi_writeback_gate_std']:.4f}/"
+                        f"{consensus_record['lidar_writeback_gate_std']:.4f} | "
+                        "message-norm="
+                        f"{consensus_record['hsi_message_norm']:.4f}/"
+                        f"{consensus_record['lidar_message_norm']:.4f}"
+                    )
 
     training_time = time.perf_counter() - start_time
     model.load_state_dict(best_state)
@@ -4424,6 +4875,14 @@ def validate_args(args):
         raise ValueError(
             "--consensus-reliability-temperature must be positive."
         )
+    if args.consensus_anchor_graph_topk <= 0:
+        raise ValueError(
+            "--consensus-anchor-graph-topk must be positive."
+        )
+    if args.consensus_learned_graph_weight < 0:
+        raise ValueError(
+            "--consensus-learned-graph-weight must be nonnegative."
+        )
     if args.transport_semantic_weight < 0:
         raise ValueError(
             "--transport-semantic-weight must be nonnegative."
@@ -4485,6 +4944,22 @@ def validate_args(args):
             raise ValueError(
                 "--consensus-writeback difference requires "
                 "--consensus-fusion adaptive."
+            )
+        if (
+            args.consensus_structure_fusion != "none"
+            and args.consensus_anchor_reasoning == "none"
+        ):
+            raise ValueError(
+                "--consensus-structure-fusion requires "
+                "--consensus-anchor-reasoning unified-gcn."
+            )
+        if (
+            args.consensus_selective_writeback != "none"
+            and args.consensus_writeback != "difference"
+        ):
+            raise ValueError(
+                "--consensus-selective-writeback gate requires "
+                "--consensus-writeback difference."
             )
         if args.cross_modal_interaction != "none":
             raise ValueError(
@@ -4766,6 +5241,22 @@ def main():
                 f"{args.consensus_gamma_init:g}, reliability-tau="
                 f"{args.consensus_reliability_temperature:g}"
             )
+            if args.consensus_anchor_reasoning != "none":
+                print(
+                    "Consensus anchor reasoning: "
+                    f"{args.consensus_anchor_reasoning}, "
+                    "structure fusion="
+                    f"{args.consensus_structure_fusion}, "
+                    "anchor top-k="
+                    f"{args.consensus_anchor_graph_topk}, "
+                    "learned-graph weight="
+                    f"{args.consensus_learned_graph_weight:g}"
+                )
+            if args.consensus_selective_writeback != "none":
+                print(
+                    "Consensus selective write-back: "
+                    f"{args.consensus_selective_writeback}"
+                )
         print(f"Intersection-cell interaction: {args.cell_interaction}")
         if args.cell_interaction == "rag":
             print(

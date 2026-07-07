@@ -109,6 +109,48 @@ Each logging record stores both per-anchor modality weights, per-anchor
 weight entropy, detached reconstruction errors, both gamma values, and the
 full area mass of every anchor plus empty-anchor counts.
 
+The unified-anchor-graph extension remains in the same post-GAT2 location and
+is also disabled unless requested. It keeps the existing shared assignment,
+then optionally maps HSI/LiDAR anchors into a shared structure space, builds
+per-modality anchor graphs, fuses them into one unified anchor graph, performs
+one lightweight GCN step on the anchor consensus, and writes the correction
+back to the original HSI/LiDAR superpixel nodes. This is a forward mechanism,
+not an extra loss, and it still projects graph nodes to pixels only once.
+
+The intended follow-up ablations are:
+
+```bash
+# B1: adaptive+difference plus unified anchor GCN using learned anchor graph
+--post-gat-consensus mssagf-anchor \
+--consensus-fusion adaptive \
+--consensus-writeback difference \
+--consensus-anchor-reasoning unified-gcn \
+--consensus-structure-fusion none
+
+# B2: B1 plus HSI/LiDAR anchor graph structure fusion
+--post-gat-consensus mssagf-anchor \
+--consensus-fusion adaptive \
+--consensus-writeback difference \
+--consensus-anchor-reasoning unified-gcn \
+--consensus-structure-fusion modality-graphs \
+--consensus-anchor-graph-topk 8 \
+--consensus-learned-graph-weight 1.0
+
+# B3: B2 plus node-level selective difference write-back
+--post-gat-consensus mssagf-anchor \
+--consensus-fusion adaptive \
+--consensus-writeback difference \
+--consensus-anchor-reasoning unified-gcn \
+--consensus-structure-fusion modality-graphs \
+--consensus-selective-writeback gate \
+--consensus-anchor-graph-topk 8 \
+--consensus-learned-graph-weight 1.0
+```
+
+When anchor reasoning is enabled, logs additionally include unified anchor
+graph entropy, diagonal mass, and HSI/LiDAR anchor-graph gap. With selective
+write-back, logs also include HSI/LiDAR gate mean/std and message norms.
+
 This first ablation has no node gate, extra contrastive loss, or dense
 HSI-by-LiDAR attention. To preserve exactly one cross-modal interaction and
 pure modality-private graph construction, it requires `cross-modal-interaction
