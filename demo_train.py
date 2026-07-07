@@ -37,6 +37,7 @@ from train import (
     normalized_sparse_assignments,
     scipy_sparse_to_torch,
     set_seed,
+    superpixel_centroids,
     split_fixed_samples_per_class,
     superpixel_height_distribution,
     symmetrically_normalize_sparse_adjacency,
@@ -336,6 +337,77 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--post-gat-bridge",
+        choices=("none", "center-block"),
+        default="none",
+        help=(
+            "Optional post-GAT2 center-bridge block interaction. "
+            "'center-block' creates public spatial bridge anchors and "
+            "uses H<->C<->L block attention before pixel projection. "
+            "Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--bridge-anchor-count",
+        type=int,
+        default=0,
+        help=(
+            "Number of public center bridge anchors. Zero resolves to "
+            "twice the dataset class count. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--bridge-attention-dk",
+        type=int,
+        default=32,
+        help="Query/key dimension of center bridge attention. Default: 32.",
+    )
+    parser.add_argument(
+        "--bridge-attention-topk",
+        type=int,
+        default=8,
+        help="Top-K entries per center bridge relation row. Default: 8.",
+    )
+    parser.add_argument(
+        "--bridge-overlap-metric",
+        choices=("coverage", "iou"),
+        default="coverage",
+        help=(
+            "Overlap prior between modality superpixels and public "
+            "bridge anchors. Default: coverage."
+        ),
+    )
+    parser.add_argument(
+        "--bridge-overlap-weight",
+        type=float,
+        default=1.0,
+        help="Weight of log-overlap bridge attention bias. Default: 1.",
+    )
+    parser.add_argument(
+        "--bridge-spatial-weight",
+        type=float,
+        default=1.0,
+        help="Weight of centroid-distance bridge bias. Default: 1.",
+    )
+    parser.add_argument(
+        "--bridge-height-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight of LiDAR height-distribution bridge bias. "
+            "Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--bridge-gamma-init",
+        type=float,
+        default=0.0,
+        help=(
+            "Initial residual scales for H/C/L bridge updates. "
+            "Default: 0."
+        ),
+    )
+    parser.add_argument(
         "--spsn-prototype-count",
         type=int,
         default=32,
@@ -624,6 +696,26 @@ def consensus_configuration_tag(args, class_count):
             f"eta{args.consensus_structure_eta_init:g}"
         )
     return tag
+
+
+def bridge_configuration_tag(args, class_count):
+    if args.post_gat_bridge == "none":
+        return "bridge-none"
+    anchor_count = (
+        args.bridge_anchor_count
+        if args.bridge_anchor_count > 0
+        else 2 * class_count
+    )
+    return (
+        f"bridge-center-k{anchor_count}-"
+        f"dk{args.bridge_attention_dk}-"
+        f"top{args.bridge_attention_topk}-"
+        f"ov{args.bridge_overlap_metric}-"
+        f"w{args.bridge_overlap_weight:g}-"
+        f"{args.bridge_spatial_weight:g}-"
+        f"{args.bridge_height_weight:g}-"
+        f"g{args.bridge_gamma_init:g}"
+    )
 
 
 def safe_output_filename(stem, suffix, maximum_bytes=240):
@@ -1049,6 +1141,244 @@ def build_cross_modal_overlap(
         hsi_to_lidar.astype(np.float32),
         lidar_to_hsi.astype(np.float32),
     )
+
+
+def build_center_bridge_assignment(height, width, anchor_count):
+    """Build an exact-K public spatial grid assignment Q_C."""
+    if anchor_count <= 0:
+        raise ValueError("Bridge anchor count must be positive.")
+    target_rows = int(
+        round(np.sqrt(anchor_count * height / max(width, 1)))
+    )
+    rows = int(np.clip(target_rows, 1, anchor_count))
+    while rows > 1 and anchor_count // rows == 0:
+        rows -= 1
+    base_columns = anchor_count // rows
+    extra_columns = anchor_count % rows
+    if base_columns == 0:
+        rows = 1
+        base_columns = anchor_count
+        extra_columns = 0
+
+    labels = np.zeros((height, width), dtype=np.int64)
+    offset = 0
+    for row_index in range(rows):
+        y_start = int(np.floor(row_index * height / rows))
+        y_end = int(np.floor((row_index + 1) * height / rows))
+        if row_index == rows - 1:
+            y_end = height
+        columns = base_columns + (
+            1 if row_index < extra_columns else 0
+        )
+        x_bins = np.floor(
+            np.arange(width, dtype=np.float32)
+            * columns
+            / max(width, 1)
+        ).astype(np.int64)
+        x_bins = np.minimum(x_bins, columns - 1)
+        labels[y_start:y_end, :] = offset + x_bins[None, :]
+        offset += columns
+    if offset != anchor_count:
+        raise RuntimeError(
+            "Internal bridge grid construction did not produce "
+            "the requested number of anchors."
+        )
+    pixel_indices = np.arange(height * width, dtype=np.int64)
+    return coo_matrix(
+        (
+            np.ones(height * width, dtype=np.float32),
+            (pixel_indices, labels.reshape(-1)),
+        ),
+        shape=(height * width, anchor_count),
+        dtype=np.float32,
+    ).tocsr()
+
+
+def _dense_overlap(source_assignment, target_assignment):
+    overlap = source_assignment.transpose() @ target_assignment
+    if issparse(overlap):
+        overlap = overlap.toarray()
+    return np.asarray(overlap, dtype=np.float32)
+
+
+def _directional_overlap_prior(
+    overlap,
+    source_area,
+    target_area,
+    metric,
+):
+    if metric == "iou":
+        union = (
+            source_area[:, None]
+            + target_area[None, :]
+            - overlap
+        )
+        correspondence = np.divide(
+            overlap,
+            np.maximum(union, 1.0),
+            out=np.zeros_like(overlap),
+            where=overlap > 0,
+        )
+    elif metric == "coverage":
+        correspondence = overlap
+    else:
+        raise ValueError(
+            "Bridge overlap metric must be 'coverage' or 'iou'."
+        )
+    return (
+        correspondence
+        / np.maximum(correspondence.sum(axis=1, keepdims=True), 1e-6)
+    ).astype(np.float32)
+
+
+def _negative_centroid_distance_bias(source_centroids, target_centroids):
+    delta = source_centroids[:, None, :] - target_centroids[None, :, :]
+    squared_distance = np.sum(delta * delta, axis=2).astype(np.float32)
+    positive = squared_distance[squared_distance > 0]
+    sigma = float(np.median(positive)) if positive.size else 1.0
+    return (-squared_distance / max(sigma, 1e-6)).astype(np.float32)
+
+
+def _negative_height_distribution_bias(source_height, target_height):
+    source_descriptor = source_height[:, [5, 6, 1, 2, 3]]
+    target_descriptor = target_height[:, [5, 6, 1, 2, 3]]
+    distance = np.mean(
+        np.abs(
+            source_descriptor[:, None, :]
+            - target_descriptor[None, :, :]
+        ),
+        axis=2,
+    ).astype(np.float32)
+    positive = distance[distance > 0]
+    sigma = float(np.median(positive)) if positive.size else 1.0
+    return (-distance / max(sigma, 1e-6)).astype(np.float32)
+
+
+def build_center_bridge_data(
+    hsi_assignment,
+    lidar_assignment,
+    elevation,
+    height,
+    width,
+    anchor_count,
+    overlap_metric="coverage",
+    overlap_weight=1.0,
+    spatial_weight=1.0,
+    height_weight=1.0,
+):
+    """Build Q_C and all fixed priors for center-bridge attention."""
+    bridge_assignment = build_center_bridge_assignment(
+        height,
+        width,
+        anchor_count,
+    )
+    hsi_area = np.asarray(hsi_assignment.sum(axis=0)).reshape(-1)
+    lidar_area = np.asarray(lidar_assignment.sum(axis=0)).reshape(-1)
+    bridge_area = np.asarray(
+        bridge_assignment.sum(axis=0)
+    ).reshape(-1)
+
+    overlap_hc = _dense_overlap(hsi_assignment, bridge_assignment)
+    overlap_lc = _dense_overlap(lidar_assignment, bridge_assignment)
+    prior_hc = _directional_overlap_prior(
+        overlap_hc,
+        hsi_area,
+        bridge_area,
+        overlap_metric,
+    )
+    prior_ch = _directional_overlap_prior(
+        overlap_hc.T,
+        bridge_area,
+        hsi_area,
+        overlap_metric,
+    )
+    prior_lc = _directional_overlap_prior(
+        overlap_lc,
+        lidar_area,
+        bridge_area,
+        overlap_metric,
+    )
+    prior_cl = _directional_overlap_prior(
+        overlap_lc.T,
+        bridge_area,
+        lidar_area,
+        overlap_metric,
+    )
+
+    hsi_centroids = superpixel_centroids(
+        hsi_assignment,
+        height,
+        width,
+    )
+    lidar_centroids = superpixel_centroids(
+        lidar_assignment,
+        height,
+        width,
+    )
+    bridge_centroids = superpixel_centroids(
+        bridge_assignment,
+        height,
+        width,
+    )
+    spatial_hc = _negative_centroid_distance_bias(
+        hsi_centroids,
+        bridge_centroids,
+    )
+    spatial_lc = _negative_centroid_distance_bias(
+        lidar_centroids,
+        bridge_centroids,
+    )
+    spatial_cc = _negative_centroid_distance_bias(
+        bridge_centroids,
+        bridge_centroids,
+    )
+    lidar_height, _ = superpixel_height_distribution(
+        lidar_assignment,
+        elevation,
+    )
+    bridge_height, _ = superpixel_height_distribution(
+        bridge_assignment,
+        elevation,
+    )
+    height_lc = _negative_height_distribution_bias(
+        lidar_height,
+        bridge_height,
+    )
+
+    eps = 1e-6
+    bias_hc = (
+        overlap_weight * np.log(prior_hc + eps)
+        + spatial_weight * spatial_hc
+    )
+    bias_ch = (
+        overlap_weight * np.log(prior_ch + eps)
+        + spatial_weight * spatial_hc.T
+    )
+    bias_lc = (
+        overlap_weight * np.log(prior_lc + eps)
+        + spatial_weight * spatial_lc
+        + height_weight * height_lc
+    )
+    bias_cl = (
+        overlap_weight * np.log(prior_cl + eps)
+        + spatial_weight * spatial_lc.T
+        + height_weight * height_lc.T
+    )
+    bias_cc = spatial_weight * spatial_cc
+    return {
+        "assignment": bridge_assignment.astype(np.float32),
+        "prior_hc": prior_hc.astype(np.float32),
+        "prior_ch": prior_ch.astype(np.float32),
+        "prior_lc": prior_lc.astype(np.float32),
+        "prior_cl": prior_cl.astype(np.float32),
+        "bias_hc": bias_hc.astype(np.float32),
+        "bias_ch": bias_ch.astype(np.float32),
+        "bias_lc": bias_lc.astype(np.float32),
+        "bias_cl": bias_cl.astype(np.float32),
+        "bias_cc": bias_cc.astype(np.float32),
+        "anchor_count": int(anchor_count),
+        "area": bridge_area.astype(np.float32),
+    }
 
 
 def build_overlap_distribution_targets(
@@ -2210,6 +2540,244 @@ class PostGATConsensusAnchorInteraction(nn.Module):
         return self.last_diagnostics
 
 
+class CenterBridgeBlockInteraction(nn.Module):
+    """Post-GAT2 H<->C<->L block relation through public bridge anchors."""
+
+    def __init__(
+        self,
+        channels,
+        bridge_data,
+        attention_d_k=32,
+        topk=8,
+        gamma_init=0.0,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.attention_d_k = attention_d_k
+        self.topk = topk
+        anchor_count = int(bridge_data["anchor_count"])
+        self.bridge_embedding = nn.Parameter(
+            torch.empty(anchor_count, channels)
+        )
+        nn.init.xavier_uniform_(self.bridge_embedding)
+        self.bridge_norm = nn.LayerNorm(channels)
+
+        self.h_query = nn.Linear(channels, attention_d_k, bias=False)
+        self.h_key = nn.Linear(channels, attention_d_k, bias=False)
+        self.h_value = nn.Linear(channels, channels, bias=False)
+        self.c_query = nn.Linear(channels, attention_d_k, bias=False)
+        self.c_key = nn.Linear(channels, attention_d_k, bias=False)
+        self.c_value = nn.Linear(channels, channels, bias=False)
+        self.l_query = nn.Linear(channels, attention_d_k, bias=False)
+        self.l_key = nn.Linear(channels, attention_d_k, bias=False)
+        self.l_value = nn.Linear(channels, channels, bias=False)
+        self.scale = attention_d_k ** -0.5
+
+        self.h_view_score = nn.Linear(channels, 1)
+        self.c_view_score = nn.Linear(channels, 1)
+        self.l_view_score = nn.Linear(channels, 1)
+        self.h_ffn = nn.Linear(channels, channels)
+        self.c_ffn = nn.Linear(channels, channels)
+        self.l_ffn = nn.Linear(channels, channels)
+        self.h_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.c_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.l_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+
+        for name in (
+            "prior_hc",
+            "prior_ch",
+            "prior_lc",
+            "prior_cl",
+            "bias_hc",
+            "bias_ch",
+            "bias_lc",
+            "bias_cl",
+            "bias_cc",
+        ):
+            self.register_buffer(
+                name,
+                torch.as_tensor(
+                    bridge_data[name],
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+        self.last_diagnostics = None
+
+    @staticmethod
+    def _topk_softmax(logits, topk):
+        if topk <= 0 or topk >= logits.shape[1]:
+            return F.softmax(logits, dim=1)
+        values, indices = torch.topk(
+            logits,
+            k=min(topk, logits.shape[1]),
+            dim=1,
+        )
+        masked = torch.full_like(
+            logits,
+            torch.finfo(logits.dtype).min,
+        )
+        masked.scatter_(1, indices, values)
+        return F.softmax(masked, dim=1)
+
+    @staticmethod
+    def _row_entropy(attention):
+        return -torch.sum(
+            attention * torch.log(attention.clamp_min(1e-12)),
+            dim=1,
+        )
+
+    def _attention(self, query, key, bias):
+        logits = query @ key.transpose(0, 1) * self.scale + bias
+        return self._topk_softmax(logits, self.topk)
+
+    @staticmethod
+    def _fuse_views(views, scorer):
+        scores = scorer(views).squeeze(-1)
+        weights = F.softmax(scores, dim=1)
+        fused = torch.sum(weights.unsqueeze(-1) * views, dim=1)
+        return fused, weights
+
+    def forward(self, hsi_nodes, lidar_nodes):
+        bridge_from_hsi = self.prior_ch @ hsi_nodes
+        bridge_from_lidar = self.prior_cl @ lidar_nodes
+        bridge_nodes = self.bridge_norm(
+            0.5 * bridge_from_hsi
+            + 0.5 * bridge_from_lidar
+            + self.bridge_embedding
+        )
+
+        h_query = self.h_query(hsi_nodes)
+        h_key = self.h_key(hsi_nodes)
+        h_value = self.h_value(hsi_nodes)
+        c_query = self.c_query(bridge_nodes)
+        c_key = self.c_key(bridge_nodes)
+        c_value = self.c_value(bridge_nodes)
+        l_query = self.l_query(lidar_nodes)
+        l_key = self.l_key(lidar_nodes)
+        l_value = self.l_value(lidar_nodes)
+
+        attention_hc = self._attention(
+            h_query,
+            c_key,
+            self.bias_hc,
+        )
+        attention_ch = self._attention(
+            c_query,
+            h_key,
+            self.bias_ch,
+        )
+        attention_lc = self._attention(
+            l_query,
+            c_key,
+            self.bias_lc,
+        )
+        attention_cl = self._attention(
+            c_query,
+            l_key,
+            self.bias_cl,
+        )
+        attention_cc = self._attention(
+            c_query,
+            c_key,
+            self.bias_cc,
+        )
+
+        zero_h = torch.zeros_like(h_value)
+        zero_l = torch.zeros_like(l_value)
+        bridge_views = torch.stack(
+            [
+                attention_ch @ h_value,
+                attention_cc @ c_value,
+                attention_cl @ l_value,
+            ],
+            dim=1,
+        )
+        bridge_message, bridge_view_weights = self._fuse_views(
+            bridge_views,
+            self.c_view_score,
+        )
+        updated_bridge = (
+            bridge_nodes + self.c_gamma * self.c_ffn(bridge_message)
+        )
+        updated_bridge_value = self.c_value(updated_bridge)
+
+        hsi_views = torch.stack(
+            [
+                h_value,
+                attention_hc @ updated_bridge_value,
+                zero_h,
+            ],
+            dim=1,
+        )
+        lidar_views = torch.stack(
+            [
+                zero_l,
+                attention_lc @ updated_bridge_value,
+                l_value,
+            ],
+            dim=1,
+        )
+        hsi_message, hsi_view_weights = self._fuse_views(
+            hsi_views,
+            self.h_view_score,
+        )
+        lidar_message, lidar_view_weights = self._fuse_views(
+            lidar_views,
+            self.l_view_score,
+        )
+
+        updated_hsi = (
+            hsi_nodes + self.h_gamma * self.h_ffn(hsi_message)
+        )
+        updated_lidar = (
+            lidar_nodes + self.l_gamma * self.l_ffn(lidar_message)
+        )
+        self.last_diagnostics = {
+            "h_gamma": float(self.h_gamma.detach().item()),
+            "c_gamma": float(self.c_gamma.detach().item()),
+            "l_gamma": float(self.l_gamma.detach().item()),
+            "bridge_count": int(bridge_nodes.shape[0]),
+            "attention_hc_entropy": float(
+                self._row_entropy(attention_hc).detach().mean().item()
+            ),
+            "attention_ch_entropy": float(
+                self._row_entropy(attention_ch).detach().mean().item()
+            ),
+            "attention_lc_entropy": float(
+                self._row_entropy(attention_lc).detach().mean().item()
+            ),
+            "attention_cl_entropy": float(
+                self._row_entropy(attention_cl).detach().mean().item()
+            ),
+            "attention_cc_entropy": float(
+                self._row_entropy(attention_cc).detach().mean().item()
+            ),
+            "hsi_view_weight_mean": (
+                hsi_view_weights.detach().mean(dim=0).cpu().tolist()
+            ),
+            "bridge_view_weight_mean": (
+                bridge_view_weights.detach().mean(dim=0).cpu().tolist()
+            ),
+            "lidar_view_weight_mean": (
+                lidar_view_weights.detach().mean(dim=0).cpu().tolist()
+            ),
+            "hsi_message_norm": float(
+                hsi_message.detach().norm(dim=1).mean().item()
+            ),
+            "bridge_message_norm": float(
+                bridge_message.detach().norm(dim=1).mean().item()
+            ),
+            "lidar_message_norm": float(
+                lidar_message.detach().norm(dim=1).mean().item()
+            ),
+        }
+        return updated_hsi, updated_lidar
+
+    def diagnostics(self):
+        return self.last_diagnostics
+
+
 def aggregate_cell_pixel_means(
     pixel_features,
     pixel_cell_index,
@@ -3334,6 +3902,11 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         consensus_anchor_graph_topk=8,
         consensus_structure_temperature=0.1,
         consensus_structure_eta_init=0.0,
+        post_gat_bridge="none",
+        bridge_data=None,
+        bridge_attention_d_k=32,
+        bridge_attention_topk=8,
+        bridge_gamma_init=0.0,
         transport_semantic_weight=1.0,
         transport_iterations=10,
         transport_warmup_epochs=50,
@@ -3743,6 +4316,22 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 )
         else:
             self.consensus_anchor_interaction = None
+        if post_gat_bridge == "center-block":
+            if bridge_data is None:
+                raise ValueError(
+                    "bridge_data is required for center bridge block."
+                )
+            self.bridge_block_interaction = (
+                CenterBridgeBlockInteraction(
+                    hidden_dim,
+                    bridge_data,
+                    attention_d_k=bridge_attention_d_k,
+                    topk=bridge_attention_topk,
+                    gamma_init=bridge_gamma_init,
+                )
+            )
+        else:
+            self.bridge_block_interaction = None
 
     def set_contrastive_epoch(self, epoch):
         if (
@@ -3792,6 +4381,12 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             >= self.cell_veto_threshold,
             self.lidar_topology_support
             >= self.cell_veto_threshold,
+        )
+
+    def _has_post_node_interaction(self):
+        return (
+            self.consensus_anchor_interaction is not None
+            or self.bridge_block_interaction is not None
         )
 
     def forward(self, hsi, lidar, joint_input):
@@ -3880,7 +4475,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 hsi_final_nodes,
                 lidar_final_nodes,
             )
-            if self.consensus_anchor_interaction is None:
+            if not self._has_post_node_interaction():
                 hsi_graph_features = self.hsi_graph.project_nodes(
                     hsi_final_nodes
                 )
@@ -3893,7 +4488,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             if (
                 self.contrastive_module is None
                 and self.prototype_correlation_fusion is None
-                and self.consensus_anchor_interaction is None
+                and not self._has_post_node_interaction()
             ):
                 # Preserve the original Stage-3 path exactly.
                 hsi_graph_features = self.hsi_graph(hsi)
@@ -3908,7 +4503,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     hsi_features,
                     adjacency=hsi_adjacency,
                 )
-                if self.consensus_anchor_interaction is None:
+                if not self._has_post_node_interaction():
                     hsi_graph_features = (
                         self.hsi_graph.project_nodes(
                             hsi_final_nodes
@@ -3925,7 +4520,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                         adjacency=lidar_adjacency,
                     )
                 )
-                if self.consensus_anchor_interaction is None:
+                if not self._has_post_node_interaction():
                     lidar_graph_features = (
                         self.lidar_graph.project_nodes(
                             lidar_final_nodes
@@ -3954,7 +4549,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             if (
                 self.contrastive_module is None
                 and self.prototype_correlation_fusion is None
-                and self.consensus_anchor_interaction is None
+                and not self._has_post_node_interaction()
             ):
                 hsi_graph_features = (
                     self.hsi_graph.apply_gat2_and_project(
@@ -3983,7 +4578,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     hsi_final_nodes,
                     lidar_final_nodes,
                 )
-                if self.consensus_anchor_interaction is None:
+                if not self._has_post_node_interaction():
                     hsi_graph_features = (
                         self.hsi_graph.project_nodes(
                             hsi_final_nodes
@@ -4009,7 +4604,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             if (
                 self.contrastive_module is None
                 and self.prototype_correlation_fusion is None
-                and self.consensus_anchor_interaction is None
+                and not self._has_post_node_interaction()
             ):
                 hsi_graph_features = (
                     self.hsi_graph.apply_gat2_and_project(
@@ -4038,7 +4633,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     hsi_final_nodes,
                     lidar_final_nodes,
                 )
-                if self.consensus_anchor_interaction is None:
+                if not self._has_post_node_interaction():
                     hsi_graph_features = (
                         self.hsi_graph.project_nodes(
                             hsi_final_nodes
@@ -4049,14 +4644,23 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                             lidar_final_nodes
                         )
                     )
-        if self.consensus_anchor_interaction is not None:
-            (
-                hsi_final_nodes,
-                lidar_final_nodes,
-            ) = self.consensus_anchor_interaction(
-                hsi_final_nodes,
-                lidar_final_nodes,
-            )
+        if self._has_post_node_interaction():
+            if self.consensus_anchor_interaction is not None:
+                (
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                ) = self.consensus_anchor_interaction(
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                )
+            if self.bridge_block_interaction is not None:
+                (
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                ) = self.bridge_block_interaction(
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                )
             hsi_graph_features = self.hsi_graph.project_nodes(
                 hsi_final_nodes
             )
@@ -4228,6 +4832,25 @@ def prepare_data(args, config):
             reduced_hsi,
             lidar_features,
         )
+    bridge_data = None
+    if args.post_gat_bridge == "center-block":
+        bridge_anchor_count = (
+            args.bridge_anchor_count
+            if args.bridge_anchor_count > 0
+            else 2 * class_count
+        )
+        bridge_data = build_center_bridge_data(
+            hsi_assignment,
+            lidar_assignment,
+            lidar,
+            height,
+            width,
+            bridge_anchor_count,
+            overlap_metric=args.bridge_overlap_metric,
+            overlap_weight=args.bridge_overlap_weight,
+            spatial_weight=args.bridge_spatial_weight,
+            height_weight=args.bridge_height_weight,
+        )
     return (
         reduced_hsi,
         lidar_features,
@@ -4243,6 +4866,7 @@ def prepare_data(args, config):
         lidar_rag_adjacency,
         lidar_geometry_descriptors,
         cell_data,
+        bridge_data,
         joint_spatial_prior,
     )
 
@@ -4263,6 +4887,7 @@ def train_one_run(
     lidar_rag_adjacency,
     lidar_geometry_descriptors,
     cell_data,
+    bridge_data,
     joint_spatial_prior,
     run_index,
 ):
@@ -4354,6 +4979,10 @@ def train_one_run(
             consensus_structure_eta_init=(
                 args.consensus_structure_eta_init
             ),
+            post_gat_bridge=args.post_gat_bridge,
+            bridge_attention_d_k=args.bridge_attention_dk,
+            bridge_attention_topk=args.bridge_attention_topk,
+            bridge_gamma_init=args.bridge_gamma_init,
             transport_semantic_weight=(
                 args.transport_semantic_weight
             ),
@@ -4364,6 +4993,7 @@ def train_one_run(
             variance_target=args.variance_target,
             cell_interaction=args.cell_interaction,
             cell_data=cell_data,
+            bridge_data=bridge_data,
             cell_pixel_descriptor=args.cell_pixel_descriptor,
             cell_edge_mode=args.cell_edge_mode,
             cell_interaction_stages=args.cell_interaction_stages,
@@ -4400,6 +5030,7 @@ def train_one_run(
     transport_diagnostics = []
     prototype_fusion_diagnostics = []
     consensus_diagnostics = []
+    bridge_diagnostics = []
     start_time = time.perf_counter()
 
     for epoch in range(1, args.epochs + 1):
@@ -4495,6 +5126,20 @@ def train_one_run(
                     consensus_diagnostics.append(
                         consensus_record
                     )
+            bridge_record = None
+            bridge_module = getattr(
+                model,
+                "bridge_block_interaction",
+                None,
+            )
+            if bridge_module is not None:
+                bridge_record = bridge_module.diagnostics()
+                if bridge_record is not None:
+                    bridge_record = {
+                        "epoch": epoch,
+                        **bridge_record,
+                    }
+                    bridge_diagnostics.append(bridge_record)
             train_predictions = (
                 logits.index_select(0, train_index).argmax(dim=1)
             )
@@ -4593,6 +5238,32 @@ def train_one_run(
                         f"{consensus_record['hsi_message_norm']:.4f}/"
                         f"{consensus_record['lidar_message_norm']:.4f}"
                     )
+            if bridge_record is not None:
+                hsi_weights = np.asarray(
+                    bridge_record["hsi_view_weight_mean"]
+                )
+                bridge_weights = np.asarray(
+                    bridge_record["bridge_view_weight_mean"]
+                )
+                lidar_weights = np.asarray(
+                    bridge_record["lidar_view_weight_mean"]
+                )
+                print(
+                    "  center bridge | gamma H/C/L="
+                    f"{bridge_record['h_gamma']:.5f}/"
+                    f"{bridge_record['c_gamma']:.5f}/"
+                    f"{bridge_record['l_gamma']:.5f} | "
+                    "entropy HC/CH/LC/CL/CC="
+                    f"{bridge_record['attention_hc_entropy']:.4f}/"
+                    f"{bridge_record['attention_ch_entropy']:.4f}/"
+                    f"{bridge_record['attention_lc_entropy']:.4f}/"
+                    f"{bridge_record['attention_cl_entropy']:.4f}/"
+                    f"{bridge_record['attention_cc_entropy']:.4f} | "
+                    "view H/C/L="
+                    f"{hsi_weights.round(3).tolist()}/"
+                    f"{bridge_weights.round(3).tolist()}/"
+                    f"{lidar_weights.round(3).tolist()}"
+                )
 
     training_time = time.perf_counter() - start_time
     model.load_state_dict(best_state)
@@ -4622,6 +5293,7 @@ def train_one_run(
         f"{contrastive_configuration_tag(args)}_"
         f"{prototype_fusion_configuration_tag(args)}_"
         f"{consensus_configuration_tag(args, class_count)}_"
+        f"{bridge_configuration_tag(args, class_count)}_"
         f"{cell_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
         f"cnn-{args.cnn_branch}_"
@@ -4650,6 +5322,7 @@ def train_one_run(
             prototype_fusion_diagnostics
         ),
         "consensus_diagnostics": consensus_diagnostics,
+        "bridge_diagnostics": bridge_diagnostics,
     }
 
 
@@ -4718,6 +5391,23 @@ def validate_args(args):
         raise ValueError(
             "--consensus-structure-eta-init must be nonnegative."
         )
+    if args.bridge_anchor_count < 0:
+        raise ValueError("--bridge-anchor-count must be nonnegative.")
+    if args.bridge_attention_dk <= 0:
+        raise ValueError("--bridge-attention-dk must be positive.")
+    if args.bridge_attention_topk <= 0:
+        raise ValueError("--bridge-attention-topk must be positive.")
+    if args.bridge_gamma_init < 0:
+        raise ValueError("--bridge-gamma-init must be nonnegative.")
+    if any(
+        weight < 0
+        for weight in (
+            args.bridge_overlap_weight,
+            args.bridge_spatial_weight,
+            args.bridge_height_weight,
+        )
+    ):
+        raise ValueError("Bridge bias weights must be nonnegative.")
     if args.transport_semantic_weight < 0:
         raise ValueError(
             "--transport-semantic-weight must be nonnegative."
@@ -4817,6 +5507,40 @@ def validate_args(args):
                 "--post-gat-consensus and "
                 "--post-gat-prototype-fusion are alternative "
                 "single-interaction ablations."
+            )
+    if (
+        args.graph_layout == "joint"
+        and args.post_gat_bridge != "none"
+    ):
+        raise ValueError(
+            "--post-gat-bridge requires --graph-layout separate."
+        )
+    if args.post_gat_bridge != "none":
+        if args.cross_modal_interaction != "none":
+            raise ValueError(
+                "--post-gat-bridge requires "
+                "--cross-modal-interaction none so bridge is the "
+                "only cross-modal graph interaction."
+            )
+        if args.post_gat_consensus != "none":
+            raise ValueError(
+                "--post-gat-bridge and --post-gat-consensus are "
+                "alternative post-GAT2 interactions."
+            )
+        if args.post_gat_prototype_fusion != "none":
+            raise ValueError(
+                "--post-gat-bridge and --post-gat-prototype-fusion "
+                "are alternative post-GAT2 interactions."
+            )
+        if args.contrastive_mode != "none":
+            raise ValueError(
+                "--post-gat-bridge first ablation requires "
+                "--contrastive-mode none."
+            )
+        if args.cell_interaction != "none":
+            raise ValueError(
+                "--post-gat-bridge first ablation requires "
+                "--cell-interaction none."
             )
     if (
         args.graph_layout == "joint"
@@ -4928,6 +5652,7 @@ def main():
         lidar_rag_adjacency,
         lidar_geometry_descriptors,
         cell_data,
+        bridge_data,
         joint_spatial_prior,
     ) = prepare_data(args, config)
 
@@ -5089,6 +5814,30 @@ def main():
                     "eta-init="
                     f"{args.consensus_structure_eta_init:g}"
                 )
+        print(
+            "Post-GAT2 center bridge interaction: "
+            f"{args.post_gat_bridge}"
+        )
+        if args.post_gat_bridge == "center-block":
+            resolved_bridge_count = (
+                args.bridge_anchor_count
+                if args.bridge_anchor_count > 0
+                else 2 * class_count
+            )
+            print(
+                "Center bridge path: HSI/LiDAR GAT2 nodes -> "
+                f"{resolved_bridge_count} public spatial bridge "
+                "anchors -> H<->C<->L block attention -> separate "
+                "pixel projection; d_k="
+                f"{args.bridge_attention_dk}, top-k="
+                f"{args.bridge_attention_topk}, overlap="
+                f"{args.bridge_overlap_metric}, bias weights "
+                "overlap/spatial/height="
+                f"{args.bridge_overlap_weight:g}/"
+                f"{args.bridge_spatial_weight:g}/"
+                f"{args.bridge_height_weight:g}, gamma-init="
+                f"{args.bridge_gamma_init:g}"
+            )
         print(f"Intersection-cell interaction: {args.cell_interaction}")
         if args.cell_interaction == "rag":
             print(
@@ -5192,6 +5941,7 @@ def main():
             lidar_rag_adjacency,
             lidar_geometry_descriptors,
             cell_data,
+            bridge_data,
             joint_spatial_prior,
             run_index,
         )
@@ -5228,6 +5978,7 @@ def main():
         f"{contrastive_configuration_tag(args)}_"
         f"{prototype_fusion_configuration_tag(args)}_"
         f"{consensus_configuration_tag(args, class_count)}_"
+        f"{bridge_configuration_tag(args, class_count)}_"
         f"{cell_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
         f"cnn-{args.cnn_branch}_"

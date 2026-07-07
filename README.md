@@ -156,7 +156,7 @@ The intended follow-up ablations are:
 --consensus-structure-eta-init 0 \
 --consensus-structure-reliability adaptive \
 --consensus-structure-temperature 0.1 \
---consensus-anchor-graph-topk 8 \
+--consensus-anchor-graph-topk 8
 
 # E3: weak orthogonal projection loss is intentionally not implemented yet
 ```
@@ -176,6 +176,42 @@ is a MATLAB clustering method rather than a neural fusion layer. The SACR
 residual borrows the anchor-graph structure-alignment idea from
 [OSMAGC](https://github.com/ZhangYongshan/OSMAGC) without importing its
 orthogonal loss in this first pass.
+
+A separate center-bridge block interaction is available as another post-GAT2
+branch:
+
+```bash
+--post-gat-bridge center-block \
+--bridge-anchor-count 0 \
+--bridge-attention-dk 32 \
+--bridge-attention-topk 8 \
+--bridge-overlap-metric coverage \
+--bridge-overlap-weight 1.0 \
+--bridge-spatial-weight 1.0 \
+--bridge-height-weight 1.0 \
+--bridge-gamma-init 0
+```
+
+It is disabled by default with `--post-gat-bridge none`. A bridge count of
+zero resolves to twice the dataset class count. The module first constructs a
+public spatial bridge assignment `Q_C` from a deterministic grid over the
+image. It then builds `Q_H^T Q_C` and `Q_L^T Q_C` overlap priors, adds
+centroid-distance bias for both modalities, and adds LiDAR height-distribution
+bias for the LiDAR-to-bridge relations. After HSI/LiDAR GAT2, the first
+version uses only the minimal block closure:
+
+```text
+H receives: H self-view + C bridge-view
+C receives: H view + C self-view + L view
+L receives: C bridge-view + L self-view
+```
+
+The mediated direct HSI-LiDAR blocks `A_HL^C` and `A_LH^C` are intentionally
+left off in this first ablation. Residual scales for H/C/L initialize to zero,
+so the first forward pass is equivalent to the original late graph fusion.
+This branch is mutually exclusive with consensus anchors, SPSN-style
+prototype fusion, contrastive loss, cell interaction, and earlier
+cross-modal graph interaction to keep the attribution clean.
 
 The joint pixel CNN is independently selectable:
 
