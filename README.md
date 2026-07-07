@@ -197,21 +197,27 @@ zero resolves to twice the dataset class count. The module first constructs a
 public spatial bridge assignment `Q_C` from a deterministic grid over the
 image. It then builds `Q_H^T Q_C` and `Q_L^T Q_C` overlap priors, adds
 centroid-distance bias for both modalities, and adds LiDAR height-distribution
-bias for the LiDAR-to-bridge relations. After HSI/LiDAR GAT2, the first
-version uses only the minimal block closure:
+bias for the LiDAR-to-bridge relations. After HSI/LiDAR GAT2, the current
+version uses the full center-bridged block closure:
 
 ```text
-H receives: H self-view + C bridge-view
+H receives: H self-view + C bridge-view + L via C
 C receives: H view + C self-view + L view
-L receives: C bridge-view + L self-view
+L receives: H via C + C bridge-view + L self-view
 ```
 
-The mediated direct HSI-LiDAR blocks `A_HL^C` and `A_LH^C` are intentionally
-left off in this first ablation. Residual scales for H/C/L initialize to zero,
-so the first forward pass is equivalent to the original late graph fusion.
-This branch is mutually exclusive with consensus anchors, SPSN-style
-prototype fusion, contrastive loss, cell interaction, and earlier
-cross-modal graph interaction to keep the attribution clean.
+The mediated direct HSI-LiDAR blocks are induced by the bridge relations:
+
+```text
+A_HL^C = row_norm(A_HC A_CL)
+A_LH^C = row_norm(A_LC A_CH)
+```
+
+Residual scales for H/C/L initialize to zero, so even the full block matrix
+starts with a safe forward pass equivalent to the original late graph fusion.
+This branch is mutually exclusive with consensus anchors, SPSN-style prototype
+fusion, contrastive loss, cell interaction, and earlier cross-modal graph
+interaction to keep the attribution clean.
 
 The joint pixel CNN is independently selectable:
 

@@ -2627,6 +2627,13 @@ class CenterBridgeBlockInteraction(nn.Module):
             dim=1,
         )
 
+    @staticmethod
+    def _row_normalize(matrix):
+        return matrix / matrix.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-6)
+
     def _attention(self, query, key, bias):
         logits = query @ key.transpose(0, 1) * self.scale + bias
         return self._topk_softmax(logits, self.topk)
@@ -2683,8 +2690,12 @@ class CenterBridgeBlockInteraction(nn.Module):
             self.bias_cc,
         )
 
-        zero_h = torch.zeros_like(h_value)
-        zero_l = torch.zeros_like(l_value)
+        attention_hl_via_c = self._row_normalize(
+            attention_hc @ attention_cl
+        )
+        attention_lh_via_c = self._row_normalize(
+            attention_lc @ attention_ch
+        )
         bridge_views = torch.stack(
             [
                 attention_ch @ h_value,
@@ -2706,13 +2717,13 @@ class CenterBridgeBlockInteraction(nn.Module):
             [
                 h_value,
                 attention_hc @ updated_bridge_value,
-                zero_h,
+                attention_hl_via_c @ l_value,
             ],
             dim=1,
         )
         lidar_views = torch.stack(
             [
-                zero_l,
+                attention_lh_via_c @ h_value,
                 attention_lc @ updated_bridge_value,
                 l_value,
             ],
@@ -2752,6 +2763,18 @@ class CenterBridgeBlockInteraction(nn.Module):
             ),
             "attention_cc_entropy": float(
                 self._row_entropy(attention_cc).detach().mean().item()
+            ),
+            "attention_hl_via_c_entropy": float(
+                self._row_entropy(attention_hl_via_c)
+                .detach()
+                .mean()
+                .item()
+            ),
+            "attention_lh_via_c_entropy": float(
+                self._row_entropy(attention_lh_via_c)
+                .detach()
+                .mean()
+                .item()
             ),
             "hsi_view_weight_mean": (
                 hsi_view_weights.detach().mean(dim=0).cpu().tolist()
@@ -5253,12 +5276,14 @@ def train_one_run(
                     f"{bridge_record['h_gamma']:.5f}/"
                     f"{bridge_record['c_gamma']:.5f}/"
                     f"{bridge_record['l_gamma']:.5f} | "
-                    "entropy HC/CH/LC/CL/CC="
+                    "entropy HC/CH/LC/CL/CC/HLc/LHc="
                     f"{bridge_record['attention_hc_entropy']:.4f}/"
                     f"{bridge_record['attention_ch_entropy']:.4f}/"
                     f"{bridge_record['attention_lc_entropy']:.4f}/"
                     f"{bridge_record['attention_cl_entropy']:.4f}/"
-                    f"{bridge_record['attention_cc_entropy']:.4f} | "
+                    f"{bridge_record['attention_cc_entropy']:.4f}/"
+                    f"{bridge_record['attention_hl_via_c_entropy']:.4f}/"
+                    f"{bridge_record['attention_lh_via_c_entropy']:.4f} | "
                     "view H/C/L="
                     f"{hsi_weights.round(3).tolist()}/"
                     f"{bridge_weights.round(3).tolist()}/"
