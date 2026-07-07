@@ -109,47 +109,61 @@ Each logging record stores both per-anchor modality weights, per-anchor
 weight entropy, detached reconstruction errors, both gamma values, and the
 full area mass of every anchor plus empty-anchor counts.
 
-The unified-anchor-graph extension remains in the same post-GAT2 location and
-is also disabled unless requested. It keeps the existing shared assignment,
-then optionally maps HSI/LiDAR anchors into a shared structure space, builds
-per-modality anchor graphs, fuses them into one unified anchor graph, performs
-one lightweight GCN step on the anchor consensus, and writes the correction
-back to the original HSI/LiDAR superpixel nodes. This is a forward mechanism,
-not an extra loss, and it still projects graph nodes to pixels only once.
+The SACR extension remains in the same post-GAT2 location and is also
+disabled unless requested. It keeps A3 as the main consensus:
+
+```text
+C0 = r_H * U_H + r_L * U_L
+```
+
+Then it builds an HSI anchor graph and a LiDAR anchor graph from the two
+modality-specific anchor features and only adds a small structure-aligned
+residual:
+
+```text
+C = C0 + eta * structure_gate *
+    (r_H * (G_H U_H - U_H) + r_L * (G_L U_L - U_L))
+```
+
+`eta` is learnable and initializes to zero by default, so the initial forward
+pass exactly recovers A3. This first version deliberately does not add a
+learned anchor graph, an extra GCN block, LayerNorm/GELU, selective write-back
+gate, TV loss, or orthogonal projection loss. It is meant to answer one
+question cleanly: does cross-modal anchor-graph structure alignment improve
+A3?
 
 The intended follow-up ablations are:
 
 ```bash
-# B1: adaptive+difference plus unified anchor GCN using learned anchor graph
+# E0: A3 main baseline
 --post-gat-consensus mssagf-anchor \
 --consensus-fusion adaptive \
---consensus-writeback difference \
---consensus-anchor-reasoning unified-gcn \
---consensus-structure-fusion none
+--consensus-writeback difference
 
-# B2: B1 plus HSI/LiDAR anchor graph structure fusion
+# E1: A3 + SACR, eta initialized to zero, no adaptive structure reliability
 --post-gat-consensus mssagf-anchor \
 --consensus-fusion adaptive \
 --consensus-writeback difference \
---consensus-anchor-reasoning unified-gcn \
---consensus-structure-fusion modality-graphs \
---consensus-anchor-graph-topk 8 \
---consensus-learned-graph-weight 1.0
+--consensus-anchor-reasoning sacr \
+--consensus-structure-eta-init 0 \
+--consensus-structure-reliability none
 
-# B3: B2 plus node-level selective difference write-back
+# E2: E1 + adaptive structure reliability from the HSI/LiDAR graph gap
 --post-gat-consensus mssagf-anchor \
 --consensus-fusion adaptive \
 --consensus-writeback difference \
---consensus-anchor-reasoning unified-gcn \
---consensus-structure-fusion modality-graphs \
---consensus-selective-writeback gate \
+--consensus-anchor-reasoning sacr \
+--consensus-structure-eta-init 0 \
+--consensus-structure-reliability adaptive \
+--consensus-structure-temperature 0.1 \
 --consensus-anchor-graph-topk 8 \
---consensus-learned-graph-weight 1.0
+
+# E3: weak orthogonal projection loss is intentionally not implemented yet
 ```
 
-When anchor reasoning is enabled, logs additionally include unified anchor
-graph entropy, diagonal mass, and HSI/LiDAR anchor-graph gap. With selective
-write-back, logs also include HSI/LiDAR gate mean/std and message norms.
+When SACR is enabled, logs additionally include eta, HSI/LiDAR anchor-graph
+entropy, graph gap, structure gate min/mean/max, structure residual norm, and
+HSI/LiDAR message norms.
 
 This first ablation has no node gate, extra contrastive loss, or dense
 HSI-by-LiDAR attention. To preserve exactly one cross-modal interaction and
@@ -158,7 +172,10 @@ none`, `contrastive-mode none`, `cell-interaction none`, and
 `post-gat-prototype-fusion none`. The implementation adapts the multiview
 anchor-consensus principle of
 [MSSAGF](https://github.com/W-Xinxin/MSSAGF); the reference repository itself
-is a MATLAB clustering method rather than a neural fusion layer.
+is a MATLAB clustering method rather than a neural fusion layer. The SACR
+residual borrows the anchor-graph structure-alignment idea from
+[OSMAGC](https://github.com/ZhangYongshan/OSMAGC) without importing its
+orthogonal loss in this first pass.
 
 The joint pixel CNN is independently selectable:
 
