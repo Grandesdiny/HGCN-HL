@@ -219,6 +219,46 @@ This branch is mutually exclusive with consensus anchors, SPSN-style prototype
 fusion, contrastive loss, cell interaction, and earlier cross-modal graph
 interaction to keep the attribution clean.
 
+A mediator consensus graph can instead be enabled as a third post-GAT2 graph
+branch:
+
+```bash
+--post-gat-consensus-graph center-mediator \
+--consensus-graph-weight 0.333 \
+--bridge-anchor-count 0 \
+--bridge-attention-dk 32 \
+--bridge-attention-topk 8 \
+--bridge-overlap-metric coverage \
+--bridge-overlap-weight 1.0 \
+--bridge-spatial-weight 1.0 \
+--bridge-height-weight 1.0 \
+--bridge-gamma-init 0
+```
+
+It is disabled by default with `--post-gat-consensus-graph none`. This branch
+reuses the same public center bridge assignment and fixed H/C/L priors as
+`center-block`, but it does not write any mediator message back to HSI or
+LiDAR superpixel nodes. The HSI and LiDAR private GAT2 nodes are projected to
+pixels unchanged. In parallel, the public center anchors aggregate evidence
+from HSI and LiDAR, reason only inside the mediator graph, and are projected
+directly to pixels as `consensus_graph_features`.
+
+The resulting graph fusion is:
+
+```text
+F_graph =
+  (1 - w_c) * lambda * F_HSI
++ (1 - w_c) * (1 - lambda) * F_LiDAR
++ w_c * F_consensus
+```
+
+where `w_c` is `--consensus-graph-weight` and `lambda` is
+`--graph-modality-lambda`. With `--consensus-graph-weight 0`, the model
+degenerates to the original two-private-graph fusion. The first ablation keeps
+this branch mutually exclusive with `--post-gat-bridge`, MSSAGF-style anchor
+write-back, SPSN prototype fusion, contrastive losses, cell interaction, and
+earlier cross-modal graph interaction.
+
 The joint pixel CNN is independently selectable:
 
 ```bash
