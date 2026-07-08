@@ -370,6 +370,42 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--consensus-graph-fusion",
+        choices=("fixed", "c-guided-gate"),
+        default="c-guided-gate",
+        help=(
+            "Fuse HSI/LiDAR/mediator graph pixels with fixed weights "
+            "or a C-guided pixel-wise tri-graph gate. Default: "
+            "c-guided-gate."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-graph-spatial-prior-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Alpha_s for the mediator C-QK spatial prior. Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-graph-hsi-prior-weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Alpha_h for the HSI private-graph prior projected into "
+            "mediator C space. Default: 0.5."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-graph-lidar-prior-weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Alpha_l for the LiDAR private-graph prior projected into "
+            "mediator C space. Default: 0.5."
+        ),
+    )
+    parser.add_argument(
         "--bridge-anchor-count",
         type=int,
         default=0,
@@ -754,6 +790,10 @@ def consensus_graph_configuration_tag(args, class_count):
         f"top{args.bridge_attention_topk}-"
         f"ov{args.bridge_overlap_metric}-"
         f"w{args.consensus_graph_weight:g}-"
+        f"f{args.consensus_graph_fusion}-"
+        f"a{args.consensus_graph_spatial_prior_weight:g}-"
+        f"{args.consensus_graph_hsi_prior_weight:g}-"
+        f"{args.consensus_graph_lidar_prior_weight:g}-"
         f"bias{args.bridge_overlap_weight:g}-"
         f"{args.bridge_spatial_weight:g}-"
         f"{args.bridge_height_weight:g}-"
@@ -2848,10 +2888,10 @@ class PostGATMediatedConsensusGraph(nn.Module):
     """Independent mediator graph branch over public center anchors.
 
     The module consumes post-GAT2 HSI/LiDAR private graph nodes, builds
-    public center anchors from both modalities, reasons only on those
-    mediator anchors, and projects the updated mediator graph directly
-    back to pixels. It intentionally does not write messages back to the
-    HSI or LiDAR superpixel nodes.
+    public center anchors from both modalities, builds a C-C dynamic graph
+    with C's own Q/K and HSI/LiDAR projected topology priors, then projects
+    the updated mediator graph directly back to pixels. It intentionally
+    does not write messages back to HSI or LiDAR superpixel nodes.
     """
 
     def __init__(
@@ -2861,11 +2901,17 @@ class PostGATMediatedConsensusGraph(nn.Module):
         attention_d_k=32,
         topk=8,
         gamma_init=0.0,
+        spatial_prior_weight=1.0,
+        hsi_prior_weight=0.5,
+        lidar_prior_weight=0.5,
     ):
         super().__init__()
         self.channels = channels
         self.attention_d_k = attention_d_k
         self.topk = topk
+        self.spatial_prior_weight = spatial_prior_weight
+        self.hsi_prior_weight = hsi_prior_weight
+        self.lidar_prior_weight = lidar_prior_weight
         anchor_count = int(bridge_data["anchor_count"])
         self.bridge_embedding = nn.Parameter(
             torch.empty(anchor_count, channels)
@@ -2873,16 +2919,13 @@ class PostGATMediatedConsensusGraph(nn.Module):
         nn.init.xavier_uniform_(self.bridge_embedding)
         self.bridge_norm = nn.LayerNorm(channels)
 
-        self.h_key = nn.Linear(channels, attention_d_k, bias=False)
         self.h_value = nn.Linear(channels, channels, bias=False)
         self.c_query = nn.Linear(channels, attention_d_k, bias=False)
         self.c_key = nn.Linear(channels, attention_d_k, bias=False)
         self.c_value = nn.Linear(channels, channels, bias=False)
-        self.l_key = nn.Linear(channels, attention_d_k, bias=False)
         self.l_value = nn.Linear(channels, channels, bias=False)
         self.scale = attention_d_k ** -0.5
 
-        self.c_view_score = nn.Linear(channels, 1)
         self.c_ffn = nn.Linear(channels, channels)
         self.c_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
         self.graph_projection = nn.Sequential(
@@ -2892,10 +2935,10 @@ class PostGATMediatedConsensusGraph(nn.Module):
         )
 
         for name in (
+            "prior_hc",
             "prior_ch",
+            "prior_lc",
             "prior_cl",
-            "bias_ch",
-            "bias_cl",
             "bias_cc",
         ):
             self.register_buffer(
@@ -2939,21 +2982,27 @@ class PostGATMediatedConsensusGraph(nn.Module):
             dim=1,
         )
 
-    def _attention(self, query, key, bias):
-        logits = query @ key.transpose(0, 1) * self.scale + bias
-        return self._topk_softmax(logits, self.topk)
-
     @staticmethod
-    def _fuse_views(views, scorer):
-        scores = scorer(views).squeeze(-1)
-        weights = F.softmax(scores, dim=1)
-        fused = torch.sum(weights.unsqueeze(-1) * views, dim=1)
-        return fused, weights
+    def _row_normalize(matrix):
+        return matrix / matrix.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-6)
 
-    def forward(self, hsi_nodes, lidar_nodes):
-        h_key = self.h_key(hsi_nodes)
+    def _project_private_graph_prior(self, left, adjacency, right):
+        projected = left @ adjacency.detach() @ right
+        projected = projected.clamp_min(0.0)
+        return self._row_normalize(projected)
+
+    def _spatial_prior(self):
+        shifted = self.bias_cc - self.bias_cc.max(
+            dim=1,
+            keepdim=True,
+        ).values
+        return self._row_normalize(torch.exp(shifted))
+
+    def forward(self, hsi_nodes, lidar_nodes, hsi_adjacency, lidar_adjacency):
         h_value = self.h_value(hsi_nodes)
-        l_key = self.l_key(lidar_nodes)
         l_value = self.l_value(lidar_nodes)
 
         bridge_nodes = self.bridge_norm(
@@ -2965,33 +3014,29 @@ class PostGATMediatedConsensusGraph(nn.Module):
         c_key = self.c_key(bridge_nodes)
         c_value = self.c_value(bridge_nodes)
 
-        attention_ch = self._attention(
-            c_query,
-            h_key,
-            self.bias_ch,
+        spatial_prior = self._spatial_prior()
+        hsi_prior = self._project_private_graph_prior(
+            self.prior_ch,
+            hsi_adjacency,
+            self.prior_hc,
         )
-        attention_cc = self._attention(
-            c_query,
-            c_key,
-            self.bias_cc,
+        lidar_prior = self._project_private_graph_prior(
+            self.prior_cl,
+            lidar_adjacency,
+            self.prior_lc,
         )
-        attention_cl = self._attention(
-            c_query,
-            l_key,
-            self.bias_cl,
+        logits = c_query @ c_key.transpose(0, 1) * self.scale
+        logits = (
+            logits
+            + self.spatial_prior_weight
+            * torch.log(spatial_prior.clamp_min(1e-6))
+            + self.hsi_prior_weight
+            * torch.log(hsi_prior.clamp_min(1e-6))
+            + self.lidar_prior_weight
+            * torch.log(lidar_prior.clamp_min(1e-6))
         )
-        bridge_views = torch.stack(
-            [
-                attention_ch @ h_value,
-                attention_cc @ c_value,
-                attention_cl @ l_value,
-            ],
-            dim=1,
-        )
-        bridge_message, bridge_view_weights = self._fuse_views(
-            bridge_views,
-            self.c_view_score,
-        )
+        attention_cc = self._topk_softmax(logits, self.topk)
+        bridge_message = attention_cc @ c_value
         updated_bridge = (
             bridge_nodes + self.c_gamma * self.c_ffn(bridge_message)
         )
@@ -3005,17 +3050,24 @@ class PostGATMediatedConsensusGraph(nn.Module):
         self.last_diagnostics = {
             "c_gamma": float(self.c_gamma.detach().item()),
             "bridge_count": int(bridge_nodes.shape[0]),
-            "attention_ch_entropy": float(
-                self._row_entropy(attention_ch).detach().mean().item()
-            ),
             "attention_cc_entropy": float(
                 self._row_entropy(attention_cc).detach().mean().item()
             ),
-            "attention_cl_entropy": float(
-                self._row_entropy(attention_cl).detach().mean().item()
+            "spatial_prior_entropy": float(
+                self._row_entropy(spatial_prior).detach().mean().item()
             ),
-            "bridge_view_weight_mean": (
-                bridge_view_weights.detach().mean(dim=0).cpu().tolist()
+            "hsi_projected_prior_entropy": float(
+                self._row_entropy(hsi_prior).detach().mean().item()
+            ),
+            "lidar_projected_prior_entropy": float(
+                self._row_entropy(lidar_prior).detach().mean().item()
+            ),
+            "qk_logit_mean": float(logits.detach().mean().item()),
+            "qk_logit_std": float(logits.detach().std().item()),
+            "prior_weights": (
+                float(self.spatial_prior_weight),
+                float(self.hsi_prior_weight),
+                float(self.lidar_prior_weight),
             ),
             "bridge_message_norm": float(
                 bridge_message.detach().norm(dim=1).mean().item()
@@ -4017,6 +4069,7 @@ class ModalityGSDGGraphEncoder(nn.Module):
             nn.BatchNorm1d(hidden_dim),
             nn.LeakyReLU(),
         )
+        self.last_gat2_adjacency = None
 
     def encode_nodes(self, modality_input):
         height, width, _ = modality_input.shape
@@ -4091,6 +4144,7 @@ class ModalityGSDGGraphEncoder(nn.Module):
             )
         if adjacency is None:
             raise ValueError("GAT2 requires an adjacency matrix.")
+        self.last_gat2_adjacency = adjacency
         intra_features = self.gat2(first_graph_features, adjacency)
         if return_intra:
             return intra_features
@@ -4160,6 +4214,10 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         post_gat_bridge="none",
         post_gat_consensus_graph="none",
         consensus_graph_weight=0.333,
+        consensus_graph_fusion="c-guided-gate",
+        consensus_graph_spatial_prior_weight=1.0,
+        consensus_graph_hsi_prior_weight=0.5,
+        consensus_graph_lidar_prior_weight=0.5,
         bridge_data=None,
         bridge_attention_d_k=32,
         bridge_attention_topk=8,
@@ -4199,6 +4257,8 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.post_gat_consensus = post_gat_consensus
         self.post_gat_consensus_graph = post_gat_consensus_graph
         self.consensus_graph_weight = consensus_graph_weight
+        self.consensus_graph_fusion = consensus_graph_fusion
+        self.last_consensus_graph_gate_diagnostics = None
         self.cell_interaction = cell_interaction
         self.cell_interaction_stages = cell_interaction_stages
         self.cell_output_branch = cell_output_branch
@@ -4604,10 +4664,29 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     attention_d_k=bridge_attention_d_k,
                     topk=bridge_attention_topk,
                     gamma_init=bridge_gamma_init,
+                    spatial_prior_weight=(
+                        consensus_graph_spatial_prior_weight
+                    ),
+                    hsi_prior_weight=consensus_graph_hsi_prior_weight,
+                    lidar_prior_weight=(
+                        consensus_graph_lidar_prior_weight
+                    ),
                 )
             )
+            if consensus_graph_fusion == "c-guided-gate":
+                gate_output = nn.Linear(hidden_dim, 3)
+                nn.init.zeros_(gate_output.weight)
+                nn.init.zeros_(gate_output.bias)
+                self.consensus_graph_gate = nn.Sequential(
+                    nn.Linear(hidden_dim * 6, hidden_dim),
+                    nn.LeakyReLU(),
+                    gate_output,
+                )
+            else:
+                self.consensus_graph_gate = None
         else:
             self.consensus_graph_branch = None
+            self.consensus_graph_gate = None
 
     def set_contrastive_epoch(self, epoch):
         if (
@@ -4674,6 +4753,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
     def forward(self, hsi, lidar, joint_input):
         self.last_contrastive_loss = None
         self.last_variance_loss = None
+        self.last_consensus_graph_gate_diagnostics = None
         if self.cell_layer is not None:
             hsi_nodes = self.hsi_graph.encode_nodes(hsi)
             lidar_nodes = self.lidar_graph.encode_nodes(lidar)
@@ -4958,21 +5038,83 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             )
 
         if self.consensus_graph_branch is not None:
+            hsi_adjacency = self.hsi_graph.last_gat2_adjacency
+            lidar_adjacency = self.lidar_graph.last_gat2_adjacency
+            if hsi_adjacency is None or lidar_adjacency is None:
+                raise RuntimeError(
+                    "Mediator consensus graph requires both private "
+                    "GAT2 adjacencies."
+                )
             consensus_graph_features = self.consensus_graph_branch(
                 hsi_final_nodes,
                 lidar_final_nodes,
+                hsi_adjacency,
+                lidar_adjacency,
             )
-            consensus_weight = self.consensus_graph_weight
-            private_weight = 1.0 - consensus_weight
-            graph_features = (
-                private_weight
-                * self.graph_modality_lambda
-                * hsi_graph_features
-                + private_weight
-                * (1.0 - self.graph_modality_lambda)
-                * lidar_graph_features
-                + consensus_weight * consensus_graph_features
-            )
+            if self.consensus_graph_fusion == "c-guided-gate":
+                gate_input = torch.cat(
+                    [
+                        hsi_graph_features,
+                        lidar_graph_features,
+                        consensus_graph_features,
+                        torch.abs(
+                            hsi_graph_features
+                            - consensus_graph_features
+                        ),
+                        torch.abs(
+                            lidar_graph_features
+                            - consensus_graph_features
+                        ),
+                        torch.abs(
+                            hsi_graph_features
+                            - lidar_graph_features
+                        ),
+                    ],
+                    dim=1,
+                )
+                gate = F.softmax(
+                    self.consensus_graph_gate(gate_input),
+                    dim=1,
+                )
+                graph_features = (
+                    gate[:, 0:1] * hsi_graph_features
+                    + gate[:, 1:2] * lidar_graph_features
+                    + gate[:, 2:3] * consensus_graph_features
+                )
+                gate_entropy = -torch.sum(
+                    gate * torch.log(gate.clamp_min(1e-12)),
+                    dim=1,
+                )
+                self.last_consensus_graph_gate_diagnostics = {
+                    "fusion_mode": self.consensus_graph_fusion,
+                    "gate_mean": gate.detach().mean(dim=0).cpu().tolist(),
+                    "gate_entropy": float(
+                        gate_entropy.detach().mean().item()
+                    ),
+                    "gate_min": gate.detach().min(dim=0).values.cpu().tolist(),
+                    "gate_max": gate.detach().max(dim=0).values.cpu().tolist(),
+                }
+            else:
+                consensus_weight = self.consensus_graph_weight
+                private_weight = 1.0 - consensus_weight
+                graph_features = (
+                    private_weight
+                    * self.graph_modality_lambda
+                    * hsi_graph_features
+                    + private_weight
+                    * (1.0 - self.graph_modality_lambda)
+                    * lidar_graph_features
+                    + consensus_weight * consensus_graph_features
+                )
+                self.last_consensus_graph_gate_diagnostics = {
+                    "fusion_mode": self.consensus_graph_fusion,
+                    "fixed_weights": [
+                        private_weight * self.graph_modality_lambda,
+                        private_weight
+                        * (1.0 - self.graph_modality_lambda),
+                        consensus_weight,
+                    ],
+                }
         elif self.prototype_correlation_fusion is None:
             graph_features = (
                 self.graph_modality_lambda * hsi_graph_features
@@ -5288,6 +5430,16 @@ def train_one_run(
                 args.post_gat_consensus_graph
             ),
             consensus_graph_weight=args.consensus_graph_weight,
+            consensus_graph_fusion=args.consensus_graph_fusion,
+            consensus_graph_spatial_prior_weight=(
+                args.consensus_graph_spatial_prior_weight
+            ),
+            consensus_graph_hsi_prior_weight=(
+                args.consensus_graph_hsi_prior_weight
+            ),
+            consensus_graph_lidar_prior_weight=(
+                args.consensus_graph_lidar_prior_weight
+            ),
             bridge_attention_d_k=args.bridge_attention_dk,
             bridge_attention_topk=args.bridge_attention_topk,
             bridge_gamma_init=args.bridge_gamma_init,
@@ -5460,6 +5612,16 @@ def train_one_run(
                     consensus_graph_module.diagnostics()
                 )
                 if consensus_graph_record is not None:
+                    gate_record = getattr(
+                        model,
+                        "last_consensus_graph_gate_diagnostics",
+                        None,
+                    )
+                    if gate_record is not None:
+                        consensus_graph_record = {
+                            **consensus_graph_record,
+                            **gate_record,
+                        }
                     consensus_graph_record = {
                         "epoch": epoch,
                         **consensus_graph_record,
@@ -5594,23 +5756,46 @@ def train_one_run(
                     f"{lidar_weights.round(3).tolist()}"
                 )
             if consensus_graph_record is not None:
-                bridge_weights = np.asarray(
-                    consensus_graph_record["bridge_view_weight_mean"]
+                prior_weights = np.asarray(
+                    consensus_graph_record["prior_weights"]
                 )
                 print(
                     "  mediator consensus graph | gamma C="
                     f"{consensus_graph_record['c_gamma']:.5f} | "
-                    "entropy CH/CC/CL="
-                    f"{consensus_graph_record['attention_ch_entropy']:.4f}/"
-                    f"{consensus_graph_record['attention_cc_entropy']:.4f}/"
-                    f"{consensus_graph_record['attention_cl_entropy']:.4f} | "
-                    "view C="
-                    f"{bridge_weights.round(3).tolist()} | "
+                    "C-QK entropy="
+                    f"{consensus_graph_record['attention_cc_entropy']:.4f} | "
+                    "prior entropy S/H/L="
+                    f"{consensus_graph_record['spatial_prior_entropy']:.4f}/"
+                    f"{consensus_graph_record['hsi_projected_prior_entropy']:.4f}/"
+                    f"{consensus_graph_record['lidar_projected_prior_entropy']:.4f} | "
+                    "alpha S/H/L="
+                    f"{prior_weights.round(3).tolist()} | "
                     "message-norm="
                     f"{consensus_graph_record['bridge_message_norm']:.4f} | "
                     "pixel-norm="
                     f"{consensus_graph_record['consensus_pixel_norm']:.4f}"
                 )
+                if (
+                    consensus_graph_record.get("fusion_mode")
+                    == "c-guided-gate"
+                ):
+                    gate_mean = np.asarray(
+                        consensus_graph_record["gate_mean"]
+                    )
+                    print(
+                        "  C-guided tri-graph gate | mean H/L/C="
+                        f"{gate_mean.round(3).tolist()} | "
+                        "entropy="
+                        f"{consensus_graph_record['gate_entropy']:.4f}"
+                    )
+                elif "fixed_weights" in consensus_graph_record:
+                    fixed_weights = np.asarray(
+                        consensus_graph_record["fixed_weights"]
+                    )
+                    print(
+                        "  fixed tri-graph fusion | weights H/L/C="
+                        f"{fixed_weights.round(3).tolist()}"
+                    )
 
     training_time = time.perf_counter() - start_time
     model.load_state_dict(best_state)
@@ -5904,6 +6089,17 @@ def validate_args(args):
     if not 0.0 <= args.consensus_graph_weight <= 1.0:
         raise ValueError(
             "--consensus-graph-weight must be between 0 and 1."
+        )
+    if any(
+        weight < 0
+        for weight in (
+            args.consensus_graph_spatial_prior_weight,
+            args.consensus_graph_hsi_prior_weight,
+            args.consensus_graph_lidar_prior_weight,
+        )
+    ):
+        raise ValueError(
+            "Consensus graph prior weights must be nonnegative."
         )
     if args.post_gat_consensus_graph != "none":
         if args.cross_modal_interaction != "none":
@@ -6247,22 +6443,33 @@ def main():
                 else 2 * class_count
             )
             private_weight = 1.0 - args.consensus_graph_weight
+            fusion_detail = (
+                "C-guided pixel tri-graph gate"
+                if args.consensus_graph_fusion == "c-guided-gate"
+                else (
+                    "fixed weights H/L/C="
+                    f"{private_weight * args.graph_modality_lambda:g}/"
+                    f"{private_weight * (1.0 - args.graph_modality_lambda):g}/"
+                    f"{args.consensus_graph_weight:g}"
+                )
+            )
             print(
                 "Mediator graph path: HSI/LiDAR private GAT2 nodes "
                 f"stay unchanged -> {resolved_bridge_count} public "
-                "center anchors -> C receives H/C/L block attention "
-                "-> consensus pixels as third graph branch; fusion "
-                "weights H/L/C="
-                f"{private_weight * args.graph_modality_lambda:g}/"
-                f"{private_weight * (1.0 - args.graph_modality_lambda):g}/"
-                f"{args.consensus_graph_weight:g}; d_k="
+                "center anchors -> C-QK dynamic C-C graph with "
+                "projected HSI/LiDAR topology priors -> consensus "
+                "pixels as third graph branch; fusion="
+                f"{fusion_detail}; d_k="
                 f"{args.bridge_attention_dk}, top-k="
                 f"{args.bridge_attention_topk}, overlap="
-                f"{args.bridge_overlap_metric}, bias weights "
+                f"{args.bridge_overlap_metric}, bridge bias weights "
                 "overlap/spatial/height="
                 f"{args.bridge_overlap_weight:g}/"
                 f"{args.bridge_spatial_weight:g}/"
-                f"{args.bridge_height_weight:g}, gamma-init="
+                f"{args.bridge_height_weight:g}, C prior alpha S/H/L="
+                f"{args.consensus_graph_spatial_prior_weight:g}/"
+                f"{args.consensus_graph_hsi_prior_weight:g}/"
+                f"{args.consensus_graph_lidar_prior_weight:g}, gamma-init="
                 f"{args.bridge_gamma_init:g}"
             )
         print(f"Intersection-cell interaction: {args.cell_interaction}")

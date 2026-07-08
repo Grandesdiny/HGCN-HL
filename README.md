@@ -225,6 +225,10 @@ branch:
 ```bash
 --post-gat-consensus-graph center-mediator \
 --consensus-graph-weight 0.333 \
+--consensus-graph-fusion c-guided-gate \
+--consensus-graph-spatial-prior-weight 1.0 \
+--consensus-graph-hsi-prior-weight 0.5 \
+--consensus-graph-lidar-prior-weight 0.5 \
 --bridge-anchor-count 0 \
 --bridge-attention-dk 32 \
 --bridge-attention-topk 8 \
@@ -239,11 +243,47 @@ It is disabled by default with `--post-gat-consensus-graph none`. This branch
 reuses the same public center bridge assignment and fixed H/C/L priors as
 `center-block`, but it does not write any mediator message back to HSI or
 LiDAR superpixel nodes. The HSI and LiDAR private GAT2 nodes are projected to
-pixels unchanged. In parallel, the public center anchors aggregate evidence
-from HSI and LiDAR, reason only inside the mediator graph, and are projected
-directly to pixels as `consensus_graph_features`.
+pixels unchanged. In parallel, the public center anchors aggregate HSI/LiDAR
+node features:
 
-The resulting graph fusion is:
+```text
+C = LN(0.5 * B_CH V_H(H) + 0.5 * B_CL V_L(L) + E_C)
+```
+
+The mediator graph is then constructed by C's own Q/K, not by HSI-to-LiDAR
+bipartite attention. The HSI/LiDAR private GAT2 adjacencies only modulate the
+C-QK logits as projected structure priors:
+
+```text
+P_C^H = row_norm(B_CH A_H B_HC)
+P_C^L = row_norm(B_CL A_L B_LC)
+P_C^S = row_norm(exp(bias_CC))
+
+A_C = TopKSoftmax(
+    Q_C K_C^T / sqrt(d)
+  + alpha_s log(P_C^S + eps)
+  + alpha_h log(P_C^H + eps)
+  + alpha_l log(P_C^L + eps)
+)
+```
+
+The updated C nodes are projected directly to pixels as
+`consensus_graph_features`. By default, the final graph readout uses a
+C-guided tri-graph gate:
+
+```text
+gate = softmax(MLP([
+    F_H, F_L, F_C,
+    abs(F_H - F_C),
+    abs(F_L - F_C),
+    abs(F_H - F_L)
+]))
+
+F_graph = pi_H F_H + pi_L F_L + pi_C F_C
+```
+
+For a fixed-weight ablation, use `--consensus-graph-fusion fixed`; then the
+fusion becomes:
 
 ```text
 F_graph =
@@ -253,11 +293,10 @@ F_graph =
 ```
 
 where `w_c` is `--consensus-graph-weight` and `lambda` is
-`--graph-modality-lambda`. With `--consensus-graph-weight 0`, the model
-degenerates to the original two-private-graph fusion. The first ablation keeps
-this branch mutually exclusive with `--post-gat-bridge`, MSSAGF-style anchor
-write-back, SPSN prototype fusion, contrastive losses, cell interaction, and
-earlier cross-modal graph interaction.
+`--graph-modality-lambda`. The first ablation keeps this branch mutually
+exclusive with `--post-gat-bridge`, MSSAGF-style anchor write-back, SPSN
+prototype fusion, contrastive losses, cell interaction, and earlier
+cross-modal graph interaction.
 
 The joint pixel CNN is independently selectable:
 
