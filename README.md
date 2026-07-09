@@ -224,8 +224,9 @@ branch:
 
 ```bash
 --post-gat-consensus-graph center-mediator \
---consensus-graph-weight 0.333 \
---consensus-graph-fusion c-guided-gate \
+--consensus-graph-fusion residual-c \
+--consensus-graph-residual-init 0 \
+--consensus-graph-weight 0.1 \
 --consensus-graph-spatial-prior-weight 1.0 \
 --consensus-graph-hsi-prior-weight 0.5 \
 --consensus-graph-lidar-prior-weight 0.5 \
@@ -239,16 +240,32 @@ branch:
 --bridge-gamma-init 0
 ```
 
-It is disabled by default with `--post-gat-consensus-graph none`. This branch
-reuses the same public center bridge assignment and fixed H/C/L priors as
-`center-block`, but it does not write any mediator message back to HSI or
-LiDAR superpixel nodes. The HSI and LiDAR private GAT2 nodes are projected to
-pixels unchanged. In parallel, the public center anchors aggregate HSI/LiDAR
-node features:
+It is disabled by default with `--post-gat-consensus-graph none`. The mediator
+branch never writes messages back to HSI or LiDAR superpixel nodes. The HSI
+and LiDAR private GAT2 nodes are projected to pixels unchanged. In parallel,
+mediator C nodes aggregate HSI/LiDAR node features:
 
 ```text
-C = LN(0.5 * B_CH V_H(H) + 0.5 * B_CL V_L(L) + E_C)
+H_C = B_CH V_H(H)
+L_C = B_CL V_L(L)
+C0 = LN(phi([H_C, L_C, abs(H_C - L_C), H_C * L_C, attrs]) + E_C)
 ```
+
+For `intersection-mediator`, `attrs` are the cell attributes from
+`build_common_refinement_cells()`; for `center-mediator`, the same encoder is
+used without cell attributes.
+
+Two mediator node sets are available:
+
+```bash
+--post-gat-consensus-graph center-mediator        # deterministic public grid
+--post-gat-consensus-graph intersection-mediator  # HSI-SP ∩ LiDAR-SP cells
+```
+
+`center-mediator` uses the public center bridge assignment from the center-block
+ablation. `intersection-mediator` reuses `build_common_refinement_cells()`, so
+each C node is a nonempty HSI-superpixel/LiDAR-superpixel intersection cell and
+requires exactly one superpixel scale.
 
 The mediator graph is then constructed by C's own Q/K, not by HSI-to-LiDAR
 bipartite attention. The HSI/LiDAR private GAT2 adjacencies only modulate the
@@ -257,7 +274,7 @@ C-QK logits as projected structure priors:
 ```text
 P_C^H = row_norm(B_CH A_H B_HC)
 P_C^L = row_norm(B_CL A_L B_LC)
-P_C^S = row_norm(exp(bias_CC))
+P_C^S = center spatial prior or intersection-cell RAG prior
 
 A_C = TopKSoftmax(
     Q_C K_C^T / sqrt(d)
@@ -267,9 +284,33 @@ A_C = TopKSoftmax(
 )
 ```
 
-The updated C nodes are projected directly to pixels as
-`consensus_graph_features`. By default, the final graph readout uses a
-C-guided tri-graph gate:
+This adjacency is then used by an independent C-GNN branch:
+
+```text
+M_C = A_C V_C(C0)
+Z_C1 = LN(C0 + W_o M_C)
+Z_C2 = LN(Z_C1 + FFN(Z_C1))
+F_C = Q_C_pixel Z_C2
+```
+
+So C is not merely an attention prior: it is a third graph branch with its own
+message passing. `Z_C2` is projected directly to pixels as
+`consensus_graph_features`. By default, the final graph readout uses
+`residual-c`, which starts exactly from the private HSI/LiDAR baseline:
+
+```text
+F_base = lambda * F_HSI + (1 - lambda) * F_LiDAR
+F_graph = F_base + gamma_c * (F_consensus - F_base)
+```
+
+`gamma_c` is initialized by `--consensus-graph-residual-init` and defaults to
+zero. This makes the first forward pass exactly match the two-private-graph
+baseline, useful for testing whether accuracy drops are caused by over-strong
+C injection.
+
+For a gated ablation, use `--consensus-graph-fusion c-guided-gate`. Its final
+linear layer is zero-weight initialized and biased to the fixed prior
+`[lambda(1-w_c), (1-lambda)(1-w_c), w_c]`, not to uniform 1/3:
 
 ```text
 gate = softmax(MLP([
@@ -282,8 +323,7 @@ gate = softmax(MLP([
 F_graph = pi_H F_H + pi_L F_L + pi_C F_C
 ```
 
-For a fixed-weight ablation, use `--consensus-graph-fusion fixed`; then the
-fusion becomes:
+For a fixed-weight ablation, use `--consensus-graph-fusion fixed`:
 
 ```text
 F_graph =
@@ -293,10 +333,27 @@ F_graph =
 ```
 
 where `w_c` is `--consensus-graph-weight` and `lambda` is
-`--graph-modality-lambda`. The first ablation keeps this branch mutually
-exclusive with `--post-gat-bridge`, MSSAGF-style anchor write-back, SPSN
-prototype fusion, contrastive losses, cell interaction, and earlier
-cross-modal graph interaction.
+`--graph-modality-lambda`.
+
+For `intersection-mediator`, the C graph prior can be upgraded from binary
+cell RAG to a LiDAR-aware weighted RAG:
+
+```bash
+--post-gat-consensus-graph intersection-mediator \
+--consensus-graph-cell-edge spectral-height-boundary \
+--cell-sam-weight 1.0 \
+--cell-height-weight 1.0 \
+--cell-boundary-weight 1.0 \
+--cell-conflict-weight 0.0
+```
+
+This edge mode uses HSI spectral angle, LiDAR height difference, LiDAR boundary
+gradient, and optional HSI/LiDAR boundary conflict. It does not enable the
+original cell interaction branch; it only changes the mediator C-C prior. The
+first ablation keeps mediator consensus mutually exclusive with
+`--post-gat-bridge`, MSSAGF-style anchor write-back, SPSN prototype fusion,
+contrastive losses, cell interaction, and earlier cross-modal graph
+interaction.
 
 The joint pixel CNN is independently selectable:
 

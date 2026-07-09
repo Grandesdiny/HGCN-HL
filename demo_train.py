@@ -349,34 +349,56 @@ def parse_args():
     )
     parser.add_argument(
         "--post-gat-consensus-graph",
-        choices=("none", "center-mediator"),
+        choices=("none", "center-mediator", "intersection-mediator"),
         default="none",
         help=(
             "Optional post-GAT2 mediator consensus graph as an "
-            "independent third pixel branch. It reuses public center "
-            "bridge anchors but does not write messages back to HSI or "
-            "LiDAR private graph nodes. Default: none."
+            "independent third pixel branch. 'center-mediator' uses "
+            "public grid anchors; 'intersection-mediator' uses "
+            "HSI-superpixel ∩ LiDAR-superpixel cells. Default: none."
         ),
     )
     parser.add_argument(
         "--consensus-graph-weight",
         type=float,
-        default=0.333,
+        default=0.1,
         help=(
             "Pixel-fusion weight of the mediator consensus graph "
             "branch. The remaining weight is split between HSI and "
             "LiDAR according to --graph-modality-lambda. Default: "
-            "0.333."
+            "0.1."
         ),
     )
     parser.add_argument(
         "--consensus-graph-fusion",
-        choices=("fixed", "c-guided-gate"),
-        default="c-guided-gate",
+        choices=("fixed", "c-guided-gate", "residual-c"),
+        default="residual-c",
         help=(
             "Fuse HSI/LiDAR/mediator graph pixels with fixed weights "
-            "or a C-guided pixel-wise tri-graph gate. Default: "
-            "c-guided-gate."
+            "or a C-guided pixel-wise tri-graph gate. 'residual-c' "
+            "starts exactly from the private HSI/LiDAR baseline. "
+            "Default: residual-c."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-graph-residual-init",
+        type=float,
+        default=0.0,
+        help=(
+            "Initial residual scale for residual-c fusion. Zero makes "
+            "the initial forward pass exactly match private HSI/LiDAR "
+            "graph fusion. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-graph-cell-edge",
+        choices=("binary", "spectral-height-boundary"),
+        default="binary",
+        help=(
+            "Cell RAG prior used by intersection-mediator. "
+            "'spectral-height-boundary' uses HSI SAM, LiDAR height "
+            "difference, LiDAR boundary gradient, and HSI/LiDAR "
+            "boundary conflict. Default: binary."
         ),
     )
     parser.add_argument(
@@ -779,18 +801,23 @@ def bridge_configuration_tag(args, class_count):
 def consensus_graph_configuration_tag(args, class_count):
     if args.post_gat_consensus_graph == "none":
         return "cg-none"
-    anchor_count = (
-        args.bridge_anchor_count
-        if args.bridge_anchor_count > 0
-        else 2 * class_count
-    )
+    if args.post_gat_consensus_graph == "center-mediator":
+        anchor_tag = (
+            args.bridge_anchor_count
+            if args.bridge_anchor_count > 0
+            else 2 * class_count
+        )
+    else:
+        anchor_tag = "cells"
     return (
-        f"cg-center-mediator-k{anchor_count}-"
+        f"cg-{args.post_gat_consensus_graph}-k{anchor_tag}-"
         f"dk{args.bridge_attention_dk}-"
         f"top{args.bridge_attention_topk}-"
         f"ov{args.bridge_overlap_metric}-"
         f"w{args.consensus_graph_weight:g}-"
         f"f{args.consensus_graph_fusion}-"
+        f"rg{args.consensus_graph_residual_init:g}-"
+        f"edge{args.consensus_graph_cell_edge}-"
         f"a{args.consensus_graph_spatial_prior_weight:g}-"
         f"{args.consensus_graph_hsi_prior_weight:g}-"
         f"{args.consensus_graph_lidar_prior_weight:g}-"
@@ -1461,6 +1488,121 @@ def build_center_bridge_data(
         "bias_cc": bias_cc.astype(np.float32),
         "anchor_count": int(anchor_count),
         "area": bridge_area.astype(np.float32),
+    }
+
+
+def build_intersection_mediator_data(
+    cell_data,
+    hsi_node_count,
+    lidar_node_count,
+    edge_mode="binary",
+):
+    """Build mediator matrices from HSI/LiDAR common-refinement cells."""
+    cell_count = int(cell_data["cell_count"])
+    cell_indices = np.arange(cell_count, dtype=np.int64)
+    hsi_parent = np.asarray(
+        cell_data["hsi_parent"],
+        dtype=np.int64,
+    )
+    lidar_parent = np.asarray(
+        cell_data["lidar_parent"],
+        dtype=np.int64,
+    )
+    hsi_coverage = np.asarray(
+        cell_data["hsi_coverage"],
+        dtype=np.float32,
+    )
+    lidar_coverage = np.asarray(
+        cell_data["lidar_coverage"],
+        dtype=np.float32,
+    )
+
+    prior_ch = coo_matrix(
+        (
+            np.ones(cell_count, dtype=np.float32),
+            (cell_indices, hsi_parent),
+        ),
+        shape=(cell_count, hsi_node_count),
+        dtype=np.float32,
+    ).toarray()
+    prior_cl = coo_matrix(
+        (
+            np.ones(cell_count, dtype=np.float32),
+            (cell_indices, lidar_parent),
+        ),
+        shape=(cell_count, lidar_node_count),
+        dtype=np.float32,
+    ).toarray()
+    prior_hc = coo_matrix(
+        (
+            hsi_coverage,
+            (hsi_parent, cell_indices),
+        ),
+        shape=(hsi_node_count, cell_count),
+        dtype=np.float32,
+    ).toarray()
+    prior_lc = coo_matrix(
+        (
+            lidar_coverage,
+            (lidar_parent, cell_indices),
+        ),
+        shape=(lidar_node_count, cell_count),
+        dtype=np.float32,
+    ).toarray()
+
+    pixel_cell_index = np.asarray(
+        cell_data["pixel_cell_index"],
+        dtype=np.int64,
+    )
+    pixel_indices = np.arange(pixel_cell_index.size, dtype=np.int64)
+    assignment = coo_matrix(
+        (
+            np.ones(pixel_cell_index.size, dtype=np.float32),
+            (pixel_indices, pixel_cell_index),
+        ),
+        shape=(pixel_cell_index.size, cell_count),
+        dtype=np.float32,
+    ).tocsr()
+
+    adjacency_key = (
+        "cell_weighted_adjacency"
+        if edge_mode == "spectral-height-boundary"
+        else "cell_rag_adjacency"
+    )
+    if adjacency_key not in cell_data:
+        raise ValueError(
+            f"Missing {adjacency_key} for intersection mediator."
+        )
+    cc_prior = cell_data[adjacency_key].tocsr().astype(np.float32)
+    cc_prior = cc_prior.copy()
+    cc_prior.setdiag(1.0)
+    cc_prior.eliminate_zeros()
+    row_sum = np.asarray(cc_prior.sum(axis=1)).reshape(-1)
+    cc_prior = cc_prior.tocoo()
+    cc_values = cc_prior.data / np.maximum(row_sum[cc_prior.row], 1e-6)
+    cc_prior = coo_matrix(
+        (cc_values.astype(np.float32), (cc_prior.row, cc_prior.col)),
+        shape=(cell_count, cell_count),
+        dtype=np.float32,
+    ).toarray()
+    return {
+        "assignment": assignment.astype(np.float32),
+        "prior_hc": prior_hc.astype(np.float32),
+        "prior_ch": prior_ch.astype(np.float32),
+        "prior_lc": prior_lc.astype(np.float32),
+        "prior_cl": prior_cl.astype(np.float32),
+        "cc_prior": cc_prior.astype(np.float32),
+        "attributes": np.asarray(
+            cell_data["attributes"],
+            dtype=np.float32,
+        ),
+        "anchor_count": cell_count,
+        "area": np.asarray(
+            cell_data["cell_area"],
+            dtype=np.float32,
+        ),
+        "mediator_kind": "intersection",
+        "edge_mode": edge_mode,
     }
 
 
@@ -2918,6 +3060,18 @@ class PostGATMediatedConsensusGraph(nn.Module):
         )
         nn.init.xavier_uniform_(self.bridge_embedding)
         self.bridge_norm = nn.LayerNorm(channels)
+        attribute_channels = (
+            bridge_data["attributes"].shape[1]
+            if "attributes" in bridge_data
+            else 0
+        )
+        self.cell_encoder = nn.Sequential(
+            nn.Linear(4 * channels + attribute_channels, channels),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+            nn.LeakyReLU(),
+        )
 
         self.h_value = nn.Linear(channels, channels, bias=False)
         self.c_query = nn.Linear(channels, attention_d_k, bias=False)
@@ -2926,12 +3080,23 @@ class PostGATMediatedConsensusGraph(nn.Module):
         self.l_value = nn.Linear(channels, channels, bias=False)
         self.scale = attention_d_k ** -0.5
 
-        self.c_ffn = nn.Linear(channels, channels)
-        self.c_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.c_output = nn.Linear(channels, channels, bias=False)
+        self.c_gnn_gamma = nn.Parameter(torch.tensor(1.0))
+        self.c_graph_norm = nn.LayerNorm(channels)
+        self.c_ffn = nn.Sequential(
+            nn.Linear(channels, 2 * channels),
+            nn.LeakyReLU(),
+            nn.Linear(2 * channels, channels),
+        )
+        self.c_ffn_norm = nn.LayerNorm(channels)
         self.graph_projection = nn.Sequential(
             nn.Linear(channels, channels),
             nn.BatchNorm1d(channels),
             nn.LeakyReLU(),
+        )
+        self.mediator_kind = bridge_data.get(
+            "mediator_kind",
+            "center",
         )
 
         for name in (
@@ -2939,12 +3104,54 @@ class PostGATMediatedConsensusGraph(nn.Module):
             "prior_ch",
             "prior_lc",
             "prior_cl",
-            "bias_cc",
         ):
             self.register_buffer(
                 name,
                 torch.as_tensor(
                     bridge_data[name],
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+        if "attributes" in bridge_data:
+            self.register_buffer(
+                "cell_attributes",
+                torch.as_tensor(
+                    bridge_data["attributes"],
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+        else:
+            self.register_buffer(
+                "cell_attributes",
+                None,
+                persistent=False,
+            )
+        if "cc_prior" in bridge_data:
+            self.register_buffer(
+                "cc_prior",
+                torch.as_tensor(
+                    bridge_data["cc_prior"],
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "bias_cc",
+                None,
+                persistent=False,
+            )
+        else:
+            self.register_buffer(
+                "cc_prior",
+                None,
+                persistent=False,
+            )
+            self.register_buffer(
+                "bias_cc",
+                torch.as_tensor(
+                    bridge_data["bias_cc"],
                     dtype=torch.float32,
                 ),
                 persistent=False,
@@ -2995,6 +3202,8 @@ class PostGATMediatedConsensusGraph(nn.Module):
         return self._row_normalize(projected)
 
     def _spatial_prior(self):
+        if self.cc_prior is not None:
+            return self._row_normalize(self.cc_prior)
         shifted = self.bias_cc - self.bias_cc.max(
             dim=1,
             keepdim=True,
@@ -3004,10 +3213,19 @@ class PostGATMediatedConsensusGraph(nn.Module):
     def forward(self, hsi_nodes, lidar_nodes, hsi_adjacency, lidar_adjacency):
         h_value = self.h_value(hsi_nodes)
         l_value = self.l_value(lidar_nodes)
+        h_context = self.prior_ch @ h_value
+        l_context = self.prior_cl @ l_value
+        cell_inputs = [
+            h_context,
+            l_context,
+            torch.abs(h_context - l_context),
+            h_context * l_context,
+        ]
+        if self.cell_attributes is not None:
+            cell_inputs.append(self.cell_attributes)
 
         bridge_nodes = self.bridge_norm(
-            0.5 * (self.prior_ch @ h_value)
-            + 0.5 * (self.prior_cl @ l_value)
+            self.cell_encoder(torch.cat(cell_inputs, dim=1))
             + self.bridge_embedding
         )
         c_query = self.c_query(bridge_nodes)
@@ -3036,9 +3254,14 @@ class PostGATMediatedConsensusGraph(nn.Module):
             * torch.log(lidar_prior.clamp_min(1e-6))
         )
         attention_cc = self._topk_softmax(logits, self.topk)
-        bridge_message = attention_cc @ c_value
-        updated_bridge = (
-            bridge_nodes + self.c_gamma * self.c_ffn(bridge_message)
+        c_graph_message = attention_cc @ c_value
+        c_gnn_output = self.c_output(c_graph_message)
+        c_graph_features = self.c_graph_norm(
+            bridge_nodes + self.c_gnn_gamma * c_gnn_output
+        )
+        c_ffn_delta = self.c_ffn(c_graph_features)
+        updated_bridge = self.c_ffn_norm(
+            c_graph_features + c_ffn_delta
         )
         consensus_pixel_features = torch.sparse.mm(
             self.bridge_projection_assignment,
@@ -3048,8 +3271,10 @@ class PostGATMediatedConsensusGraph(nn.Module):
             consensus_pixel_features
         )
         self.last_diagnostics = {
-            "c_gamma": float(self.c_gamma.detach().item()),
+            "c_gamma": float(self.c_gnn_gamma.detach().item()),
+            "c_gnn_gamma": float(self.c_gnn_gamma.detach().item()),
             "bridge_count": int(bridge_nodes.shape[0]),
+            "mediator_kind": self.mediator_kind,
             "attention_cc_entropy": float(
                 self._row_entropy(attention_cc).detach().mean().item()
             ),
@@ -3069,8 +3294,17 @@ class PostGATMediatedConsensusGraph(nn.Module):
                 float(self.hsi_prior_weight),
                 float(self.lidar_prior_weight),
             ),
-            "bridge_message_norm": float(
-                bridge_message.detach().norm(dim=1).mean().item()
+            "initial_c_norm": float(
+                bridge_nodes.detach().norm(dim=1).mean().item()
+            ),
+            "c_gnn_message_norm": float(
+                c_graph_message.detach().norm(dim=1).mean().item()
+            ),
+            "c_gnn_output_norm": float(
+                c_gnn_output.detach().norm(dim=1).mean().item()
+            ),
+            "c_ffn_delta_norm": float(
+                c_ffn_delta.detach().norm(dim=1).mean().item()
             ),
             "consensus_pixel_norm": float(
                 consensus_pixel_features.detach()
@@ -4213,8 +4447,9 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         consensus_structure_eta_init=0.0,
         post_gat_bridge="none",
         post_gat_consensus_graph="none",
-        consensus_graph_weight=0.333,
-        consensus_graph_fusion="c-guided-gate",
+        consensus_graph_weight=0.1,
+        consensus_graph_fusion="residual-c",
+        consensus_graph_residual_init=0.0,
         consensus_graph_spatial_prior_weight=1.0,
         consensus_graph_hsi_prior_weight=0.5,
         consensus_graph_lidar_prior_weight=0.5,
@@ -4259,6 +4494,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.consensus_graph_weight = consensus_graph_weight
         self.consensus_graph_fusion = consensus_graph_fusion
         self.last_consensus_graph_gate_diagnostics = None
+        self.consensus_graph_residual_gamma = None
         self.cell_interaction = cell_interaction
         self.cell_interaction_stages = cell_interaction_stages
         self.cell_output_branch = cell_output_branch
@@ -4651,10 +4887,10 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             )
         else:
             self.bridge_block_interaction = None
-        if post_gat_consensus_graph == "center-mediator":
+        if post_gat_consensus_graph != "none":
             if bridge_data is None:
                 raise ValueError(
-                    "bridge_data is required for center mediator "
+                    "mediator data is required for mediator "
                     "consensus graph."
                 )
             self.consensus_graph_branch = (
@@ -4676,7 +4912,18 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             if consensus_graph_fusion == "c-guided-gate":
                 gate_output = nn.Linear(hidden_dim, 3)
                 nn.init.zeros_(gate_output.weight)
-                nn.init.zeros_(gate_output.bias)
+                initial_weights = torch.tensor(
+                    [
+                        graph_modality_lambda
+                        * (1.0 - consensus_graph_weight),
+                        (1.0 - graph_modality_lambda)
+                        * (1.0 - consensus_graph_weight),
+                        consensus_graph_weight,
+                    ],
+                    dtype=torch.float32,
+                ).clamp_min(1e-6)
+                with torch.no_grad():
+                    gate_output.bias.copy_(torch.log(initial_weights))
                 self.consensus_graph_gate = nn.Sequential(
                     nn.Linear(hidden_dim * 6, hidden_dim),
                     nn.LeakyReLU(),
@@ -4684,6 +4931,10 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 )
             else:
                 self.consensus_graph_gate = None
+            if consensus_graph_fusion == "residual-c":
+                self.consensus_graph_residual_gamma = nn.Parameter(
+                    torch.tensor(float(consensus_graph_residual_init))
+                )
         else:
             self.consensus_graph_branch = None
             self.consensus_graph_gate = None
@@ -5051,6 +5302,11 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 hsi_adjacency,
                 lidar_adjacency,
             )
+            private_graph_features = (
+                self.graph_modality_lambda * hsi_graph_features
+                + (1.0 - self.graph_modality_lambda)
+                * lidar_graph_features
+            )
             if self.consensus_graph_fusion == "c-guided-gate":
                 gate_input = torch.cat(
                     [
@@ -5094,7 +5350,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     "gate_min": gate.detach().min(dim=0).values.cpu().tolist(),
                     "gate_max": gate.detach().max(dim=0).values.cpu().tolist(),
                 }
-            else:
+            elif self.consensus_graph_fusion == "fixed":
                 consensus_weight = self.consensus_graph_weight
                 private_weight = 1.0 - consensus_weight
                 graph_features = (
@@ -5115,6 +5371,32 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                         consensus_weight,
                     ],
                 }
+            elif self.consensus_graph_fusion == "residual-c":
+                residual_gamma = self.consensus_graph_residual_gamma
+                graph_features = (
+                    private_graph_features
+                    + residual_gamma
+                    * (
+                        consensus_graph_features
+                        - private_graph_features
+                    )
+                )
+                self.last_consensus_graph_gate_diagnostics = {
+                    "fusion_mode": self.consensus_graph_fusion,
+                    "residual_gamma": float(
+                        residual_gamma.detach().item()
+                    ),
+                    "baseline_weights": [
+                        self.graph_modality_lambda,
+                        1.0 - self.graph_modality_lambda,
+                        0.0,
+                    ],
+                }
+            else:
+                raise ValueError(
+                    f"Unsupported consensus graph fusion: "
+                    f"{self.consensus_graph_fusion}"
+                )
         elif self.prototype_correlation_fusion is None:
             graph_features = (
                 self.graph_modality_lambda * hsi_graph_features
@@ -5222,7 +5504,11 @@ def prepare_data(args, config):
         args.spatial_prior_k,
     )
     cell_data = None
-    if args.cell_interaction == "rag":
+    needs_intersection_cells = (
+        args.cell_interaction == "rag"
+        or args.post_gat_consensus_graph == "intersection-mediator"
+    )
+    if needs_intersection_cells:
         cell_data = build_common_refinement_cells(
             hsi_assignment,
             lidar_assignment,
@@ -5231,6 +5517,8 @@ def prepare_data(args, config):
         )
         if (
             args.cell_edge_mode
+            == "spectral-height-boundary"
+            or args.consensus_graph_cell_edge
             == "spectral-height-boundary"
         ):
             build_multimodal_weighted_cell_rag(
@@ -5244,7 +5532,10 @@ def prepare_data(args, config):
                 boundary_weight=args.cell_boundary_weight,
                 conflict_weight=args.cell_conflict_weight,
             )
-        if args.cell_topology_veto != "none":
+        if (
+            args.cell_interaction == "rag"
+            and args.cell_topology_veto != "none"
+        ):
             attach_cell_parent_topology_supports(
                 cell_data,
                 args.cell_edge_mode,
@@ -5296,6 +5587,13 @@ def prepare_data(args, config):
             overlap_weight=args.bridge_overlap_weight,
             spatial_weight=args.bridge_spatial_weight,
             height_weight=args.bridge_height_weight,
+        )
+    elif args.post_gat_consensus_graph == "intersection-mediator":
+        bridge_data = build_intersection_mediator_data(
+            cell_data,
+            hsi_assignment.shape[1],
+            lidar_assignment.shape[1],
+            edge_mode=args.consensus_graph_cell_edge,
         )
     return (
         reduced_hsi,
@@ -5431,6 +5729,9 @@ def train_one_run(
             ),
             consensus_graph_weight=args.consensus_graph_weight,
             consensus_graph_fusion=args.consensus_graph_fusion,
+            consensus_graph_residual_init=(
+                args.consensus_graph_residual_init
+            ),
             consensus_graph_spatial_prior_weight=(
                 args.consensus_graph_spatial_prior_weight
             ),
@@ -5760,7 +6061,9 @@ def train_one_run(
                     consensus_graph_record["prior_weights"]
                 )
                 print(
-                    "  mediator consensus graph | gamma C="
+                    "  mediator consensus graph | kind="
+                    f"{consensus_graph_record['mediator_kind']} | "
+                    "gamma C="
                     f"{consensus_graph_record['c_gamma']:.5f} | "
                     "C-QK entropy="
                     f"{consensus_graph_record['attention_cc_entropy']:.4f} | "
@@ -5770,8 +6073,10 @@ def train_one_run(
                     f"{consensus_graph_record['lidar_projected_prior_entropy']:.4f} | "
                     "alpha S/H/L="
                     f"{prior_weights.round(3).tolist()} | "
-                    "message-norm="
-                    f"{consensus_graph_record['bridge_message_norm']:.4f} | "
+                    "C-GNN msg/out/ffn-norm="
+                    f"{consensus_graph_record['c_gnn_message_norm']:.4f}/"
+                    f"{consensus_graph_record['c_gnn_output_norm']:.4f}/"
+                    f"{consensus_graph_record['c_ffn_delta_norm']:.4f} | "
                     "pixel-norm="
                     f"{consensus_graph_record['consensus_pixel_norm']:.4f}"
                 )
@@ -5795,6 +6100,12 @@ def train_one_run(
                     print(
                         "  fixed tri-graph fusion | weights H/L/C="
                         f"{fixed_weights.round(3).tolist()}"
+                    )
+                elif "residual_gamma" in consensus_graph_record:
+                    print(
+                        "  residual-C tri-graph fusion | gamma="
+                        f"{consensus_graph_record['residual_gamma']:.5f} "
+                        "(0 equals private H/L baseline)"
                     )
 
     training_time = time.perf_counter() - start_time
@@ -6090,6 +6401,10 @@ def validate_args(args):
         raise ValueError(
             "--consensus-graph-weight must be between 0 and 1."
         )
+    if args.consensus_graph_residual_init < 0:
+        raise ValueError(
+            "--consensus-graph-residual-init must be nonnegative."
+        )
     if any(
         weight < 0
         for weight in (
@@ -6100,6 +6415,16 @@ def validate_args(args):
     ):
         raise ValueError(
             "Consensus graph prior weights must be nonnegative."
+        )
+    if (
+        args.consensus_graph_cell_edge != "binary"
+        and args.post_gat_consensus_graph
+        != "intersection-mediator"
+    ):
+        raise ValueError(
+            "--consensus-graph-cell-edge spectral-height-boundary "
+            "requires --post-gat-consensus-graph "
+            "intersection-mediator."
         )
     if args.post_gat_consensus_graph != "none":
         if args.cross_modal_interaction != "none":
@@ -6116,9 +6441,18 @@ def validate_args(args):
             )
         if args.post_gat_bridge != "none":
             raise ValueError(
-                "--post-gat-consensus-graph center-mediator reuses "
-                "center bridge priors internally; do not also enable "
+                "--post-gat-consensus-graph is an alternative "
+                "mediator branch; do not also enable "
                 "--post-gat-bridge."
+            )
+        if (
+            args.post_gat_consensus_graph
+            == "intersection-mediator"
+            and len(args.scales) != 1
+        ):
+            raise ValueError(
+                "--post-gat-consensus-graph intersection-mediator "
+                "requires exactly one superpixel scale."
             )
         if args.post_gat_prototype_fusion != "none":
             raise ValueError(
@@ -6170,12 +6504,20 @@ def validate_args(args):
             "--cell-interaction rag currently requires exactly one "
             "superpixel scale."
         )
+    consensus_weighted_cell_edge_requested = (
+        args.post_gat_consensus_graph == "intersection-mediator"
+        and args.consensus_graph_cell_edge
+        == "spectral-height-boundary"
+    )
     cell_enhancement_requested = (
         args.cell_pixel_descriptor != "none"
         or args.cell_edge_mode != "binary"
         or args.cell_interaction_stages != 1
         or args.cell_output_branch != "none"
-        or args.cell_conflict_weight > 0
+        or (
+            args.cell_conflict_weight > 0
+            and not consensus_weighted_cell_edge_requested
+        )
         or args.cell_topology_veto != "none"
     )
     if (
@@ -6192,10 +6534,12 @@ def validate_args(args):
         args.cell_conflict_weight > 0
         and args.cell_edge_mode
         != "spectral-height-boundary"
+        and not consensus_weighted_cell_edge_requested
     ):
         raise ValueError(
             "--cell-conflict-weight requires "
-            "--cell-edge-mode spectral-height-boundary."
+            "--cell-edge-mode spectral-height-boundary or "
+            "--consensus-graph-cell-edge spectral-height-boundary."
         )
     if not 0.0 < args.cell_veto_threshold <= 1.0:
         raise ValueError(
@@ -6436,32 +6780,53 @@ def main():
             "Post-GAT2 mediator consensus graph: "
             f"{args.post_gat_consensus_graph}"
         )
-        if args.post_gat_consensus_graph == "center-mediator":
-            resolved_bridge_count = (
-                args.bridge_anchor_count
-                if args.bridge_anchor_count > 0
-                else 2 * class_count
-            )
+        if args.post_gat_consensus_graph != "none":
+            if args.post_gat_consensus_graph == "center-mediator":
+                resolved_mediator_count = (
+                    args.bridge_anchor_count
+                    if args.bridge_anchor_count > 0
+                    else 2 * class_count
+                )
+                mediator_source = "public center anchors"
+                spatial_source = "center spatial prior"
+            else:
+                resolved_mediator_count = cell_data["cell_count"]
+                mediator_source = "intersection cells"
+                spatial_source = (
+                    f"cell RAG ({args.consensus_graph_cell_edge})"
+                )
             private_weight = 1.0 - args.consensus_graph_weight
-            fusion_detail = (
-                "C-guided pixel tri-graph gate"
-                if args.consensus_graph_fusion == "c-guided-gate"
-                else (
+            if args.consensus_graph_fusion == "c-guided-gate":
+                fusion_detail = (
+                    "C-guided pixel tri-graph gate initialized to "
+                    "fixed H/L/C="
+                    f"{private_weight * args.graph_modality_lambda:g}/"
+                    f"{private_weight * (1.0 - args.graph_modality_lambda):g}/"
+                    f"{args.consensus_graph_weight:g}"
+                )
+            elif args.consensus_graph_fusion == "residual-c":
+                fusion_detail = (
+                    "residual C correction with gamma-init="
+                    f"{args.consensus_graph_residual_init:g} "
+                    "(gamma=0 equals private H/L baseline)"
+                )
+            else:
+                fusion_detail = (
                     "fixed weights H/L/C="
                     f"{private_weight * args.graph_modality_lambda:g}/"
                     f"{private_weight * (1.0 - args.graph_modality_lambda):g}/"
                     f"{args.consensus_graph_weight:g}"
                 )
-            )
             print(
                 "Mediator graph path: HSI/LiDAR private GAT2 nodes "
-                f"stay unchanged -> {resolved_bridge_count} public "
-                "center anchors -> C-QK dynamic C-C graph with "
+                f"stay unchanged -> {resolved_mediator_count} "
+                f"{mediator_source} -> C-QK dynamic C-C graph with "
                 "projected HSI/LiDAR topology priors -> consensus "
                 "pixels as third graph branch; fusion="
                 f"{fusion_detail}; d_k="
                 f"{args.bridge_attention_dk}, top-k="
-                f"{args.bridge_attention_topk}, overlap="
+                f"{args.bridge_attention_topk}, spatial prior="
+                f"{spatial_source}, overlap="
                 f"{args.bridge_overlap_metric}, bridge bias weights "
                 "overlap/spatial/height="
                 f"{args.bridge_overlap_weight:g}/"
