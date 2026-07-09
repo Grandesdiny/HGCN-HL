@@ -68,11 +68,13 @@ A_C = TopKSoftmax(
 )
 ```
 
-This adjacency is then used by an independent C-GNN branch:
+This adjacency is then used by an independent C-GAT branch. The propagation
+layer reuses the same `MultiHeadGAT` implementation as the private HSI/LiDAR
+graph branches, with the dynamic C-QK adjacency supplied as a weighted graph:
 
 ```text
-M_C = A_C V_C(C0)
-Z_C1 = LN(C0 + W_o M_C)
+C_GAT = MultiHeadGAT(C0, A_C)
+Z_C1 = LN(C0 + gamma_c * C_GAT)
 Z_C2 = LN(Z_C1 + FFN(Z_C1))
 F_C = Q_C_pixel Z_C2
 ```
@@ -170,14 +172,13 @@ after HSI superpixel pooling. For LiDAR, `--lidar-modulation rag-lowhigh`
 uses a geometry-gated decomposition into RAG-smoothed low-frequency and
 RAG-residual high-frequency node features. The optional
 `--lidar-graph-prior rag-height-knn` restricts LiDAR dynamic Top-k edges with
-a local RAG and elevation similarity. The archived GAT1/GAT2 cross-modal
+a local RAG and elevation similarity. The previous GAT1/GAT2 cross-modal
 interaction, contrastive losses, MSSAGF/SACR anchor write-back, SPSN
 prototype fusion, center-block, center-mediator, and parent-cell-parent cell
-feedback routes are no longer exposed in the main command-line entry point.
-The main line is private dual graphs plus the optional intersection C-GNN
-third branch. The demo does not use a fixed-incidence hypergraph. Outputs are
-isolated under
-`model_demo/stage8_intersection_mediator_cgnn`.
+feedback routes have been removed from `demo_train.py`. The main line is
+private dual graphs plus the optional intersection C-GAT third branch. The
+demo does not use a fixed-incidence hypergraph. Outputs are isolated under
+`model_demo/stage8_intersection_mediator_cgat`.
 
 ## Supported datasets
 
