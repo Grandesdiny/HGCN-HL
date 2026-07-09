@@ -1,11 +1,12 @@
-"""Stage-8 demo: overlap-conditioned second-layer dynamic graphs.
+"""Stage-8 demo: private dual GSDG graphs plus mediator C-GNN.
 
 The fixed hypergraph/HGCN path is replaced by GSDG graph/GAT propagation.
 The default uses independent HSI and LiDAR graphs; the previous concatenated
 node graph remains selectable. The LiDAR graph can additionally restrict its
 dynamic neighbors with a local RAG and an elevation-similarity KNN. The
-original joint CNN and fusion remain. An intersection-cell RAG can be inserted
-after GAT1, but is disabled by default.
+original joint CNN and fusion remain. The only exposed cross-modal graph
+branch is a post-GAT2 intersection-cell mediator C graph with its own C-GNN
+message passing and pixel readout.
 """
 
 import argparse
@@ -50,7 +51,7 @@ from utils import (
 )
 
 
-STAGE = "stage8_overlap_conditioned_qk"
+STAGE = "stage8_intersection_mediator_cgnn"
 
 
 def parse_args():
@@ -131,231 +132,149 @@ def parse_args():
         default=0.5,
         help="HSI weight when fusing the two separate graph outputs.",
     )
+    # Archived ablation switches are kept as hidden compatibility flags
+    # but their active choices are removed from the main entry point.
     parser.add_argument(
         "--cross-modal-interaction",
-        choices=(
-            "none",
-            "overlap-gate",
-            "overlap-attention",
-            "overlap-qk-condition",
-        ),
+        choices=("none",),
         default="none",
-        help=(
-            "Interaction between independent HSI/LiDAR graphs after "
-            "GAT1. overlap-qk-condition uses cross-partition overlap "
-            "context only to condition each modality's second Q/K graph. "
-            "The default 'none' exactly preserves late fusion."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--cross-attention-dk",
         type=int,
         default=16,
-        help="Query/key dimension of overlap-constrained cross-attention.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--overlap-metric",
         choices=("iou", "coverage"),
         default="iou",
-        help=(
-            "Cross-modal superpixel correspondence. 'iou' uses "
-            "intersection over union; 'coverage' preserves the earlier "
-            "directional intersection/target-area weighting."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--contrastive-mode",
-        choices=(
-            "none",
-            "overlap-soft",
-            "overlap-prototype",
-            "overlap-transport",
-        ),
+        choices=("none",),
         default="none",
-        help=(
-            "Training-only cross-modal contrastive alignment of GAT2 "
-            "node features before pixel projection. overlap-transport "
-            "uses overlap-supported semantic transport and SimSiam-style "
-            "distillation. Default: none."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--contrastive-weight",
         type=float,
         default=0.05,
-        help="Lambda of the cross-modal contrastive loss. Default: 0.05.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--contrastive-temperature",
         type=float,
         default=0.2,
-        help=(
-            "Similarity temperature for overlap-soft, prototype "
-            "InfoNCE, and transport semantics; unused by prototype "
-            "cosine consistency. Default: 0.2."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--contrastive-dim",
         type=int,
         default=32,
-        help="Shared projector output dimension. Default: 32.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--prototype-objective",
         choices=("cosine", "infonce"),
         default="cosine",
-        help=(
-            "Objective used by overlap-prototype. 'cosine' performs "
-            "bidirectional node-prototype consistency without global "
-            "negatives; 'infonce' retains the earlier prototype "
-            "classification ablation. Default: cosine."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--post-gat-prototype-fusion",
-        choices=("none", "spsn-correlation"),
+        choices=("none",),
         default="none",
-        help=(
-            "Optional SPSN-inspired prototype selection, correlation "
-            "maps, and pixel-wise modality reliability fusion after "
-            "GAT2. Default: none."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--post-gat-consensus",
-        choices=("none", "mssagf-anchor"),
+        choices=("none",),
         default="none",
-        help=(
-            "Optional single post-GAT2 cross-modal interaction through "
-            "shared consensus anchors. Default: none."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--consensus-anchor-count",
         type=int,
         default=0,
-        help=(
-            "Number of shared consensus anchors. Zero resolves to twice "
-            "the dataset class count. Default: 0."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--consensus-temperature",
         type=float,
         default=0.2,
-        help=(
-            "Soft node-to-consensus-anchor assignment temperature. "
-            "Default: 0.2."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--consensus-gamma-init",
         type=float,
         default=0.0,
-        help=(
-            "Initial learnable residual write-back scale for both "
-            "modalities. Default: 0."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--consensus-fusion",
         choices=("fixed", "adaptive"),
         default="fixed",
-        help=(
-            "Fuse modality-specific anchor features with fixed 0.5/0.5 "
-            "or detached reconstruction-error reliability. "
-            "Default: fixed."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--consensus-writeback",
         choices=("direct", "difference"),
         default="direct",
-        help=(
-            "Write the consensus anchor directly or write only its "
-            "difference from each modality anchor. Default: direct."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--consensus-reliability-temperature",
         type=float,
         default=1.0,
-        help=(
-            "Temperature tau_r of adaptive per-anchor modality "
-            "reliability. Default: 1.0."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--consensus-anchor-reasoning",
-        choices=("none", "sacr"),
+        choices=("none",),
         default="none",
-        help=(
-            "Optional post-GAT2 reasoning on the shared consensus "
-            "anchors. 'sacr' applies structure-aligned consensus "
-            "refinement as a small residual on top of A3. Default: "
-            "none."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--consensus-structure-reliability",
-        choices=("none", "adaptive"),
+        choices=("none",),
         default="none",
-        help=(
-            "Whether SACR uses the HSI/LiDAR anchor-graph gap to "
-            "downweight structurally inconsistent anchors. Default: "
-            "none."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--consensus-anchor-graph-topk",
         type=int,
         default=8,
-        help=(
-            "Top-K neighbors per anchor when building HSI/LiDAR "
-            "anchor graphs for SACR. Default: 8."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--consensus-structure-temperature",
         type=float,
         default=0.1,
-        help=(
-            "Temperature for converting the HSI/LiDAR anchor-graph "
-            "gap into SACR adaptive structure reliability. Default: "
-            "0.1."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--consensus-structure-eta-init",
         type=float,
         default=0.0,
-        help=(
-            "Initial eta for SACR residual refinement. Eta is "
-            "learnable and defaults to 0 so the initial forward pass "
-            "exactly recovers A3."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--post-gat-bridge",
-        choices=("none", "center-block"),
+        choices=("none",),
         default="none",
-        help=(
-            "Optional post-GAT2 center-bridge block interaction. "
-            "'center-block' creates public spatial bridge anchors and "
-            "uses H<->C<->L block attention before pixel projection. "
-            "Default: none."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--post-gat-consensus-graph",
-        choices=("none", "center-mediator", "intersection-mediator"),
+        choices=("none", "intersection-mediator"),
         default="none",
         help=(
             "Optional post-GAT2 mediator consensus graph as an "
-            "independent third pixel branch. 'center-mediator' uses "
-            "public grid anchors; 'intersection-mediator' uses "
-            "HSI-superpixel ∩ LiDAR-superpixel cells. Default: none."
+            "independent third pixel branch. 'intersection-mediator' "
+            "uses HSI-superpixel ∩ LiDAR-superpixel cells. "
+            "Default: none."
         ),
     )
     parser.add_argument(
@@ -431,207 +350,182 @@ def parse_args():
         "--bridge-anchor-count",
         type=int,
         default=0,
-        help=(
-            "Number of public center bridge anchors. Zero resolves to "
-            "twice the dataset class count. Default: 0."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--bridge-attention-dk",
         type=int,
         default=32,
-        help="Query/key dimension of center bridge attention. Default: 32.",
+        help=(
+            "Query/key dimension of the mediator C graph attention. "
+            "Default: 32."
+        ),
     )
     parser.add_argument(
         "--bridge-attention-topk",
         type=int,
         default=8,
-        help="Top-K entries per center bridge relation row. Default: 8.",
+        help="Top-K entries per mediator C graph row. Default: 8.",
     )
     parser.add_argument(
         "--bridge-overlap-metric",
         choices=("coverage", "iou"),
         default="coverage",
-        help=(
-            "Overlap prior between modality superpixels and public "
-            "bridge anchors. Default: coverage."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--bridge-overlap-weight",
         type=float,
         default=1.0,
-        help="Weight of log-overlap bridge attention bias. Default: 1.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--bridge-spatial-weight",
         type=float,
         default=1.0,
-        help="Weight of centroid-distance bridge bias. Default: 1.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--bridge-height-weight",
         type=float,
         default=1.0,
-        help=(
-            "Weight of LiDAR height-distribution bridge bias. "
-            "Default: 1."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--bridge-gamma-init",
         type=float,
         default=0.0,
-        help=(
-            "Initial residual scales for H/C/L bridge updates. "
-            "Default: 0."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--spsn-prototype-count",
         type=int,
         default=32,
-        help=(
-            "Number of independently selected GAT2 prototypes per "
-            "modality for spsn-correlation. Default: 32."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--spsn-correlation-temperature",
         type=float,
         default=0.2,
-        help=(
-            "Cosine-correlation softmax temperature for the selected "
-            "post-GAT prototypes. Default: 0.2."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--transport-semantic-weight",
         type=float,
         default=1.0,
-        help=(
-            "Beta multiplying semantic cosine similarity inside the "
-            "overlap-supported Sinkhorn kernel. Default: 1.0."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--transport-iterations",
         type=int,
         default=10,
-        help="Number of log-domain Sinkhorn iterations. Default: 10.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--transport-warmup-epochs",
         type=int,
         default=50,
-        help=(
-            "Epochs using fixed normalized overlap M before linearly "
-            "introducing semantic transport over the same duration. "
-            "Default: 50."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--variance-weight",
         type=float,
         default=0.01,
-        help=(
-            "Lambda of the overlap-transport projector variance "
-            "regularizer. Ignored by other modes. Default: 0.01."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--variance-target",
         type=float,
         default=1.0,
-        help=(
-            "Minimum per-dimension projector standard deviation gamma "
-            "for overlap-transport. Default: 1.0."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--cell-interaction",
-        choices=("none", "rag"),
+        choices=("none",),
         default="none",
-        help=(
-            "Optional intersection-cell interaction after GAT1. "
-            "'rag' performs parent-to-cell fusion, one sparse 1-hop "
-            "cell RAG-GCN, and gated cell-to-parent feedback before "
-            "the existing second-layer graph construction. Default: none."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--cell-pixel-descriptor",
-        choices=("none", "mean"),
+        choices=("none",),
         default="none",
-        help=(
-            "Optionally append mean HSI-PCA and LiDAR pixels inside "
-            "each intersection cell to its node encoder. Default: none."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--cell-edge-mode",
-        choices=("binary", "spectral-height-boundary"),
+        choices=("binary",),
         default="binary",
-        help=(
-            "Binary 1-hop cell RAG or a sparse RAG weighted by cell "
-            "spectral angle, mean-height difference, and shared-boundary "
-            "LiDAR gradient. Default: binary."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--cell-interaction-stages",
         type=int,
-        choices=(1, 2),
+        choices=(1,),
         default=1,
-        help=(
-            "Run cell interaction only after GAT1, or again after GAT2. "
-            "Default: 1."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--cell-output-branch",
-        choices=("none", "fixed"),
+        choices=("none",),
         default="none",
-        help=(
-            "Optionally project the latest cell features to pixels as "
-            "a third fixed-weight graph branch. Default: none."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--cell-output-weight",
         type=float,
         default=1.0 / 3.0,
-        help="Cell pixel-branch weight when --cell-output-branch fixed.",
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument("--cell-sam-weight", type=float, default=1.0)
-    parser.add_argument("--cell-height-weight", type=float, default=1.0)
-    parser.add_argument("--cell-boundary-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--cell-sam-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "HSI spectral-angle weight for the intersection-mediator "
+            "spectral-height-boundary C-C prior. Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--cell-height-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "LiDAR mean-height difference weight for the "
+            "intersection-mediator spectral-height-boundary C-C prior. "
+            "Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--cell-boundary-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "LiDAR boundary-gradient weight for the "
+            "intersection-mediator spectral-height-boundary C-C prior. "
+            "Default: 1."
+        ),
+    )
     parser.add_argument(
         "--cell-conflict-weight",
         type=float,
         default=0.0,
         help=(
             "Weight of the absolute normalized HSI/LiDAR shared-boundary "
-            "strength disagreement. Default: 0 (disabled)."
+            "strength disagreement in the intersection-mediator "
+            "spectral-height-boundary C-C prior. Default: 0 (disabled)."
         ),
     )
     parser.add_argument(
         "--cell-topology-veto",
-        choices=("none", "soft", "hard"),
+        choices=("none",),
         default="none",
-        help=(
-            "Use the cell graph to attenuate or mask second-layer "
-            "HSI/LiDAR Q/K edges before Top-K. Default: none."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--cell-veto-threshold",
         type=float,
         default=0.05,
-        help=(
-            "Minimum mapped cell support retained by hard topology veto. "
-            "Default: 0.05."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--fdsm-scope",
@@ -801,19 +695,11 @@ def bridge_configuration_tag(args, class_count):
 def consensus_graph_configuration_tag(args, class_count):
     if args.post_gat_consensus_graph == "none":
         return "cg-none"
-    if args.post_gat_consensus_graph == "center-mediator":
-        anchor_tag = (
-            args.bridge_anchor_count
-            if args.bridge_anchor_count > 0
-            else 2 * class_count
-        )
-    else:
-        anchor_tag = "cells"
+    anchor_tag = "cells"
     return (
         f"cg-{args.post_gat_consensus_graph}-k{anchor_tag}-"
         f"dk{args.bridge_attention_dk}-"
         f"top{args.bridge_attention_topk}-"
-        f"ov{args.bridge_overlap_metric}-"
         f"w{args.consensus_graph_weight:g}-"
         f"f{args.consensus_graph_fusion}-"
         f"rg{args.consensus_graph_residual_init:g}-"
@@ -5567,28 +5453,7 @@ def prepare_data(args, config):
             lidar_features,
         )
     bridge_data = None
-    if (
-        args.post_gat_bridge == "center-block"
-        or args.post_gat_consensus_graph == "center-mediator"
-    ):
-        bridge_anchor_count = (
-            args.bridge_anchor_count
-            if args.bridge_anchor_count > 0
-            else 2 * class_count
-        )
-        bridge_data = build_center_bridge_data(
-            hsi_assignment,
-            lidar_assignment,
-            lidar,
-            height,
-            width,
-            bridge_anchor_count,
-            overlap_metric=args.bridge_overlap_metric,
-            overlap_weight=args.bridge_overlap_weight,
-            spatial_weight=args.bridge_spatial_weight,
-            height_weight=args.bridge_height_weight,
-        )
-    elif args.post_gat_consensus_graph == "intersection-mediator":
+    if args.post_gat_consensus_graph == "intersection-mediator":
         bridge_data = build_intersection_mediator_data(
             cell_data,
             hsi_assignment.shape[1],
@@ -6131,14 +5996,7 @@ def train_one_run(
         f"{STAGE}_{args.graph_layout}_"
         f"lidar-{args.lidar_segmentation}_"
         f"prior-{args.lidar_graph_prior}_"
-        f"cross-{args.cross_modal_interaction}_"
-        f"overlap-{args.overlap_metric}_"
-        f"{contrastive_configuration_tag(args)}_"
-        f"{prototype_fusion_configuration_tag(args)}_"
-        f"{consensus_configuration_tag(args, class_count)}_"
-        f"{bridge_configuration_tag(args, class_count)}_"
         f"{consensus_graph_configuration_tag(args, class_count)}_"
-        f"{cell_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
         f"cnn-{args.cnn_branch}_"
         f"lidarmod-{args.lidar_modulation}_"
@@ -6596,7 +6454,7 @@ def main():
 
     print("=" * 72)
     print(
-        "demo_train | Stage 8: overlap-conditioned second-layer Q/K"
+        "demo_train | Stage 8: private dual GSDG + mediator C-GNN"
     )
     if args.cnn_branch == "original":
         print(
@@ -6637,164 +6495,14 @@ def main():
         else:
             print("LiDAR prior: Stage-3 centroid KNN")
         print(
-            "Cross-modal graph interaction: "
-            f"{args.cross_modal_interaction}"
-        )
-        if args.cross_modal_interaction != "none":
-            print(
-                "Cross-modal overlap metric: "
-                f"{args.overlap_metric}"
-            )
-        if (
-            args.cross_modal_interaction
-            == "overlap-qk-condition"
-        ):
-            print(
-                "Cross condition: C_HL @ L and C_LH @ H modify "
-                "both modalities' second-layer Q/K; no direct "
-                "overlap feature gate"
-            )
-        print(
-            "Post-GAT2 cross-modal contrastive loss: "
-            f"{args.contrastive_mode}"
-        )
-        if args.contrastive_mode != "none":
-            contrastive_target = {
-                "overlap-soft": "soft overlap distribution",
-                "overlap-prototype": (
-                    "opposite-modal overlap prototype"
-                ),
-                "overlap-transport": (
-                    "overlap-supported semantic transport prototype"
-                ),
-            }[args.contrastive_mode]
-            prototype_detail = (
-                f", prototype objective={args.prototype_objective}"
-                if args.contrastive_mode == "overlap-prototype"
-                else ""
-            )
-            transport_detail = (
-                ", semantic beta="
-                f"{args.transport_semantic_weight:g}, Sinkhorn "
-                f"iterations={args.transport_iterations}, fixed-overlap "
-                f"warmup={args.transport_warmup_epochs} epochs, "
-                "linear semantic ramp="
-                f"{args.transport_warmup_epochs} epochs, variance "
-                f"lambda={args.variance_weight:g}, gamma="
-                f"{args.variance_target:g}"
-                if args.contrastive_mode == "overlap-transport"
-                else ""
-            )
-            temperature_detail = (
-                ""
-                if (
-                    args.contrastive_mode == "overlap-prototype"
-                    and args.prototype_objective == "cosine"
-                )
-                else f", tau={args.contrastive_temperature:g}"
-            )
-            print(
-                "Contrastive configuration: lambda="
-                f"{args.contrastive_weight:g}"
-                f"{temperature_detail}, projection dim="
-                f"{args.contrastive_dim}; target="
-                f"{contrastive_target}{prototype_detail}"
-                f"{transport_detail}"
-            )
-        print(
-            "Post-GAT2 prototype correlation fusion: "
-            f"{args.post_gat_prototype_fusion}"
-        )
-        if (
-            args.post_gat_prototype_fusion
-            == "spsn-correlation"
-        ):
-            print(
-                "SPSN-style path: independent HSI/LiDAR GAT2 "
-                f"prototype Top-{args.spsn_prototype_count} -> "
-                "node correlation -> sparse pixel projection -> "
-                "pixel-wise reliability -> unchanged CNN fusion; "
-                "correlation tau="
-                f"{args.spsn_correlation_temperature:g}"
-            )
-        print(
-            "Post-GAT2 consensus interaction: "
-            f"{args.post_gat_consensus}"
-        )
-        if args.post_gat_consensus == "mssagf-anchor":
-            resolved_anchor_count = (
-                args.consensus_anchor_count
-                if args.consensus_anchor_count > 0
-                else 2 * class_count
-            )
-            print(
-                "Consensus path: pure modality-private GAT1/GAT2 "
-                f"-> {resolved_anchor_count} shared anchors -> "
-                "area-weighted "
-                f"{args.consensus_fusion} anchor fusion -> "
-                f"{args.consensus_writeback} "
-                "zero-initialized learnable residual write-back -> "
-                "separate pixel projection; tau="
-                f"{args.consensus_temperature:g}, gamma-init="
-                f"{args.consensus_gamma_init:g}, reliability-tau="
-                f"{args.consensus_reliability_temperature:g}"
-            )
-            if args.consensus_anchor_reasoning != "none":
-                print(
-                    "Consensus anchor reasoning: "
-                    f"{args.consensus_anchor_reasoning}, "
-                    "structure reliability="
-                    f"{args.consensus_structure_reliability}, "
-                    "anchor top-k="
-                    f"{args.consensus_anchor_graph_topk}, "
-                    "structure temperature="
-                    f"{args.consensus_structure_temperature:g}, "
-                    "eta-init="
-                    f"{args.consensus_structure_eta_init:g}"
-                )
-        print(
-            "Post-GAT2 center bridge interaction: "
-            f"{args.post_gat_bridge}"
-        )
-        if args.post_gat_bridge == "center-block":
-            resolved_bridge_count = (
-                args.bridge_anchor_count
-                if args.bridge_anchor_count > 0
-                else 2 * class_count
-            )
-            print(
-                "Center bridge path: HSI/LiDAR GAT2 nodes -> "
-                f"{resolved_bridge_count} public spatial bridge "
-                "anchors -> H<->C<->L block attention -> separate "
-                "pixel projection; d_k="
-                f"{args.bridge_attention_dk}, top-k="
-                f"{args.bridge_attention_topk}, overlap="
-                f"{args.bridge_overlap_metric}, bias weights "
-                "overlap/spatial/height="
-                f"{args.bridge_overlap_weight:g}/"
-                f"{args.bridge_spatial_weight:g}/"
-                f"{args.bridge_height_weight:g}, gamma-init="
-                f"{args.bridge_gamma_init:g}"
-            )
-        print(
             "Post-GAT2 mediator consensus graph: "
             f"{args.post_gat_consensus_graph}"
         )
         if args.post_gat_consensus_graph != "none":
-            if args.post_gat_consensus_graph == "center-mediator":
-                resolved_mediator_count = (
-                    args.bridge_anchor_count
-                    if args.bridge_anchor_count > 0
-                    else 2 * class_count
-                )
-                mediator_source = "public center anchors"
-                spatial_source = "center spatial prior"
-            else:
-                resolved_mediator_count = cell_data["cell_count"]
-                mediator_source = "intersection cells"
-                spatial_source = (
-                    f"cell RAG ({args.consensus_graph_cell_edge})"
-                )
+            resolved_mediator_count = cell_data["cell_count"]
+            spatial_source = (
+                f"cell RAG ({args.consensus_graph_cell_edge})"
+            )
             private_weight = 1.0 - args.consensus_graph_weight
             if args.consensus_graph_fusion == "c-guided-gate":
                 fusion_detail = (
@@ -6820,64 +6528,22 @@ def main():
             print(
                 "Mediator graph path: HSI/LiDAR private GAT2 nodes "
                 f"stay unchanged -> {resolved_mediator_count} "
-                f"{mediator_source} -> C-QK dynamic C-C graph with "
+                "intersection C nodes -> C-QK dynamic C-C graph with "
                 "projected HSI/LiDAR topology priors -> consensus "
-                "pixels as third graph branch; fusion="
+                "C-GNN -> consensus pixels as third graph branch; "
+                "fusion="
                 f"{fusion_detail}; d_k="
                 f"{args.bridge_attention_dk}, top-k="
                 f"{args.bridge_attention_topk}, spatial prior="
-                f"{spatial_source}, overlap="
-                f"{args.bridge_overlap_metric}, bridge bias weights "
-                "overlap/spatial/height="
-                f"{args.bridge_overlap_weight:g}/"
-                f"{args.bridge_spatial_weight:g}/"
-                f"{args.bridge_height_weight:g}, C prior alpha S/H/L="
+                f"{spatial_source}, C prior alpha S/H/L="
                 f"{args.consensus_graph_spatial_prior_weight:g}/"
                 f"{args.consensus_graph_hsi_prior_weight:g}/"
-                f"{args.consensus_graph_lidar_prior_weight:g}, gamma-init="
-                f"{args.bridge_gamma_init:g}"
+                f"{args.consensus_graph_lidar_prior_weight:g}"
             )
-        print(f"Intersection-cell interaction: {args.cell_interaction}")
-        if args.cell_interaction == "rag":
-            print(
-                "Cell path: parent-to-cell -> sparse 1-hop RAG-GCN "
-                "-> gated cell-to-parent; cells="
-                f"{cell_data['cell_count']}, directed RAG entries "
-                "excluding self="
-                f"{cell_data['cell_rag_edge_count']}"
-            )
-            print(
-                "Cell enhancements: pixel descriptor="
-                f"{args.cell_pixel_descriptor}, edge mode="
-                f"{args.cell_edge_mode}, interaction stages="
-                f"{args.cell_interaction_stages}, pixel output="
-                f"{args.cell_output_branch}"
-            )
-            print(
-                "Cell topology veto: "
-                f"{args.cell_topology_veto}"
-            )
-            if args.cell_topology_veto != "none":
-                hsi_support = cell_data[
-                    "hsi_topology_support"
-                ]
-                lidar_support = cell_data[
-                    "lidar_topology_support"
-                ]
-                print(
-                    "Mapped cell support retained at threshold "
-                    f"{args.cell_veto_threshold:g}: HSI="
-                    f"{np.mean(hsi_support >= args.cell_veto_threshold):.4f}, "
-                    "LiDAR="
-                    f"{np.mean(lidar_support >= args.cell_veto_threshold):.4f}"
-                )
-            if (
-                args.cell_edge_mode
-                == "spectral-height-boundary"
-            ):
+            if args.consensus_graph_cell_edge == "spectral-height-boundary":
                 weight_stats = cell_data["cell_weight_stats"]
                 print(
-                    "Cell multimodal edge weights: "
+                    "Mediator C-C multimodal edge weights: "
                     f"min={weight_stats['minimum']:.4f}, "
                     f"mean={weight_stats['mean']:.4f}, "
                     f"max={weight_stats['maximum']:.4f}"
@@ -6893,11 +6559,6 @@ def main():
                         f"mean={conflict_stats['mean']:.4f}, "
                         f"max={conflict_stats['maximum']:.4f}"
                     )
-            if args.cell_output_branch == "fixed":
-                print(
-                    "Cell third pixel branch weight: "
-                    f"{args.cell_output_weight:g}"
-                )
         print(f"HSI FDSM: {args.fdsm_scope}")
         print(f"LiDAR modulation: {args.lidar_modulation}")
     else:
@@ -6972,14 +6633,7 @@ def main():
         f"{STAGE}_{args.graph_layout}_"
         f"lidar-{args.lidar_segmentation}_"
         f"prior-{args.lidar_graph_prior}_"
-        f"cross-{args.cross_modal_interaction}_"
-        f"overlap-{args.overlap_metric}_"
-        f"{contrastive_configuration_tag(args)}_"
-        f"{prototype_fusion_configuration_tag(args)}_"
-        f"{consensus_configuration_tag(args, class_count)}_"
-        f"{bridge_configuration_tag(args, class_count)}_"
         f"{consensus_graph_configuration_tag(args, class_count)}_"
-        f"{cell_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
         f"cnn-{args.cnn_branch}_"
         f"lidarmod-{args.lidar_modulation}_results"

@@ -1,6 +1,6 @@
 # HGCN-HL
-Dual-branch GSDG-style dynamic hypergraph classification for hyperspectral
-and LiDAR data.
+Dual-branch GSDG-style dynamic superpixel graph classification for
+hyperspectral and LiDAR data.
 
 ## Step-by-step demo
 
@@ -17,227 +17,23 @@ python demo_train.py \
   --lidar-rag-hops 2 \
   --lidar-height-knn-k 5 \
   --lidar-modulation rag-lowhigh \
-  --cross-modal-interaction overlap-qk-condition \
-  --overlap-metric iou \
   --fdsm-scope hsi \
   --device cuda
 ```
 
-An SPSN-inspired post-GAT prototype-correlation branch can be enabled on
-this base pipeline:
+A mediator consensus graph can be enabled as the only exposed post-GAT2
+cross-modal branch:
 
 ```bash
---post-gat-prototype-fusion spsn-correlation \
---spsn-prototype-count 32 \
---spsn-correlation-temperature 0.2
-```
-
-It is disabled by default with `--post-gat-prototype-fusion none`. HSI and
-LiDAR GAT2 nodes already represent modality-specific superpixel prototypes,
-so no second SLIC/GAP stage is added. Independent classification-trained
-selectors retain a fixed number of prototypes per modality. Node-to-selected-
-prototype cosine correlations are computed before pixel projection and then
-mapped through the sparse HSI/LiDAR assignment matrices. Two small residual
-adapters inject the correlation maps into the corresponding pixel graph
-features. A pixel-wise two-way reliability gate replaces fixed HSI/LiDAR
-graph fusion and is initialized from `--graph-modality-lambda`; its output
-continues through the unchanged graph/CNN `--fusion-lambda` fusion.
-
-Unlike the original saliency-oriented SPSN, this branch does not copy
-foreground-superpixel BCE or reliability pseudo-label losses. Pixel
-classification supervision trains the selectors, correlation adapters, and
-reliability gate end to end. The selected indices, mean selection scores, and
-mean modality reliabilities are stored in each run's result JSON at logging
-epochs.
-
-A separate MSSAGF-inspired post-graph consensus interaction is available:
-
-```bash
---post-gat-consensus mssagf-anchor \
---consensus-anchor-count 0 \
---consensus-temperature 0.2 \
---consensus-gamma-init 0 \
---consensus-fusion fixed \
---consensus-writeback direct \
---consensus-reliability-temperature 1.0
-```
-
-It is disabled by default with `--post-gat-consensus none`. An anchor count
-of zero resolves to twice the dataset class count. After both modality-private
-GAT2 layers, HSI and LiDAR nodes independently obtain soft assignments to one
-learnable shared anchor bank. The one-layer modality projections and shared
-anchor queries are L2-normalized before assignment so HSI and LiDAR feature
-scales cannot make one assignment uniformly diffuse and the other collapse.
-Each modality forms anchor features with raw superpixel-area weighting, the
-two anchor sets are fused either with fixed 0.5/0.5 weights or per-anchor
-modality reliability. Adaptive reliability is the softmax of the negative
-area-weighted within-anchor reconstruction errors. The shared node features
-are L2-normalized only in this error-estimation path so HSI FDSM and LiDAR
-geometry features have comparable error units; the consensus values
-themselves remain unchanged. These errors are detached before the softmax,
-preventing the feature encoders from manipulating them to collapse the
-weights. `direct` writes the consensus anchor itself back;
-`difference` writes `consensus - modality_anchor`, removing self-copy and
-making the message an explicit cross-modal correction. Both residual scales
-start at zero by default, so the initial forward pass exactly recovers the
-existing graph branch. Updated nodes are projected exactly once with their
-original sparse assignment matrices, combined by `graph-modality-lambda`, and
-then follow the unchanged graph/CNN fusion.
-
-The three intended ablations are:
-
-```bash
-# Fixed 0.5 consensus + direct write-back
---post-gat-consensus mssagf-anchor \
---consensus-fusion fixed \
---consensus-writeback direct
-
-# Adaptive reliability + direct write-back
---post-gat-consensus mssagf-anchor \
---consensus-fusion adaptive \
---consensus-writeback direct \
---consensus-reliability-temperature 1.0
-
-# Adaptive reliability + difference write-back
---post-gat-consensus mssagf-anchor \
---consensus-fusion adaptive \
---consensus-writeback difference \
---consensus-reliability-temperature 1.0
-```
-
-Each logging record stores both per-anchor modality weights, per-anchor
-weight entropy, detached reconstruction errors, both gamma values, and the
-full area mass of every anchor plus empty-anchor counts.
-
-The SACR extension remains in the same post-GAT2 location and is also
-disabled unless requested. It keeps A3 as the main consensus:
-
-```text
-C0 = r_H * U_H + r_L * U_L
-```
-
-Then it builds an HSI anchor graph and a LiDAR anchor graph from the two
-modality-specific anchor features and only adds a small structure-aligned
-residual:
-
-```text
-C = C0 + eta * structure_gate *
-    (r_H * (G_H U_H - U_H) + r_L * (G_L U_L - U_L))
-```
-
-`eta` is learnable and initializes to zero by default, so the initial forward
-pass exactly recovers A3. This first version deliberately does not add a
-learned anchor graph, an extra GCN block, LayerNorm/GELU, selective write-back
-gate, TV loss, or orthogonal projection loss. It is meant to answer one
-question cleanly: does cross-modal anchor-graph structure alignment improve
-A3?
-
-The intended follow-up ablations are:
-
-```bash
-# E0: A3 main baseline
---post-gat-consensus mssagf-anchor \
---consensus-fusion adaptive \
---consensus-writeback difference
-
-# E1: A3 + SACR, eta initialized to zero, no adaptive structure reliability
---post-gat-consensus mssagf-anchor \
---consensus-fusion adaptive \
---consensus-writeback difference \
---consensus-anchor-reasoning sacr \
---consensus-structure-eta-init 0 \
---consensus-structure-reliability none
-
-# E2: E1 + adaptive structure reliability from the HSI/LiDAR graph gap
---post-gat-consensus mssagf-anchor \
---consensus-fusion adaptive \
---consensus-writeback difference \
---consensus-anchor-reasoning sacr \
---consensus-structure-eta-init 0 \
---consensus-structure-reliability adaptive \
---consensus-structure-temperature 0.1 \
---consensus-anchor-graph-topk 8
-
-# E3: weak orthogonal projection loss is intentionally not implemented yet
-```
-
-When SACR is enabled, logs additionally include eta, HSI/LiDAR anchor-graph
-entropy, graph gap, structure gate min/mean/max, structure residual norm, and
-HSI/LiDAR message norms.
-
-This first ablation has no node gate, extra contrastive loss, or dense
-HSI-by-LiDAR attention. To preserve exactly one cross-modal interaction and
-pure modality-private graph construction, it requires `cross-modal-interaction
-none`, `contrastive-mode none`, `cell-interaction none`, and
-`post-gat-prototype-fusion none`. The implementation adapts the multiview
-anchor-consensus principle of
-[MSSAGF](https://github.com/W-Xinxin/MSSAGF); the reference repository itself
-is a MATLAB clustering method rather than a neural fusion layer. The SACR
-residual borrows the anchor-graph structure-alignment idea from
-[OSMAGC](https://github.com/ZhangYongshan/OSMAGC) without importing its
-orthogonal loss in this first pass.
-
-A separate center-bridge block interaction is available as another post-GAT2
-branch:
-
-```bash
---post-gat-bridge center-block \
---bridge-anchor-count 0 \
---bridge-attention-dk 32 \
---bridge-attention-topk 8 \
---bridge-overlap-metric coverage \
---bridge-overlap-weight 1.0 \
---bridge-spatial-weight 1.0 \
---bridge-height-weight 1.0 \
---bridge-gamma-init 0
-```
-
-It is disabled by default with `--post-gat-bridge none`. A bridge count of
-zero resolves to twice the dataset class count. The module first constructs a
-public spatial bridge assignment `Q_C` from a deterministic grid over the
-image. It then builds `Q_H^T Q_C` and `Q_L^T Q_C` overlap priors, adds
-centroid-distance bias for both modalities, and adds LiDAR height-distribution
-bias for the LiDAR-to-bridge relations. After HSI/LiDAR GAT2, the current
-version uses the full center-bridged block closure:
-
-```text
-H receives: H self-view + C bridge-view + L via C
-C receives: H view + C self-view + L view
-L receives: H via C + C bridge-view + L self-view
-```
-
-The mediated direct HSI-LiDAR blocks are induced by the bridge relations:
-
-```text
-A_HL^C = row_norm(A_HC A_CL)
-A_LH^C = row_norm(A_LC A_CH)
-```
-
-Residual scales for H/C/L initialize to zero, so even the full block matrix
-starts with a safe forward pass equivalent to the original late graph fusion.
-This branch is mutually exclusive with consensus anchors, SPSN-style prototype
-fusion, contrastive loss, cell interaction, and earlier cross-modal graph
-interaction to keep the attribution clean.
-
-A mediator consensus graph can instead be enabled as a third post-GAT2 graph
-branch:
-
-```bash
---post-gat-consensus-graph center-mediator \
+--post-gat-consensus-graph intersection-mediator \
 --consensus-graph-fusion residual-c \
 --consensus-graph-residual-init 0 \
 --consensus-graph-weight 0.1 \
 --consensus-graph-spatial-prior-weight 1.0 \
 --consensus-graph-hsi-prior-weight 0.5 \
 --consensus-graph-lidar-prior-weight 0.5 \
---bridge-anchor-count 0 \
 --bridge-attention-dk 32 \
---bridge-attention-topk 8 \
---bridge-overlap-metric coverage \
---bridge-overlap-weight 1.0 \
---bridge-spatial-weight 1.0 \
---bridge-height-weight 1.0 \
---bridge-gamma-init 0
+--bridge-attention-topk 8
 ```
 
 It is disabled by default with `--post-gat-consensus-graph none`. The mediator
@@ -251,21 +47,9 @@ L_C = B_CL V_L(L)
 C0 = LN(phi([H_C, L_C, abs(H_C - L_C), H_C * L_C, attrs]) + E_C)
 ```
 
-For `intersection-mediator`, `attrs` are the cell attributes from
-`build_common_refinement_cells()`; for `center-mediator`, the same encoder is
-used without cell attributes.
-
-Two mediator node sets are available:
-
-```bash
---post-gat-consensus-graph center-mediator        # deterministic public grid
---post-gat-consensus-graph intersection-mediator  # HSI-SP ∩ LiDAR-SP cells
-```
-
-`center-mediator` uses the public center bridge assignment from the center-block
-ablation. `intersection-mediator` reuses `build_common_refinement_cells()`, so
-each C node is a nonempty HSI-superpixel/LiDAR-superpixel intersection cell and
-requires exactly one superpixel scale.
+`attrs` are the cell attributes from `build_common_refinement_cells()`.
+Each C node is a nonempty HSI-superpixel/LiDAR-superpixel intersection cell,
+so this branch requires exactly one superpixel scale.
 
 The mediator graph is then constructed by C's own Q/K, not by HSI-to-LiDAR
 bipartite attention. The HSI/LiDAR private GAT2 adjacencies only modulate the
@@ -274,7 +58,7 @@ C-QK logits as projected structure priors:
 ```text
 P_C^H = row_norm(B_CH A_H B_HC)
 P_C^L = row_norm(B_CL A_L B_LC)
-P_C^S = center spatial prior or intersection-cell RAG prior
+P_C^S = intersection-cell RAG prior
 
 A_C = TopKSoftmax(
     Q_C K_C^T / sqrt(d)
@@ -348,12 +132,9 @@ cell RAG to a LiDAR-aware weighted RAG:
 ```
 
 This edge mode uses HSI spectral angle, LiDAR height difference, LiDAR boundary
-gradient, and optional HSI/LiDAR boundary conflict. It does not enable the
-original cell interaction branch; it only changes the mediator C-C prior. The
-first ablation keeps mediator consensus mutually exclusive with
-`--post-gat-bridge`, MSSAGF-style anchor write-back, SPSN prototype fusion,
-contrastive losses, cell interaction, and earlier cross-modal graph
-interaction.
+gradient, and optional HSI/LiDAR boundary conflict. It only changes the
+mediator C-C prior; there is no parent-cell-parent feedback branch in the
+main entry point.
 
 The joint pixel CNN is independently selectable:
 
@@ -371,161 +152,32 @@ making the comparison against the original 5x5/5x5 branch primarily a
 kernel-layout comparison. The option is currently available with
 `--graph-layout separate`; `original` remains the default.
 
-An optional training-only contrastive objective can be added to this exact
-Stage-8 pipeline:
-
-```bash
---contrastive-mode overlap-prototype \
---prototype-objective cosine \
---contrastive-weight 0.05 \
---contrastive-temperature 0.2 \
---contrastive-dim 32
-```
-
-It is inserted after the two modality-specific GAT2 layers and immediately
-before their node features are projected back to pixels. Row-normalized
-shared-pixel counts `q_HL` and `q_LH` construct an opposite-modal structural
-prototype for every node: `prototype_L = q_HL @ z_L` and
-`prototype_H = q_LH @ z_H`. The default prototype objective minimizes
-`1 - cosine(node, own_opposite_modal_prototype)` in both directions, without
-using other nodes or prototypes as global negatives. Both directions are
-weighted by
-`1 - entropy(q) / log(number_of_overlapping_nodes)`. Independent projectors
-align only a low-dimensional shared subspace; pixel projection and
-classification continue to use the unprojected modality-private GAT2 node
-features. The projectors and contrastive similarity matrix are skipped in
-evaluation. `--prototype-objective infonce` retains the earlier global
-prototype-negative formulation, while `overlap-soft` remains the
-distribution-cross-entropy ablation. `--contrastive-mode none` is the default.
-
-Overlap-constrained semantic transport distillation is available as a larger
-training-only ablation and is also disabled by default:
-
-```bash
---contrastive-mode overlap-transport \
---transport-semantic-weight 1.0 \
---transport-iterations 10 \
---transport-warmup-epochs 50 \
---contrastive-weight 0.05 \
---variance-weight 0.01 \
---variance-target 1.0 \
---contrastive-temperature 0.2 \
---contrastive-dim 32
-```
-
-The raw shared-pixel matrix `M = Q_H^T Q_L`, normalized by the image pixel
-count, is already a feasible transport plan with HSI/LiDAR superpixel-area
-marginals. For the first `transport-warmup-epochs`, this fixed plan is used
-exactly. Semantic cosine similarity is then linearly introduced over the same
-number of epochs. Log-domain Sinkhorn scaling preserves the area marginals,
-and entries outside the true overlap support remain exactly zero. The
-transport produces bidirectional opposite-modal structural prototypes.
-Independent SimSiam-style predictors match each node to a stop-gradient
-prototype; a small per-dimension variance penalty protects the projected
-shared spaces from collapse. Projectors, predictors, transport, and losses
-are absent from inference. This mode requires one superpixel scale so each
-assignment matrix is a true pixel partition and its area marginals are
-well-defined.
-
-At each logging epoch, the result JSON stores both modalities' full
-per-dimension projector standard deviations, bidirectional and mean
-node-prototype cosine, maximum Sinkhorn row/column marginal errors, transport
-entropy, and semantic-ramp progress. OA, AA, and Kappa remain recorded for
-every run. The retained comparison modes are `none`, `overlap-soft`,
-`overlap-prototype` with either `infonce` or `cosine`, and
-`overlap-transport`.
-
-Intersection-cell RAG interaction is an optional addition to this exact
-pipeline and is disabled by default. Enable it by appending:
-
-```bash
---cell-interaction rag
-```
-
-With this option, the two modality-specific GAT1 outputs are sent to one
-node per nonempty HSI/LiDAR superpixel intersection. The cell nodes run one
-sparse residual GCN over the common-refinement map's 1-hop RAG and return
-coverage-weighted messages to both parent graphs through independent gates.
-The updated parent features are then used by the existing IoU-conditioned
-second-layer Q/K builders. Thus the original joint CNN, HSI FDSM, LiDAR
-RAG-height-KNN, LiDAR low/high modulation, and overlap-Q/K condition remain
-active. This initial cell mode requires one superpixel scale.
-
-Four enhancements can be independently enabled on top of that command:
-
-```bash
---cell-pixel-descriptor mean \
---cell-edge-mode spectral-height-boundary \
---cell-interaction-stages 2 \
---cell-output-branch fixed \
---cell-output-weight 0.3333333333 \
---cell-conflict-weight 1.0 \
---cell-topology-veto soft
-```
-
-`mean` adds the mean HSI-PCA vector and mean LiDAR value of the pixels
-inside each cell. `spectral-height-boundary` replaces binary cell edge
-values with sparse weights based on normalized spectral angle, mean-height
-difference, and average DSM gradient along the shared cell boundary. Two
-interaction stages run separate parent-cell-parent layers after GAT1 and
-GAT2. The fixed output branch projects the latest cell features back with
-the pixel-to-cell assignment and mixes them with the already fused
-HSI/LiDAR graph output. The HSI boundary strength is the average spectral
-angle of pixel pairs across the shared boundary, while the LiDAR boundary
-strength is its average DSM gradient. After separate robust normalization,
-`--cell-conflict-weight` adds their absolute disagreement
-`abs(B_HSI - B_LiDAR)` to the edge penalty. It defaults to `0`, so this
-additional term is disabled unless explicitly requested. The other three
-edge terms can be controlled with
-`--cell-sam-weight`, `--cell-height-weight`, and
-`--cell-boundary-weight`.
-
-Cell-derived topology veto is separately disabled by default. It maps the
-cell adjacency back to both parent graphs:
-
-```text
-S_h = R_h<-c A_c R_c<-h
-S_l = R_l<-c A_c R_c<-l
-```
-
-`--cell-topology-veto soft` applies independent learnable sigmoid gates to
-these support matrices and inserts them into the second-layer Q/K logits
-before Top-K. `hard` masks support below `--cell-veto-threshold` before
-softmax and Top-K; self-loops are always retained. The veto combines with,
-rather than replaces, the LiDAR RAG-height-KNN candidate mask.
-
-All optional enhancements are disabled by default: descriptor `none`, edge
-mode `binary`, one interaction stage, cell output `none`, conflict weight
-`0`, and topology veto `none`. They require `--cell-interaction rag`.
-
 The demo keeps the original
 joint `PCA(HSI)+LiDAR` input, two WMF blocks, original `5x5/5x5` CNN,
 lambda fusion, and classifier. In the default `--graph-layout separate`,
 HSI-SLIC and LiDAR-SLIC use independent WMF graph encoders, spatial priors,
 Q/K graph builders, and GATs. Their graph features are independently
 projected to pixels and fused with `--graph-modality-lambda`; the unchanged
-joint CNN is then fused with that graph result. Use `--graph-layout joint`
-to retain the previous concatenated-node single graph. LiDAR regions default
-to SLIC; `--lidar-segmentation felzenszwalb` remains available.
+joint CNN is then fused with that graph result. When
+`--post-gat-consensus-graph intersection-mediator` is enabled, the graph
+result becomes a private-HSI/private-LiDAR/consensus-C fusion, but the HSI
+and LiDAR private nodes remain unchanged. Use `--graph-layout joint` to
+retain the previous concatenated-node single graph. LiDAR regions default to
+SLIC; `--lidar-segmentation felzenszwalb` remains available.
 
 `--fdsm-scope hsi` applies the original GSDG frequency-domain modulation
 after HSI superpixel pooling. For LiDAR, `--lidar-modulation rag-lowhigh`
 uses a geometry-gated decomposition into RAG-smoothed low-frequency and
 RAG-residual high-frequency node features. The optional
 `--lidar-graph-prior rag-height-knn` restricts LiDAR dynamic Top-k edges with
-a local RAG and elevation similarity. `--cross-modal-interaction
-overlap-qk-condition` aggregates the other modality through the directional
-superpixel-overlap matrix after GAT1 and injects that context into both
-modalities' independent Q/K projections when rebuilding the second graph.
-It does not directly add cross-modal messages to node features.
-`--overlap-metric iou` computes intersection over union before normalizing
-the HSI-to-LiDAR and LiDAR-to-HSI aggregation rows; `coverage` retains the
-earlier intersection-count weighting.
-`overlap-gate` and `overlap-attention` remain available as earlier
-interaction ablations. Each option defaults to `none` or the earlier
-centroid prior for compatibility. The demo does not use a hypergraph or the
-GSDG CNN. Outputs are isolated under
-`model_demo/stage8_overlap_conditioned_qk`.
+a local RAG and elevation similarity. The archived GAT1/GAT2 cross-modal
+interaction, contrastive losses, MSSAGF/SACR anchor write-back, SPSN
+prototype fusion, center-block, center-mediator, and parent-cell-parent cell
+feedback routes are no longer exposed in the main command-line entry point.
+The main line is private dual graphs plus the optional intersection C-GNN
+third branch. The demo does not use a fixed-incidence hypergraph. Outputs are
+isolated under
+`model_demo/stage8_intersection_mediator_cgnn`.
 
 ## Supported datasets
 
@@ -703,47 +355,6 @@ python train.py \
   --pixel-fusion adaptive \
   --device cuda
 ```
-
-## Common-refinement Cell Bridge
-
-`--architecture common-refinement-cell` keeps the HSI GSDG and LiDAR
-Geometry-GSDG internal graphs, but can replace direct cross-modal attention
-with explicit intersection-cell nodes. The feature is disabled by default:
-
-```bash
-python train.py \
-  --architecture common-refinement-cell \
-  --cell-interaction rag \
-  --dataset muufl \
-  --train-samples-per-class 20 \
-  --device cuda
-```
-
-Every nonempty pair `S_h intersect S_l` becomes one cell. A binary parent
-lookup gathers the HSI/LiDAR parent features without attenuation. Cell
-features encode the two parents together with log-area, HSI/LiDAR coverage,
-IoU, centroid distance, and relative y/x. Separate coverage-normalized
-scatter weights then return the cell messages to HSI and LiDAR parents.
-`rag` first propagates the fused cell features through one sparse residual
-GCN on the common-refinement map's binary 1-hop RAG. Independent relation
-gates see the original parent feature, the modality-internal GAT1 message,
-and the returned cell message:
-
-```text
-HSI/LiDAR GAT1 (separate modality graphs)
-  -> parent-to-cell incidence + Cell MLP
-  -> optional cell-cell RAG-GCN
-  -> gated Cell-to-HSI and Cell-to-LiDAR injection
-  -> rebuild both modality-specific graphs
-  -> GAT2
-```
-
-Use `--cell-interaction bridge` to remove only the cell-cell RAG-GCN, or
-`--cell-interaction none` for the matched no-cell ablation. This initial
-`train.py` architecture uses one cell interaction after GAT1 and does not
-enable the four enhanced `demo_train.py` cell options above. It currently
-requires exactly one superpixel scale so that the cells form a true image
-partition.
 
 ## Original HGCN-HL
 
