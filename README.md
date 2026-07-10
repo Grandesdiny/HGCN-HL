@@ -36,10 +36,13 @@ cross-modal branch:
 --bridge-attention-topk 8
 ```
 
-It is disabled by default with `--post-gat-consensus-graph none`. The mediator
-branch never writes messages back to HSI or LiDAR superpixel nodes. The HSI
-and LiDAR private GAT2 nodes are projected to pixels unchanged. In parallel,
-mediator C nodes aggregate HSI/LiDAR node features:
+It is disabled by default with `--post-gat-consensus-graph none`. In the
+default mediator readout, the C branch does not write messages back to HSI or
+LiDAR superpixel nodes: the HSI and LiDAR private GAT2 nodes are projected to
+pixels unchanged, and the C graph is a third pixel branch. The optional
+`--consensus-graph-transport bidirectional` mode instead uses the same C graph
+as a mediator transport kernel before HSI/LiDAR pixel projection. In both
+cases, mediator C nodes aggregate HSI/LiDAR node features:
 
 ```text
 H_C = B_CH V_H(H)
@@ -74,9 +77,40 @@ logits_C = Q_C K_C^T / sqrt(d)
 A_C = TopKSoftmax(mask(logits_C, M_C))
 ```
 
-This adjacency is then used by an independent C-GAT branch. The propagation
-layer reuses the same `MultiHeadGAT` implementation as the private HSI/LiDAR
-graph branches, with the dynamic C-QK adjacency supplied as a weighted graph:
+To use the C graph as an HSI/LiDAR mediator instead of a third pixel branch:
+
+```bash
+--post-gat-consensus-graph intersection-mediator \
+--consensus-graph-transport bidirectional \
+--consensus-graph-transport-lambda 0.5 \
+--consensus-graph-transport-gamma-init 0.0
+```
+
+This reuses the existing incidence matrices and the hard-supported C-QK graph:
+
+```text
+T_C = (1 - lambda_t) I + lambda_t A_C
+Z_L_to_H = R_HC T_C R_CL V_L(L)
+Z_H_to_L = R_LC T_C R_CH V_H(H)
+H' = H + gamma_H g_H W_LH Z_L_to_H
+L' = L + gamma_L g_L W_HL Z_H_to_L
+```
+
+The gates are local node gates:
+
+```text
+g_H = sigmoid(MLP([H, W_LH Z_L_to_H, abs(H - W_LH Z_L_to_H)]))
+g_L = sigmoid(MLP([L, W_HL Z_H_to_L, abs(L - W_HL Z_H_to_L)]))
+```
+
+When this mode is enabled, the original pixel-level C residual/fixed/gated
+third-branch fusion is skipped. The updated `H'` and `L'` are projected to
+pixels and fused with `--graph-modality-lambda`.
+
+When `--consensus-graph-transport none`, this adjacency is then used by an
+independent C-GAT third branch. The propagation layer reuses the same
+`MultiHeadGAT` implementation as the private HSI/LiDAR graph branches, with
+the dynamic C-QK adjacency supplied as a weighted graph:
 
 ```text
 C_GAT = MultiHeadGAT(C0, A_C)
