@@ -44,12 +44,18 @@ mediator C nodes aggregate HSI/LiDAR node features:
 ```text
 H_C = B_CH V_H(H)
 L_C = B_CL V_L(L)
-C0 = LN(phi([H_C, L_C, abs(H_C - L_C), H_C * L_C, attrs]) + E_C)
+R = concat(R_HC, R_LC)
+X_HL = concat(V_H(H), V_L(L))
+I_C = degree_norm(R^T X_HL)
+C0 = LN(phi([H_C, L_C, I_C, abs(H_C - L_C), H_C * L_C, attrs]) + E_C)
 ```
 
 `attrs` are the cell attributes from `build_common_refinement_cells()`.
 Each C node is a nonempty HSI-superpixel/LiDAR-superpixel intersection cell,
 so this branch requires exactly one superpixel scale.
+`I_C` is the explicit incidence context from all HSI/LiDAR parent nodes to
+the intersection C nodes; it is separate from the two modality-specific parent
+contexts `H_C` and `L_C`.
 
 The mediator graph is then constructed by C's own Q/K, not by HSI-to-LiDAR
 bipartite attention. The HSI/LiDAR private GAT2 adjacencies only modulate the
@@ -60,12 +66,12 @@ P_C^H = row_norm(B_CH A_H B_HC)
 P_C^L = row_norm(B_CL A_L B_LC)
 P_C^S = intersection-cell RAG prior
 
-A_C = TopKSoftmax(
-    Q_C K_C^T / sqrt(d)
-  + alpha_s log(P_C^S + eps)
-  + alpha_h log(P_C^H + eps)
-  + alpha_l log(P_C^L + eps)
-)
+M_C = (P_C^S > 0) OR (P_C^H > 0) OR (P_C^L > 0) OR I
+logits_C = Q_C K_C^T / sqrt(d)
+         + alpha_s log(P_C^S + eps)
+         + alpha_h log(P_C^H + eps)
+         + alpha_l log(P_C^L + eps)
+A_C = TopKSoftmax(mask(logits_C, M_C))
 ```
 
 This adjacency is then used by an independent C-GAT branch. The propagation
@@ -86,13 +92,17 @@ message passing. `Z_C2` is projected directly to pixels as
 
 ```text
 F_base = lambda * F_HSI + (1 - lambda) * F_LiDAR
-F_graph = F_base + gamma_c * (F_consensus - F_base)
+r = sigmoid(MLP([F_base, F_consensus, abs(F_consensus - F_base)]))
+F_graph = F_base + gamma_c * r * (F_consensus - F_base)
 ```
 
-`gamma_c` is initialized by `--consensus-graph-residual-init` and defaults to
-zero. This makes the first forward pass exactly match the two-private-graph
-baseline, useful for testing whether accuracy drops are caused by over-strong
-C injection.
+The pixel residual scale `gamma_c` is initialized by
+`--consensus-graph-residual-init` and defaults to zero. The local gate is
+initialized with a small sigmoid output. This makes the first forward pass
+exactly match the two-private-graph baseline, useful for testing whether
+accuracy drops are caused by over-strong C injection. The internal C-GAT
+residual scale is separately controlled by `--consensus-graph-c-gamma-init`
+and defaults to `0.1`.
 
 For a gated ablation, use `--consensus-graph-fusion c-guided-gate`. Its final
 linear layer is zero-weight initialized and biased to the fixed prior

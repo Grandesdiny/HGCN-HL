@@ -178,6 +178,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--consensus-graph-c-gamma-init",
+        type=float,
+        default=0.1,
+        help=(
+            "Initial residual scale of the mediator C-GAT branch "
+            "inside the C graph. Default: 0.1."
+        ),
+    )
+    parser.add_argument(
         "--consensus-graph-cell-edge",
         choices=("binary", "spectral-height-boundary"),
         default="binary",
@@ -347,6 +356,7 @@ def consensus_graph_configuration_tag(args, class_count):
         f"w{args.consensus_graph_weight:g}-"
         f"f{args.consensus_graph_fusion}-"
         f"rg{args.consensus_graph_residual_init:g}-"
+        f"cg{args.consensus_graph_c_gamma_init:g}-"
         f"edge{args.consensus_graph_cell_edge}-"
         f"a{args.consensus_graph_spatial_prior_weight:g}-"
         f"{args.consensus_graph_hsi_prior_weight:g}-"
@@ -1188,7 +1198,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
             else 0
         )
         self.cell_encoder = nn.Sequential(
-            nn.Linear(4 * channels + attribute_channels, channels),
+            nn.Linear(5 * channels + attribute_channels, channels),
             nn.LayerNorm(channels),
             nn.LeakyReLU(),
             nn.Linear(channels, channels),
@@ -1210,7 +1220,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
             alpha=0.2,
             use_edge_weights=True,
         )
-        self.c_gat_gamma = nn.Parameter(torch.tensor(1.0))
+        self.c_gat_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
         self.c_graph_norm = nn.LayerNorm(channels)
         self.c_ffn = nn.Sequential(
             nn.Linear(channels, 2 * channels),
@@ -1344,9 +1354,16 @@ class PostGATMediatedConsensusGraph(nn.Module):
         l_value = self.l_value(lidar_nodes)
         h_context = self.prior_ch @ h_value
         l_context = self.prior_cl @ l_value
+        node_value = torch.cat([h_value, l_value], dim=0)
+        node_to_c = torch.cat([self.prior_hc, self.prior_lc], dim=0)
+        c_degree = node_to_c.sum(dim=0).clamp_min(1e-6)
+        incidence_context = (
+            node_to_c.transpose(0, 1) @ node_value
+        ) / c_degree.unsqueeze(1)
         cell_inputs = [
             h_context,
             l_context,
+            incidence_context,
             torch.abs(h_context - l_context),
             h_context * l_context,
         ]
@@ -1381,7 +1398,22 @@ class PostGATMediatedConsensusGraph(nn.Module):
             + self.lidar_prior_weight
             * torch.log(lidar_prior.clamp_min(1e-6))
         )
-        attention_cc = self._topk_softmax(logits, self.topk)
+        identity_support = torch.eye(
+            logits.shape[0],
+            dtype=torch.bool,
+            device=logits.device,
+        )
+        support_mask = (
+            (spatial_prior > 0.0)
+            | (hsi_prior > 0.0)
+            | (lidar_prior > 0.0)
+            | identity_support
+        )
+        masked_logits = logits.masked_fill(
+            ~support_mask,
+            torch.finfo(logits.dtype).min,
+        )
+        attention_cc = self._topk_softmax(masked_logits, self.topk)
         c_gat_output = self.c_gat(bridge_nodes, attention_cc)
         c_graph_features = self.c_graph_norm(
             bridge_nodes + self.c_gat_gamma * c_gat_output
@@ -1397,6 +1429,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
         consensus_pixel_features = self.graph_projection(
             consensus_pixel_features
         )
+        supported_logits = logits.detach()[support_mask]
         self.last_diagnostics = {
             "c_gamma": float(self.c_gat_gamma.detach().item()),
             "c_gat_gamma": float(self.c_gat_gamma.detach().item()),
@@ -1404,6 +1437,9 @@ class PostGATMediatedConsensusGraph(nn.Module):
             "mediator_kind": self.mediator_kind,
             "attention_cc_entropy": float(
                 self._row_entropy(attention_cc).detach().mean().item()
+            ),
+            "support_density": float(
+                support_mask.float().detach().mean().item()
             ),
             "spatial_prior_entropy": float(
                 self._row_entropy(spatial_prior).detach().mean().item()
@@ -1415,7 +1451,15 @@ class PostGATMediatedConsensusGraph(nn.Module):
                 self._row_entropy(lidar_prior).detach().mean().item()
             ),
             "qk_logit_mean": float(logits.detach().mean().item()),
-            "qk_logit_std": float(logits.detach().std().item()),
+            "qk_logit_std": float(
+                logits.detach().std(unbiased=False).item()
+            ),
+            "supported_qk_logit_mean": float(
+                supported_logits.mean().item()
+            ),
+            "supported_qk_logit_std": float(
+                supported_logits.std(unbiased=False).item()
+            ),
             "prior_weights": (
                 float(self.spatial_prior_weight),
                 float(self.hsi_prior_weight),
@@ -2358,12 +2402,22 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 self.consensus_graph_residual_gamma = nn.Parameter(
                     torch.tensor(float(consensus_graph_residual_init))
                 )
+                residual_gate_output = nn.Linear(hidden_dim, 1)
+                nn.init.zeros_(residual_gate_output.weight)
+                nn.init.constant_(residual_gate_output.bias, -3.0)
+                self.consensus_graph_residual_gate = nn.Sequential(
+                    nn.Linear(3 * hidden_dim, hidden_dim),
+                    nn.LeakyReLU(),
+                    residual_gate_output,
+                )
             else:
                 self.consensus_graph_residual_gamma = None
+                self.consensus_graph_residual_gate = None
         else:
             self.consensus_graph_branch = None
             self.consensus_graph_gate = None
             self.consensus_graph_residual_gamma = None
+            self.consensus_graph_residual_gate = None
 
     def _encode_private_graph_nodes(self, hsi, lidar):
         hsi_nodes = self.hsi_graph.encode_nodes(hsi)
@@ -2491,9 +2545,24 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 }
             elif self.consensus_graph_fusion == "residual-c":
                 residual_gamma = self.consensus_graph_residual_gamma
+                residual_input = torch.cat(
+                    [
+                        private_graph_features,
+                        consensus_graph_features,
+                        torch.abs(
+                            consensus_graph_features
+                            - private_graph_features
+                        ),
+                    ],
+                    dim=1,
+                )
+                residual_gate = torch.sigmoid(
+                    self.consensus_graph_residual_gate(residual_input)
+                )
                 graph_features = (
                     private_graph_features
                     + residual_gamma
+                    * residual_gate
                     * (
                         consensus_graph_features
                         - private_graph_features
@@ -2503,6 +2572,15 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     "fusion_mode": self.consensus_graph_fusion,
                     "residual_gamma": float(
                         residual_gamma.detach().item()
+                    ),
+                    "residual_gate_mean": float(
+                        residual_gate.detach().mean().item()
+                    ),
+                    "residual_gate_min": float(
+                        residual_gate.detach().min().item()
+                    ),
+                    "residual_gate_max": float(
+                        residual_gate.detach().max().item()
                     ),
                     "baseline_weights": [
                         self.graph_modality_lambda,
@@ -2753,6 +2831,7 @@ def train_one_run(
             ),
             bridge_attention_d_k=args.bridge_attention_dk,
             bridge_attention_topk=args.bridge_attention_topk,
+            bridge_gamma_init=args.consensus_graph_c_gamma_init,
             bridge_data=bridge_data,
             fdsm_scope=args.fdsm_scope,
             cnn_branch=args.cnn_branch,
@@ -2852,6 +2931,8 @@ def train_one_run(
                     fusion_suffix = (
                         ", residual="
                         f"{consensus_graph_record['residual_gamma']:.4f}"
+                        ", gate="
+                        f"{consensus_graph_record.get('residual_gate_mean', 0.0):.4f}"
                     )
                 elif "fixed_weights" in consensus_graph_record:
                     fixed_weights = np.asarray(
@@ -2960,6 +3041,10 @@ def validate_args(args):
     if args.consensus_graph_residual_init < 0:
         raise ValueError(
             "--consensus-graph-residual-init must be nonnegative."
+        )
+    if args.consensus_graph_c_gamma_init < 0:
+        raise ValueError(
+            "--consensus-graph-c-gamma-init must be nonnegative."
         )
     if any(
         weight < 0
@@ -3074,7 +3159,8 @@ def main():
                 )
             elif args.consensus_graph_fusion == "residual-c":
                 fusion_detail = (
-                    f"residual gamma-init={args.consensus_graph_residual_init:g}"
+                    "local residual gate, "
+                    f"gamma-init={args.consensus_graph_residual_init:g}"
                 )
             else:
                 fusion_detail = (
@@ -3090,6 +3176,7 @@ def main():
                 f"edge={args.consensus_graph_cell_edge} | "
                 f"C-GAT d_k={args.bridge_attention_dk}, "
                 f"topk={args.bridge_attention_topk} | "
+                f"c-gamma-init={args.consensus_graph_c_gamma_init:g} | "
                 f"alpha S/H/L="
                 f"{args.consensus_graph_spatial_prior_weight:g}/"
                 f"{args.consensus_graph_hsi_prior_weight:g}/"
