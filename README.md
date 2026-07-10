@@ -82,6 +82,7 @@ To use the C graph as an HSI/LiDAR mediator instead of a third pixel branch:
 ```bash
 --post-gat-consensus-graph intersection-mediator \
 --consensus-graph-transport bidirectional \
+--consensus-graph-transport-fusion residual \
 --consensus-graph-transport-lambda 0.5 \
 --consensus-graph-transport-gamma-init 0.0
 ```
@@ -102,6 +103,32 @@ The gates are local node gates:
 g_H = sigmoid(MLP([H, W_LH Z_L_to_H, abs(H - W_LH Z_L_to_H)]))
 g_L = sigmoid(MLP([L, W_HL Z_H_to_L, abs(L - W_HL Z_H_to_L)]))
 ```
+
+For the tri-source graph-level fusion ablation, keep the same C-mediated
+inter-modal messages but also include the private intra-graph messages
+`A_H H` and `A_L L`:
+
+```bash
+--consensus-graph-transport bidirectional \
+--consensus-graph-transport-fusion tri-gate \
+--consensus-graph-transport-lambda 0.0 \
+--consensus-graph-transport-gamma-init 0.1
+```
+
+The update becomes:
+
+```text
+Z_H_intra = A_H H
+Z_L_intra = A_L L
+[a0, a1, a2] = softmax(MLP([H, Z_H_intra, Z_H_inter, abs(H - Z_H_inter)]))
+H_mix = a0 H + a1 Z_H_intra + a2 Z_H_inter
+H' = H + gamma_H (H_mix - H)
+```
+
+LiDAR is symmetric. The tri-gate output bias is initialized to
+`[0.80, 0.15, 0.05]` for `[node, intra, inter]`, so it starts close to the
+existing private node representation while still exposing the intra/inter
+sources.
 
 When this mode is enabled, the original pixel-level C residual/fixed/gated
 third-branch fusion is skipped. The updated `H'` and `L'` are projected to
