@@ -82,6 +82,7 @@ To use the C graph as an HSI/LiDAR mediator instead of a third pixel branch:
 ```bash
 --post-gat-consensus-graph intersection-mediator \
 --consensus-graph-transport bidirectional \
+--consensus-graph-transport-message fixed \
 --consensus-graph-transport-fusion residual \
 --consensus-graph-transport-lambda 0.5 \
 --consensus-graph-transport-gamma-init 0.0
@@ -96,6 +97,30 @@ Z_H_to_L = R_LC T_C R_CH V_H(H)
 H' = H + gamma_H g_H W_LH Z_L_to_H
 L' = L + gamma_L g_L W_HL Z_H_to_L
 ```
+
+For a deeper C-routing-prior cross attention message, replace the fixed
+`Beta V` message with Q/K attention constrained by the same C-mediated routing
+prior:
+
+```bash
+--consensus-graph-transport bidirectional \
+--consensus-graph-transport-message qk-prior \
+--consensus-graph-transport-prior-weight 1.0
+```
+
+```text
+Beta_L_to_H = R_HC T_C R_CL
+A_L_to_H = softmax(Q_H K_L^T / sqrt(d) + eta log(Beta_L_to_H + eps))
+Z_H_inter = A_L_to_H V_L
+
+Beta_H_to_L = R_LC T_C R_CH
+A_H_to_L = softmax(Q_L K_H^T / sqrt(d) + eta log(Beta_H_to_L + eps))
+Z_L_inter = A_H_to_L V_H
+```
+
+The implementation also hard-masks entries where `Beta` is zero, so Q/K can
+choose among C-supported candidates but cannot create unsupported cross-modal
+edges.
 
 The gates are local node gates:
 
@@ -129,6 +154,26 @@ LiDAR is symmetric. The tri-gate output bias is initialized to
 `[0.80, 0.15, 0.05]` for `[node, intra, inter]`, so it starts close to the
 existing private node representation while still exposing the intra/inter
 sources.
+
+For a direct MLP fusion ablation, use:
+
+```bash
+--consensus-graph-transport bidirectional \
+--consensus-graph-transport-fusion concat \
+--consensus-graph-transport-lambda 0.0 \
+--consensus-graph-transport-gamma-init 0.1
+```
+
+This keeps the same three information sources but replaces the softmax gate
+with a learned fusion MLP:
+
+```text
+H_fused = MLP([H, Z_H_intra, Z_H_inter, abs(H - Z_H_inter)])
+H' = H + gamma_H (H_fused - H)
+```
+
+LiDAR is symmetric. This option is intentionally stronger than `tri-gate`,
+so it should be compared against the conservative `tri-gate` initialization.
 
 When this mode is enabled, the original pixel-level C residual/fixed/gated
 third-branch fusion is skipped. The updated `H'` and `L'` are projected to

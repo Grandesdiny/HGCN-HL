@@ -200,14 +200,35 @@ def parse_args():
     )
     parser.add_argument(
         "--consensus-graph-transport-fusion",
-        choices=("residual", "tri-gate"),
+        choices=("residual", "tri-gate", "concat"),
         default="residual",
         help=(
             "Fusion rule inside bidirectional C-mediated transport. "
             "'residual' keeps the existing two-source residual update; "
             "'tri-gate' mixes node state, private intra-graph message, "
-            "and C-mediated inter-modal message with a softmax gate. "
+            "and C-mediated inter-modal message with a softmax gate; "
+            "'concat' fuses the same sources with an MLP. "
             "Default: residual."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-graph-transport-message",
+        choices=("fixed", "qk-prior"),
+        default="fixed",
+        help=(
+            "How to build C-mediated inter-modal transport messages. "
+            "'fixed' uses Beta V directly; 'qk-prior' uses cross-modal "
+            "Q/K attention regularized and hard-supported by Beta. "
+            "Default: fixed."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-graph-transport-prior-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Eta multiplying log(Beta) in qk-prior transport message "
+            "attention. Default: 1."
         ),
     )
     parser.add_argument(
@@ -401,6 +422,8 @@ def consensus_graph_configuration_tag(args, class_count):
         f"cg{args.consensus_graph_c_gamma_init:g}-"
         f"tp{args.consensus_graph_transport}-"
         f"tf{args.consensus_graph_transport_fusion}-"
+        f"tm{args.consensus_graph_transport_message}-"
+        f"tw{args.consensus_graph_transport_prior_weight:g}-"
         f"tl{args.consensus_graph_transport_lambda:g}-"
         f"tg{args.consensus_graph_transport_gamma_init:g}-"
         f"edge{args.consensus_graph_cell_edge}-"
@@ -1223,6 +1246,8 @@ class PostGATMediatedConsensusGraph(nn.Module):
         gamma_init=0.0,
         transport_lambda=0.5,
         transport_fusion="residual",
+        transport_message="fixed",
+        transport_prior_weight=1.0,
         transport_gamma_init=0.0,
         spatial_prior_weight=1.0,
         hsi_prior_weight=0.5,
@@ -1237,6 +1262,8 @@ class PostGATMediatedConsensusGraph(nn.Module):
         self.lidar_prior_weight = lidar_prior_weight
         self.transport_lambda = transport_lambda
         self.transport_fusion = transport_fusion
+        self.transport_message = transport_message
+        self.transport_prior_weight = transport_prior_weight
         anchor_count = int(bridge_data["anchor_count"])
         self.bridge_embedding = nn.Parameter(
             torch.empty(anchor_count, channels)
@@ -1294,6 +1321,26 @@ class PostGATMediatedConsensusGraph(nn.Module):
             channels,
             bias=False,
         )
+        self.h_transport_query = nn.Linear(
+            channels,
+            attention_d_k,
+            bias=False,
+        )
+        self.l_transport_key = nn.Linear(
+            channels,
+            attention_d_k,
+            bias=False,
+        )
+        self.l_transport_query = nn.Linear(
+            channels,
+            attention_d_k,
+            bias=False,
+        )
+        self.h_transport_key = nn.Linear(
+            channels,
+            attention_d_k,
+            bias=False,
+        )
         self.h_intra_proj = nn.Linear(
             channels,
             channels,
@@ -1339,6 +1386,18 @@ class PostGATMediatedConsensusGraph(nn.Module):
             nn.Linear(4 * channels, channels),
             nn.LeakyReLU(),
             l_tri_gate_output,
+        )
+        self.h_concat_fuse = nn.Sequential(
+            nn.Linear(4 * channels, channels),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
+        self.l_concat_fuse = nn.Sequential(
+            nn.Linear(4 * channels, channels),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
         )
         self.h_transport_gamma = nn.Parameter(
             torch.tensor(float(transport_gamma_init))
@@ -1649,12 +1708,65 @@ class PostGATMediatedConsensusGraph(nn.Module):
             + self.transport_lambda * attention_cc
         )
 
-        l_msg_c = self.prior_cl @ l_value
-        l_to_h_raw = self.prior_hc @ (transport_kernel @ l_msg_c)
+        beta_l_to_h = self._row_normalize(
+            (self.prior_hc @ transport_kernel @ self.prior_cl)
+            .clamp_min(0.0)
+        )
+        beta_h_to_l = self._row_normalize(
+            (self.prior_lc @ transport_kernel @ self.prior_ch)
+            .clamp_min(0.0)
+        )
+        if self.transport_message == "fixed":
+            l_to_h_raw = beta_l_to_h @ l_value
+            h_to_l_raw = beta_h_to_l @ h_value
+            l_to_h_attention_entropy = None
+            h_to_l_attention_entropy = None
+        elif self.transport_message == "qk-prior":
+            l_to_h_logits = (
+                self.h_transport_query(hsi_nodes)
+                @ self.l_transport_key(lidar_nodes).transpose(0, 1)
+                * self.scale
+                + self.transport_prior_weight
+                * torch.log(beta_l_to_h.clamp_min(1e-6))
+            )
+            l_to_h_support = beta_l_to_h > 0.0
+            l_to_h_logits = l_to_h_logits.masked_fill(
+                ~l_to_h_support,
+                torch.finfo(l_to_h_logits.dtype).min,
+            )
+            l_to_h_attention = F.softmax(l_to_h_logits, dim=1)
+            l_to_h_raw = l_to_h_attention @ l_value
+            h_to_l_logits = (
+                self.l_transport_query(lidar_nodes)
+                @ self.h_transport_key(hsi_nodes).transpose(0, 1)
+                * self.scale
+                + self.transport_prior_weight
+                * torch.log(beta_h_to_l.clamp_min(1e-6))
+            )
+            h_to_l_support = beta_h_to_l > 0.0
+            h_to_l_logits = h_to_l_logits.masked_fill(
+                ~h_to_l_support,
+                torch.finfo(h_to_l_logits.dtype).min,
+            )
+            h_to_l_attention = F.softmax(h_to_l_logits, dim=1)
+            h_to_l_raw = h_to_l_attention @ h_value
+            l_to_h_attention_entropy = float(
+                self._row_entropy(l_to_h_attention)
+                .detach()
+                .mean()
+                .item()
+            )
+            h_to_l_attention_entropy = float(
+                self._row_entropy(h_to_l_attention)
+                .detach()
+                .mean()
+                .item()
+            )
+        else:
+            raise ValueError(
+                f"Unsupported transport message: {self.transport_message}"
+            )
         l_to_h_message = self.l_to_h_transport(l_to_h_raw)
-
-        h_msg_c = self.prior_ch @ h_value
-        h_to_l_raw = self.prior_lc @ (transport_kernel @ h_msg_c)
         h_to_l_message = self.h_to_l_transport(h_to_l_raw)
 
         h_intra = self.h_intra_proj(hsi_adjacency @ hsi_nodes)
@@ -1696,6 +1808,8 @@ class PostGATMediatedConsensusGraph(nn.Module):
             l_gate_mean = float(l_gate.detach().mean().item())
             h_tri_gate_mean = None
             l_tri_gate_mean = None
+            h_concat_delta_norm = None
+            l_concat_delta_norm = None
         elif self.transport_fusion == "tri-gate":
             h_tri_gate = F.softmax(
                 self.h_tri_gate(
@@ -1751,6 +1865,51 @@ class PostGATMediatedConsensusGraph(nn.Module):
             l_tri_gate_mean = (
                 l_tri_gate.detach().mean(dim=0).cpu().tolist()
             )
+            h_concat_delta_norm = None
+            l_concat_delta_norm = None
+        elif self.transport_fusion == "concat":
+            h_concat_input = torch.cat(
+                [
+                    hsi_nodes,
+                    h_intra,
+                    l_to_h_message,
+                    torch.abs(hsi_nodes - l_to_h_message),
+                ],
+                dim=1,
+            )
+            h_fused = self.h_concat_fuse(h_concat_input)
+            updated_hsi = (
+                hsi_nodes
+                + self.h_transport_gamma * (h_fused - hsi_nodes)
+            )
+            l_concat_input = torch.cat(
+                [
+                    lidar_nodes,
+                    l_intra,
+                    h_to_l_message,
+                    torch.abs(lidar_nodes - h_to_l_message),
+                ],
+                dim=1,
+            )
+            l_fused = self.l_concat_fuse(l_concat_input)
+            updated_lidar = (
+                lidar_nodes
+                + self.l_transport_gamma * (l_fused - lidar_nodes)
+            )
+            h_gate_mean = None
+            l_gate_mean = None
+            h_tri_gate_mean = None
+            l_tri_gate_mean = None
+            h_concat_delta_norm = float(
+                (h_fused - hsi_nodes).detach().norm(dim=1).mean().item()
+            )
+            l_concat_delta_norm = float(
+                (l_fused - lidar_nodes)
+                .detach()
+                .norm(dim=1)
+                .mean()
+                .item()
+            )
         else:
             raise ValueError(
                 f"Unsupported transport fusion: {self.transport_fusion}"
@@ -1760,7 +1919,17 @@ class PostGATMediatedConsensusGraph(nn.Module):
             **c_graph["diagnostics"],
             "transport_mode": "bidirectional",
             "transport_fusion": self.transport_fusion,
+            "transport_message": self.transport_message,
+            "transport_prior_weight": float(self.transport_prior_weight),
             "transport_lambda": float(self.transport_lambda),
+            "l_to_h_beta_density": float(
+                (beta_l_to_h > 0.0).float().detach().mean().item()
+            ),
+            "h_to_l_beta_density": float(
+                (beta_h_to_l > 0.0).float().detach().mean().item()
+            ),
+            "l_to_h_attention_entropy": l_to_h_attention_entropy,
+            "h_to_l_attention_entropy": h_to_l_attention_entropy,
             "h_transport_gamma": float(
                 self.h_transport_gamma.detach().item()
             ),
@@ -1771,6 +1940,8 @@ class PostGATMediatedConsensusGraph(nn.Module):
             "l_transport_gate_mean": l_gate_mean,
             "h_tri_gate_mean": h_tri_gate_mean,
             "l_tri_gate_mean": l_tri_gate_mean,
+            "h_concat_delta_norm": h_concat_delta_norm,
+            "l_concat_delta_norm": l_concat_delta_norm,
             "h_intra_message_norm": float(
                 h_intra.detach().norm(dim=1).mean().item()
             ),
@@ -2559,6 +2730,8 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         consensus_graph_residual_init=0.0,
         consensus_graph_transport="none",
         consensus_graph_transport_fusion="residual",
+        consensus_graph_transport_message="fixed",
+        consensus_graph_transport_prior_weight=1.0,
         consensus_graph_transport_lambda=0.5,
         consensus_graph_transport_gamma_init=0.0,
         consensus_graph_spatial_prior_weight=1.0,
@@ -2677,6 +2850,10 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     gamma_init=bridge_gamma_init,
                     transport_lambda=consensus_graph_transport_lambda,
                     transport_fusion=consensus_graph_transport_fusion,
+                    transport_message=consensus_graph_transport_message,
+                    transport_prior_weight=(
+                        consensus_graph_transport_prior_weight
+                    ),
                     transport_gamma_init=(
                         consensus_graph_transport_gamma_init
                     ),
@@ -3177,6 +3354,12 @@ def train_one_run(
             consensus_graph_transport_fusion=(
                 args.consensus_graph_transport_fusion
             ),
+            consensus_graph_transport_message=(
+                args.consensus_graph_transport_message
+            ),
+            consensus_graph_transport_prior_weight=(
+                args.consensus_graph_transport_prior_weight
+            ),
             consensus_graph_transport_lambda=(
                 args.consensus_graph_transport_lambda
             ),
@@ -3300,6 +3483,10 @@ def train_one_run(
                         "transport_fusion",
                         "residual",
                     )
+                    transport_message = consensus_graph_record.get(
+                        "transport_message",
+                        "fixed",
+                    )
                     if transport_fusion == "tri-gate":
                         h_tri = np.asarray(
                             consensus_graph_record["h_tri_gate_mean"]
@@ -3310,6 +3497,12 @@ def train_one_run(
                         gate_text = (
                             f"tri={h_tri.round(2).tolist()}/"
                             f"{l_tri.round(2).tolist()}"
+                        )
+                    elif transport_fusion == "concat":
+                        gate_text = (
+                            "concat_delta="
+                            f"{consensus_graph_record['h_concat_delta_norm']:.4f}/"
+                            f"{consensus_graph_record['l_concat_delta_norm']:.4f}"
                         )
                     else:
                         gate_text = (
@@ -3322,6 +3515,8 @@ def train_one_run(
                         f"{consensus_graph_record['transport_lambda']:.2f}"
                         ", mode="
                         f"{transport_fusion}"
+                        ", msg="
+                        f"{transport_message}"
                         ", h_gamma="
                         f"{consensus_graph_record['h_transport_gamma']:.4f}"
                         ", l_gamma="
@@ -3456,6 +3651,10 @@ def validate_args(args):
         raise ValueError(
             "--consensus-graph-transport-gamma-init must be nonnegative."
         )
+    if args.consensus_graph_transport_prior_weight < 0:
+        raise ValueError(
+            "--consensus-graph-transport-prior-weight must be nonnegative."
+        )
     if any(
         weight < 0
         for weight in (
@@ -3507,7 +3706,15 @@ def validate_args(args):
         and args.consensus_graph_transport_fusion != "residual"
     ):
         raise ValueError(
-            "--consensus-graph-transport-fusion tri-gate requires "
+            "--consensus-graph-transport-fusion tri-gate/concat requires "
+            "--consensus-graph-transport bidirectional."
+        )
+    if (
+        args.consensus_graph_transport == "none"
+        and args.consensus_graph_transport_message != "fixed"
+    ):
+        raise ValueError(
+            "--consensus-graph-transport-message qk-prior requires "
             "--consensus-graph-transport bidirectional."
         )
     if args.graph_layout == "joint" and args.cnn_branch != "original":
@@ -3577,7 +3784,9 @@ def main():
                 fusion_detail = (
                     "C-mediated bidirectional transport, "
                     f"fusion={args.consensus_graph_transport_fusion}, "
+                    f"message={args.consensus_graph_transport_message}, "
                     f"lambda={args.consensus_graph_transport_lambda:g}, "
+                    f"eta={args.consensus_graph_transport_prior_weight:g}, "
                     f"gamma-init={args.consensus_graph_transport_gamma_init:g}; "
                     "pixel C fusion disabled"
                 )
