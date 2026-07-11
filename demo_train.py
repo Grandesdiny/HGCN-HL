@@ -200,14 +200,16 @@ def parse_args():
     )
     parser.add_argument(
         "--consensus-graph-transport-fusion",
-        choices=("residual", "tri-gate", "concat"),
+        choices=("residual", "tri-gate", "concat", "bilinear"),
         default="residual",
         help=(
             "Fusion rule inside bidirectional C-mediated transport. "
             "'residual' keeps the existing two-source residual update; "
             "'tri-gate' mixes node state, private intra-graph message, "
             "and C-mediated inter-modal message with a softmax gate; "
-            "'concat' fuses the same sources with an MLP. "
+            "'concat' fuses the same sources with an MLP; "
+            "'bilinear' adds low-rank multiplicative evidence before "
+            "the MLP. "
             "Default: residual."
         ),
     )
@@ -1399,6 +1401,49 @@ class PostGATMediatedConsensusGraph(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(channels, channels),
         )
+        bilinear_rank = max(16, channels // 2)
+        self.h_bilinear_left = nn.Linear(
+            channels,
+            bilinear_rank,
+            bias=False,
+        )
+        self.h_bilinear_right = nn.Linear(
+            channels,
+            bilinear_rank,
+            bias=False,
+        )
+        self.h_bilinear_out = nn.Linear(
+            bilinear_rank,
+            channels,
+            bias=False,
+        )
+        self.l_bilinear_left = nn.Linear(
+            channels,
+            bilinear_rank,
+            bias=False,
+        )
+        self.l_bilinear_right = nn.Linear(
+            channels,
+            bilinear_rank,
+            bias=False,
+        )
+        self.l_bilinear_out = nn.Linear(
+            bilinear_rank,
+            channels,
+            bias=False,
+        )
+        self.h_bilinear_fuse = nn.Sequential(
+            nn.Linear(5 * channels, channels),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
+        self.l_bilinear_fuse = nn.Sequential(
+            nn.Linear(5 * channels, channels),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
         self.h_transport_gamma = nn.Parameter(
             torch.tensor(float(transport_gamma_init))
         )
@@ -1810,6 +1855,8 @@ class PostGATMediatedConsensusGraph(nn.Module):
             l_tri_gate_mean = None
             h_concat_delta_norm = None
             l_concat_delta_norm = None
+            h_bilinear_product_norm = None
+            l_bilinear_product_norm = None
         elif self.transport_fusion == "tri-gate":
             h_tri_gate = F.softmax(
                 self.h_tri_gate(
@@ -1867,6 +1914,8 @@ class PostGATMediatedConsensusGraph(nn.Module):
             )
             h_concat_delta_norm = None
             l_concat_delta_norm = None
+            h_bilinear_product_norm = None
+            l_bilinear_product_norm = None
         elif self.transport_fusion == "concat":
             h_concat_input = torch.cat(
                 [
@@ -1910,6 +1959,69 @@ class PostGATMediatedConsensusGraph(nn.Module):
                 .mean()
                 .item()
             )
+            h_bilinear_product_norm = None
+            l_bilinear_product_norm = None
+        elif self.transport_fusion == "bilinear":
+            h_product = self.h_bilinear_out(
+                self.h_bilinear_left(hsi_nodes)
+                * self.h_bilinear_right(l_to_h_message)
+            )
+            h_fused = self.h_bilinear_fuse(
+                torch.cat(
+                    [
+                        hsi_nodes,
+                        h_intra,
+                        l_to_h_message,
+                        torch.abs(hsi_nodes - l_to_h_message),
+                        h_product,
+                    ],
+                    dim=1,
+                )
+            )
+            updated_hsi = (
+                hsi_nodes
+                + self.h_transport_gamma * (h_fused - hsi_nodes)
+            )
+            l_product = self.l_bilinear_out(
+                self.l_bilinear_left(lidar_nodes)
+                * self.l_bilinear_right(h_to_l_message)
+            )
+            l_fused = self.l_bilinear_fuse(
+                torch.cat(
+                    [
+                        lidar_nodes,
+                        l_intra,
+                        h_to_l_message,
+                        torch.abs(lidar_nodes - h_to_l_message),
+                        l_product,
+                    ],
+                    dim=1,
+                )
+            )
+            updated_lidar = (
+                lidar_nodes
+                + self.l_transport_gamma * (l_fused - lidar_nodes)
+            )
+            h_gate_mean = None
+            l_gate_mean = None
+            h_tri_gate_mean = None
+            l_tri_gate_mean = None
+            h_concat_delta_norm = float(
+                (h_fused - hsi_nodes).detach().norm(dim=1).mean().item()
+            )
+            l_concat_delta_norm = float(
+                (l_fused - lidar_nodes)
+                .detach()
+                .norm(dim=1)
+                .mean()
+                .item()
+            )
+            h_bilinear_product_norm = float(
+                h_product.detach().norm(dim=1).mean().item()
+            )
+            l_bilinear_product_norm = float(
+                l_product.detach().norm(dim=1).mean().item()
+            )
         else:
             raise ValueError(
                 f"Unsupported transport fusion: {self.transport_fusion}"
@@ -1942,6 +2054,8 @@ class PostGATMediatedConsensusGraph(nn.Module):
             "l_tri_gate_mean": l_tri_gate_mean,
             "h_concat_delta_norm": h_concat_delta_norm,
             "l_concat_delta_norm": l_concat_delta_norm,
+            "h_bilinear_product_norm": h_bilinear_product_norm,
+            "l_bilinear_product_norm": l_bilinear_product_norm,
             "h_intra_message_norm": float(
                 h_intra.detach().norm(dim=1).mean().item()
             ),
@@ -3504,6 +3618,15 @@ def train_one_run(
                             f"{consensus_graph_record['h_concat_delta_norm']:.4f}/"
                             f"{consensus_graph_record['l_concat_delta_norm']:.4f}"
                         )
+                    elif transport_fusion == "bilinear":
+                        gate_text = (
+                            "bilinear_delta="
+                            f"{consensus_graph_record['h_concat_delta_norm']:.4f}/"
+                            f"{consensus_graph_record['l_concat_delta_norm']:.4f}"
+                            ", product="
+                            f"{consensus_graph_record['h_bilinear_product_norm']:.4f}/"
+                            f"{consensus_graph_record['l_bilinear_product_norm']:.4f}"
+                        )
                     else:
                         gate_text = (
                             "gates="
@@ -3706,8 +3829,8 @@ def validate_args(args):
         and args.consensus_graph_transport_fusion != "residual"
     ):
         raise ValueError(
-            "--consensus-graph-transport-fusion tri-gate/concat requires "
-            "--consensus-graph-transport bidirectional."
+            "--consensus-graph-transport-fusion tri-gate/concat/bilinear "
+            "requires --consensus-graph-transport bidirectional."
         )
     if (
         args.consensus_graph_transport == "none"

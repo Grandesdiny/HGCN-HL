@@ -175,6 +175,28 @@ H' = H + gamma_H (H_fused - H)
 LiDAR is symmetric. This option is intentionally stronger than `tri-gate`,
 so it should be compared against the conservative `tri-gate` initialization.
 
+For multiplicative cross-modal evidence, use the low-rank bilinear fusion
+variant:
+
+```bash
+--consensus-graph-transport bidirectional \
+--consensus-graph-transport-fusion bilinear \
+--consensus-graph-transport-lambda 0.0 \
+--consensus-graph-transport-gamma-init 0.1
+```
+
+This keeps the C-mediated routing and adds a product channel between the
+private node state and the routed inter-modal message:
+
+```text
+P_H = Out_H(Left_H(H) * Right_H(Z_H_inter))
+H_fused = MLP([H, Z_H_intra, Z_H_inter, abs(H - Z_H_inter), P_H])
+H' = H + gamma_H (H_fused - H)
+```
+
+LiDAR is symmetric. The product term is used as an extra evidence channel
+rather than replacing the original GAT2 node representation.
+
 When this mode is enabled, the original pixel-level C residual/fixed/gated
 third-branch fusion is skipped. The updated `H'` and `L'` are projected to
 pixels and fused with `--graph-modality-lambda`.
