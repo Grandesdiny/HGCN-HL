@@ -215,12 +215,21 @@ def parse_args():
     )
     parser.add_argument(
         "--consensus-graph-transport-message",
-        choices=("fixed", "qk-prior"),
+        choices=(
+            "fixed",
+            "qk-prior",
+            "qk-structure-prior",
+            "qk-structure-sinkhorn",
+        ),
         default="fixed",
         help=(
             "How to build C-mediated inter-modal transport messages. "
             "'fixed' uses Beta V directly; 'qk-prior' uses cross-modal "
-            "Q/K attention regularized and hard-supported by Beta. "
+            "Q/K attention regularized and hard-supported by Beta; "
+            "'qk-structure-prior' adds private graph structure priors "
+            "with independent directional softmax; "
+            "'qk-structure-sinkhorn' replaces the two directional "
+            "softmaxes with one area-constrained rectangular coupling. "
             "Default: fixed."
         ),
     )
@@ -243,6 +252,42 @@ def parse_args():
         help=(
             "Eta multiplying log(Beta) in qk-prior transport message "
             "attention. Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-graph-transport-structure-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight for the private-graph structural prior used by "
+            "qk-structure-prior and qk-structure-sinkhorn. Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-graph-transport-structure-steps",
+        type=int,
+        default=1,
+        help=(
+            "Number of private-graph structure refinement steps for "
+            "qk-structure-prior and qk-structure-sinkhorn. Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-graph-transport-sinkhorn-epsilon",
+        type=float,
+        default=0.2,
+        help=(
+            "Entropy regularization epsilon for qk-structure-sinkhorn "
+            "area-constrained transport. Default: 0.2."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-graph-transport-sinkhorn-iterations",
+        type=int,
+        default=10,
+        help=(
+            "Log-domain Sinkhorn iterations for qk-structure-sinkhorn. "
+            "Default: 10."
         ),
     )
     parser.add_argument(
@@ -439,6 +484,10 @@ def consensus_graph_configuration_tag(args, class_count):
         f"tm{args.consensus_graph_transport_message}-"
         f"ts{args.consensus_graph_transport_state}-"
         f"tw{args.consensus_graph_transport_prior_weight:g}-"
+        f"tsw{args.consensus_graph_transport_structure_weight:g}-"
+        f"tss{args.consensus_graph_transport_structure_steps}-"
+        f"tse{args.consensus_graph_transport_sinkhorn_epsilon:g}-"
+        f"tsi{args.consensus_graph_transport_sinkhorn_iterations}-"
         f"tl{args.consensus_graph_transport_lambda:g}-"
         f"tg{args.consensus_graph_transport_gamma_init:g}-"
         f"edge{args.consensus_graph_cell_edge}-"
@@ -1264,6 +1313,10 @@ class PostGATMediatedConsensusGraph(nn.Module):
         transport_message="fixed",
         transport_state="topology-only",
         transport_prior_weight=1.0,
+        transport_structure_weight=1.0,
+        transport_structure_steps=1,
+        transport_sinkhorn_epsilon=0.2,
+        transport_sinkhorn_iterations=10,
         transport_gamma_init=0.0,
         spatial_prior_weight=1.0,
         hsi_prior_weight=0.5,
@@ -1281,6 +1334,10 @@ class PostGATMediatedConsensusGraph(nn.Module):
         self.transport_message = transport_message
         self.transport_state = transport_state
         self.transport_prior_weight = transport_prior_weight
+        self.transport_structure_weight = transport_structure_weight
+        self.transport_structure_steps = transport_structure_steps
+        self.transport_sinkhorn_epsilon = transport_sinkhorn_epsilon
+        self.transport_sinkhorn_iterations = transport_sinkhorn_iterations
         anchor_count = int(bridge_data["anchor_count"])
         self.bridge_embedding = nn.Parameter(
             torch.empty(anchor_count, channels)
@@ -1483,6 +1540,50 @@ class PostGATMediatedConsensusGraph(nn.Module):
             "center",
         )
 
+        cell_area = np.asarray(
+            bridge_data["area"],
+            dtype=np.float32,
+        )
+        prior_ch_np = np.asarray(
+            bridge_data["prior_ch"],
+            dtype=np.float32,
+        )
+        prior_cl_np = np.asarray(
+            bridge_data["prior_cl"],
+            dtype=np.float32,
+        )
+        overlap_counts = prior_ch_np.transpose(1, 0) @ (
+            cell_area[:, None] * prior_cl_np
+        )
+        total_area = max(float(overlap_counts.sum()), 1.0)
+        hsi_mass = overlap_counts.sum(axis=1) / total_area
+        lidar_mass = overlap_counts.sum(axis=0) / total_area
+        overlap_support = overlap_counts > 0
+        self.register_buffer(
+            "hsi_area_mass",
+            torch.as_tensor(
+                hsi_mass,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "lidar_area_mass",
+            torch.as_tensor(
+                lidar_mass,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "exact_overlap_support",
+            torch.as_tensor(
+                overlap_support,
+                dtype=torch.bool,
+            ),
+            persistent=False,
+        )
+
         for name in (
             "prior_hc",
             "prior_ch",
@@ -1579,6 +1680,70 @@ class PostGATMediatedConsensusGraph(nn.Module):
             dim=1,
             keepdim=True,
         ).clamp_min(1e-6)
+
+    @staticmethod
+    def _masked_row_softmax(logits, support):
+        masked_logits = logits.masked_fill(
+            ~support,
+            torch.finfo(logits.dtype).min,
+        )
+        return F.softmax(masked_logits, dim=1)
+
+    @staticmethod
+    def _symmetric_normalize_graph(adjacency):
+        graph = adjacency.detach().clamp_min(0.0)
+        graph = 0.5 * (graph + graph.transpose(0, 1))
+        degree = graph.sum(dim=1).clamp_min(1e-6)
+        inv_sqrt_degree = torch.rsqrt(degree)
+        return (
+            graph
+            * inv_sqrt_degree.unsqueeze(1)
+            * inv_sqrt_degree.unsqueeze(0)
+        )
+
+    def _area_sinkhorn(self, logits, support):
+        epsilon = self.transport_sinkhorn_epsilon
+        log_kernel = logits / epsilon
+        supported_values = log_kernel[support]
+        if supported_values.numel() == 0:
+            raise RuntimeError("Sinkhorn transport has no supported edges.")
+        if not torch.all(support.any(dim=1)):
+            raise RuntimeError(
+                "Sinkhorn transport has HSI nodes without supported edges."
+            )
+        if not torch.all(support.any(dim=0)):
+            raise RuntimeError(
+                "Sinkhorn transport has LiDAR nodes without supported edges."
+            )
+
+        log_kernel = log_kernel - supported_values.max().detach()
+        log_kernel = log_kernel.masked_fill(~support, -torch.inf)
+
+        log_a = torch.log(self.hsi_area_mass.clamp_min(1e-12))
+        log_b = torch.log(self.lidar_area_mass.clamp_min(1e-12))
+        log_u = torch.zeros_like(log_a)
+        log_v = torch.zeros_like(log_b)
+
+        for _ in range(self.transport_sinkhorn_iterations):
+            log_u = log_a - torch.logsumexp(
+                log_kernel + log_v.unsqueeze(0),
+                dim=1,
+            )
+            log_v = log_b - torch.logsumexp(
+                log_kernel + log_u.unsqueeze(1),
+                dim=0,
+            )
+
+        log_coupling = (
+            log_kernel
+            + log_u.unsqueeze(1)
+            + log_v.unsqueeze(0)
+        )
+        return torch.where(
+            support,
+            torch.exp(log_coupling),
+            torch.zeros_like(log_coupling),
+        )
 
     def _project_private_graph_prior(self, left, adjacency, right):
         projected = left @ adjacency.detach() @ right
@@ -1842,12 +2007,18 @@ class PostGATMediatedConsensusGraph(nn.Module):
             (self.prior_lc @ transport_kernel @ self.prior_ch)
             .clamp_min(0.0)
         )
+        sinkhorn_row_error = None
+        sinkhorn_col_error = None
+        sinkhorn_coupling_entropy = None
         if self.transport_message == "fixed":
             l_to_h_raw = beta_l_to_h @ l_value
             h_to_l_raw = beta_h_to_l @ h_value
             l_to_h_attention_entropy = None
             h_to_l_attention_entropy = None
-        elif self.transport_message == "qk-prior":
+        elif self.transport_message in (
+            "qk-prior",
+            "qk-structure-prior",
+        ):
             l_to_h_logits = (
                 self.h_transport_query(hsi_nodes)
                 @ self.l_transport_key(lidar_nodes).transpose(0, 1)
@@ -1856,12 +2027,6 @@ class PostGATMediatedConsensusGraph(nn.Module):
                 * torch.log(beta_l_to_h.clamp_min(1e-6))
             )
             l_to_h_support = beta_l_to_h > 0.0
-            l_to_h_logits = l_to_h_logits.masked_fill(
-                ~l_to_h_support,
-                torch.finfo(l_to_h_logits.dtype).min,
-            )
-            l_to_h_attention = F.softmax(l_to_h_logits, dim=1)
-            l_to_h_raw = l_to_h_attention @ l_value
             h_to_l_logits = (
                 self.l_transport_query(lidar_nodes)
                 @ self.h_transport_key(hsi_nodes).transpose(0, 1)
@@ -1870,11 +2035,85 @@ class PostGATMediatedConsensusGraph(nn.Module):
                 * torch.log(beta_h_to_l.clamp_min(1e-6))
             )
             h_to_l_support = beta_h_to_l > 0.0
-            h_to_l_logits = h_to_l_logits.masked_fill(
-                ~h_to_l_support,
-                torch.finfo(h_to_l_logits.dtype).min,
-            )
-            h_to_l_attention = F.softmax(h_to_l_logits, dim=1)
+            if (
+                self.transport_message == "qk-structure-prior"
+                and self.transport_structure_steps > 0
+                and self.transport_structure_weight > 0
+            ):
+                l_to_h_attention = self._masked_row_softmax(
+                    l_to_h_logits,
+                    l_to_h_support,
+                )
+                h_to_l_attention = self._masked_row_softmax(
+                    h_to_l_logits,
+                    h_to_l_support,
+                )
+                h_graph = self._symmetric_normalize_graph(
+                    hsi_adjacency
+                )
+                l_graph = self._symmetric_normalize_graph(
+                    lidar_adjacency
+                )
+                joint_support = (
+                    (beta_l_to_h > 0.0)
+                    | beta_h_to_l.transpose(0, 1).gt(0.0)
+                    | self.exact_overlap_support
+                )
+                joint_coupling = 0.5 * (
+                    self.hsi_area_mass.unsqueeze(1) * l_to_h_attention
+                    + (
+                        self.lidar_area_mass.unsqueeze(1)
+                        * h_to_l_attention
+                    ).transpose(0, 1)
+                )
+                for _ in range(self.transport_structure_steps):
+                    structural_prior = h_graph @ joint_coupling @ l_graph
+                    structural_prior = (
+                        structural_prior.clamp_min(0.0)
+                        * joint_support.to(structural_prior.dtype)
+                    )
+                    structural_prior = (
+                        structural_prior
+                        + 1e-8 * joint_support.to(structural_prior.dtype)
+                    )
+                    l_to_h_refined_logits = (
+                        l_to_h_logits
+                        + self.transport_structure_weight
+                        * torch.log(structural_prior.clamp_min(1e-8))
+                    )
+                    h_to_l_refined_logits = (
+                        h_to_l_logits
+                        + self.transport_structure_weight
+                        * torch.log(
+                            structural_prior.transpose(0, 1).clamp_min(1e-8)
+                        )
+                    )
+                    l_to_h_attention = self._masked_row_softmax(
+                        l_to_h_refined_logits,
+                        l_to_h_support,
+                    )
+                    h_to_l_attention = self._masked_row_softmax(
+                        h_to_l_refined_logits,
+                        h_to_l_support,
+                    )
+                    joint_coupling = 0.5 * (
+                        self.hsi_area_mass.unsqueeze(1)
+                        * l_to_h_attention
+                        + (
+                            self.lidar_area_mass.unsqueeze(1)
+                            * h_to_l_attention
+                        ).transpose(0, 1)
+                    )
+            else:
+                l_to_h_attention = self._masked_row_softmax(
+                    l_to_h_logits,
+                    l_to_h_support,
+                )
+                h_to_l_attention = self._masked_row_softmax(
+                    h_to_l_logits,
+                    h_to_l_support,
+                )
+            l_to_h_raw = l_to_h_attention @ l_value
             h_to_l_raw = h_to_l_attention @ h_value
             l_to_h_attention_entropy = float(
                 self._row_entropy(l_to_h_attention)
@@ -1886,6 +2125,113 @@ class PostGATMediatedConsensusGraph(nn.Module):
                 self._row_entropy(h_to_l_attention)
                 .detach()
                 .mean()
+                .item()
+            )
+        elif self.transport_message == "qk-structure-sinkhorn":
+            joint_from_hsi = self.hsi_area_mass.unsqueeze(1) * beta_l_to_h
+            joint_from_lidar = (
+                self.lidar_area_mass.unsqueeze(1) * beta_h_to_l
+            ).transpose(0, 1)
+            joint_beta = 0.5 * (joint_from_hsi + joint_from_lidar)
+            joint_support = (
+                (joint_beta > 0.0) | self.exact_overlap_support
+            )
+            overlap_prior = self.exact_overlap_support.to(
+                joint_beta.dtype
+            )
+            overlap_prior = overlap_prior / overlap_prior.sum().clamp_min(
+                1.0
+            )
+            joint_beta = joint_beta + 1e-6 * overlap_prior
+
+            h_to_l_feature_logits = (
+                self.h_transport_query(hsi_nodes)
+                @ self.l_transport_key(lidar_nodes).transpose(0, 1)
+                * self.scale
+            )
+            l_to_h_feature_logits_transposed = (
+                self.l_transport_query(lidar_nodes)
+                @ self.h_transport_key(hsi_nodes).transpose(0, 1)
+                * self.scale
+            ).transpose(0, 1)
+            feature_logits = 0.5 * (
+                h_to_l_feature_logits
+                + l_to_h_feature_logits_transposed
+            )
+            base_logits = (
+                feature_logits
+                + self.transport_prior_weight
+                * torch.log(joint_beta.clamp_min(1e-8))
+            )
+            coupling = self._area_sinkhorn(base_logits, joint_support)
+            if (
+                self.transport_structure_steps > 0
+                and self.transport_structure_weight > 0
+            ):
+                h_graph = self._symmetric_normalize_graph(
+                    hsi_adjacency
+                )
+                l_graph = self._symmetric_normalize_graph(
+                    lidar_adjacency
+                )
+                for _ in range(self.transport_structure_steps):
+                    structural_prior = h_graph @ coupling @ l_graph
+                    structural_prior = (
+                        structural_prior.clamp_min(0.0)
+                        * joint_support.to(structural_prior.dtype)
+                    )
+                    structural_prior = (
+                        structural_prior
+                        + 1e-8 * joint_support.to(structural_prior.dtype)
+                    )
+                    refined_logits = (
+                        base_logits
+                        + self.transport_structure_weight
+                        * torch.log(structural_prior.clamp_min(1e-8))
+                    )
+                    coupling = self._area_sinkhorn(
+                        refined_logits,
+                        joint_support,
+                    )
+            l_to_h_attention = coupling / self.hsi_area_mass.unsqueeze(
+                1
+            ).clamp_min(1e-12)
+            h_to_l_attention = coupling.transpose(
+                0,
+                1,
+            ) / self.lidar_area_mass.unsqueeze(1).clamp_min(1e-12)
+            l_to_h_raw = l_to_h_attention @ l_value
+            h_to_l_raw = h_to_l_attention @ h_value
+            l_to_h_attention_entropy = float(
+                self._row_entropy(l_to_h_attention)
+                .detach()
+                .mean()
+                .item()
+            )
+            h_to_l_attention_entropy = float(
+                self._row_entropy(h_to_l_attention)
+                .detach()
+                .mean()
+                .item()
+            )
+            row_error = torch.abs(
+                coupling.sum(dim=1) - self.hsi_area_mass
+            )
+            col_error = torch.abs(
+                coupling.sum(dim=0) - self.lidar_area_mass
+            )
+            sinkhorn_row_error = float(
+                row_error.detach().mean().item()
+            )
+            sinkhorn_col_error = float(
+                col_error.detach().mean().item()
+            )
+            sinkhorn_coupling_entropy = float(
+                -torch.sum(
+                    coupling
+                    * torch.log(coupling.clamp_min(1e-12))
+                )
+                .detach()
                 .item()
             )
         else:
@@ -2116,6 +2462,18 @@ class PostGATMediatedConsensusGraph(nn.Module):
             "transport_message": self.transport_message,
             "transport_state": self.transport_state,
             "transport_prior_weight": float(self.transport_prior_weight),
+            "transport_structure_weight": float(
+                self.transport_structure_weight
+            ),
+            "transport_structure_steps": int(
+                self.transport_structure_steps
+            ),
+            "transport_sinkhorn_epsilon": float(
+                self.transport_sinkhorn_epsilon
+            ),
+            "transport_sinkhorn_iterations": int(
+                self.transport_sinkhorn_iterations
+            ),
             "transport_lambda": float(self.transport_lambda),
             "c_reliability_mean": (
                 None
@@ -2138,6 +2496,9 @@ class PostGATMediatedConsensusGraph(nn.Module):
             "h_to_l_beta_density": float(
                 (beta_h_to_l > 0.0).float().detach().mean().item()
             ),
+            "sinkhorn_row_error": sinkhorn_row_error,
+            "sinkhorn_col_error": sinkhorn_col_error,
+            "sinkhorn_coupling_entropy": sinkhorn_coupling_entropy,
             "l_to_h_attention_entropy": l_to_h_attention_entropy,
             "h_to_l_attention_entropy": h_to_l_attention_entropy,
             "h_transport_gamma": float(
@@ -2945,6 +3306,10 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         consensus_graph_transport_message="fixed",
         consensus_graph_transport_state="topology-only",
         consensus_graph_transport_prior_weight=1.0,
+        consensus_graph_transport_structure_weight=1.0,
+        consensus_graph_transport_structure_steps=1,
+        consensus_graph_transport_sinkhorn_epsilon=0.2,
+        consensus_graph_transport_sinkhorn_iterations=10,
         consensus_graph_transport_lambda=0.5,
         consensus_graph_transport_gamma_init=0.0,
         consensus_graph_spatial_prior_weight=1.0,
@@ -3067,6 +3432,18 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     transport_state=consensus_graph_transport_state,
                     transport_prior_weight=(
                         consensus_graph_transport_prior_weight
+                    ),
+                    transport_structure_weight=(
+                        consensus_graph_transport_structure_weight
+                    ),
+                    transport_structure_steps=(
+                        consensus_graph_transport_structure_steps
+                    ),
+                    transport_sinkhorn_epsilon=(
+                        consensus_graph_transport_sinkhorn_epsilon
+                    ),
+                    transport_sinkhorn_iterations=(
+                        consensus_graph_transport_sinkhorn_iterations
                     ),
                     transport_gamma_init=(
                         consensus_graph_transport_gamma_init
@@ -3577,6 +3954,18 @@ def train_one_run(
             consensus_graph_transport_prior_weight=(
                 args.consensus_graph_transport_prior_weight
             ),
+            consensus_graph_transport_structure_weight=(
+                args.consensus_graph_transport_structure_weight
+            ),
+            consensus_graph_transport_structure_steps=(
+                args.consensus_graph_transport_structure_steps
+            ),
+            consensus_graph_transport_sinkhorn_epsilon=(
+                args.consensus_graph_transport_sinkhorn_epsilon
+            ),
+            consensus_graph_transport_sinkhorn_iterations=(
+                args.consensus_graph_transport_sinkhorn_iterations
+            ),
             consensus_graph_transport_lambda=(
                 args.consensus_graph_transport_lambda
             ),
@@ -3764,6 +4153,18 @@ def train_one_run(
                             ", c_rel="
                             f"{c_reliability_mean:.3f}"
                         )
+                    sinkhorn_row_error = consensus_graph_record.get(
+                        "sinkhorn_row_error"
+                    )
+                    sinkhorn_col_error = consensus_graph_record.get(
+                        "sinkhorn_col_error"
+                    )
+                    if sinkhorn_row_error is not None:
+                        fusion_suffix += (
+                            ", sh_err="
+                            f"{sinkhorn_row_error:.2e}/"
+                            f"{sinkhorn_col_error:.2e}"
+                        )
                 elif "residual_gamma" in consensus_graph_record:
                     fusion_suffix = (
                         ", residual="
@@ -3895,6 +4296,26 @@ def validate_args(args):
         raise ValueError(
             "--consensus-graph-transport-prior-weight must be nonnegative."
         )
+    if args.consensus_graph_transport_structure_weight < 0:
+        raise ValueError(
+            "--consensus-graph-transport-structure-weight must be "
+            "nonnegative."
+        )
+    if args.consensus_graph_transport_structure_steps < 0:
+        raise ValueError(
+            "--consensus-graph-transport-structure-steps must be "
+            "nonnegative."
+        )
+    if args.consensus_graph_transport_sinkhorn_epsilon <= 0:
+        raise ValueError(
+            "--consensus-graph-transport-sinkhorn-epsilon must be "
+            "positive."
+        )
+    if args.consensus_graph_transport_sinkhorn_iterations <= 0:
+        raise ValueError(
+            "--consensus-graph-transport-sinkhorn-iterations must be "
+            "positive."
+        )
     if any(
         weight < 0
         for weight in (
@@ -3954,7 +4375,7 @@ def validate_args(args):
         and args.consensus_graph_transport_message != "fixed"
     ):
         raise ValueError(
-            "--consensus-graph-transport-message qk-prior requires "
+            "--consensus-graph-transport-message qk modes require "
             "--consensus-graph-transport bidirectional."
         )
     if (
@@ -4036,6 +4457,10 @@ def main():
                     f"state={args.consensus_graph_transport_state}, "
                     f"lambda={args.consensus_graph_transport_lambda:g}, "
                     f"eta={args.consensus_graph_transport_prior_weight:g}, "
+                    f"struct={args.consensus_graph_transport_structure_weight:g}"
+                    f"x{args.consensus_graph_transport_structure_steps}, "
+                    f"sinkhorn={args.consensus_graph_transport_sinkhorn_epsilon:g}"
+                    f"x{args.consensus_graph_transport_sinkhorn_iterations}, "
                     f"gamma-init={args.consensus_graph_transport_gamma_init:g}; "
                     "pixel C fusion disabled"
                 )

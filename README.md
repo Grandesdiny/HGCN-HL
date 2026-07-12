@@ -145,6 +145,60 @@ The implementation also hard-masks entries where `Beta` is zero, so Q/K can
 choose among C-supported candidates but cannot create unsupported cross-modal
 edges.
 
+For a unified rectangular HSI-LiDAR coupling, use the area-constrained
+Sinkhorn message mode:
+
+```bash
+--consensus-graph-transport bidirectional \
+--consensus-graph-transport-message qk-structure-sinkhorn \
+--consensus-graph-transport-prior-weight 1.0 \
+--consensus-graph-transport-structure-weight 1.0 \
+--consensus-graph-transport-structure-steps 1 \
+--consensus-graph-transport-sinkhorn-epsilon 0.2 \
+--consensus-graph-transport-sinkhorn-iterations 10
+```
+
+This does not apply Sinkhorn to the C graph adjacency `A_C`. Instead, it
+uses the C graph to induce an HSI-by-LiDAR routing prior and then solves one
+area-preserving rectangular transport problem:
+
+```text
+J_H = diag(a_H) Beta_L_to_H
+J_L = (diag(a_L) Beta_H_to_L)^T
+Beta_joint = 0.5 * (J_H + J_L)
+
+S = 0.5 * (Q_H K_L^T + (Q_L K_H^T)^T) / sqrt(d)
+Pi = Sinkhorn_aH,aL(S + eta log(Beta_joint + eps))
+```
+
+The row and column marginals are superpixel area masses:
+
+```text
+Pi 1 = a_H
+Pi^T 1 = a_L
+```
+
+The two directional messages are then derived from the same coupling:
+
+```text
+A_L_to_H = diag(a_H)^-1 Pi
+A_H_to_L = diag(a_L)^-1 Pi^T
+Z_H_inter = A_L_to_H V_L
+Z_L_inter = A_H_to_L V_H
+```
+
+When `--consensus-graph-transport-structure-steps` is positive, the coupling
+is refined with private graph structure:
+
+```text
+R = norm(A_H) Pi norm(A_L)
+Pi = Sinkhorn_aH,aL(S + eta log(Beta_joint + eps) + alpha log(R + eps))
+```
+
+`qk-structure-prior` uses the same private-graph structure term but keeps
+the older two independent directional softmaxes. `qk-structure-sinkhorn`
+is the version that enforces one shared area-conserving coupling.
+
 The gates are local node gates:
 
 ```text
