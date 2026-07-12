@@ -82,6 +82,7 @@ To use the C graph as an HSI/LiDAR mediator instead of a third pixel branch:
 ```bash
 --post-gat-consensus-graph intersection-mediator \
 --consensus-graph-transport bidirectional \
+--consensus-graph-transport-state topology-only \
 --consensus-graph-transport-message fixed \
 --consensus-graph-transport-fusion residual \
 --consensus-graph-transport-lambda 0.5 \
@@ -97,6 +98,28 @@ Z_H_to_L = R_LC T_C R_CH V_H(H)
 H' = H + gamma_H g_H W_LH Z_L_to_H
 L' = L + gamma_L g_L W_HL Z_H_to_L
 ```
+
+`--consensus-graph-transport-state topology-only` is the default and keeps
+the previous strict baseline: transport uses only the C topology kernel
+`T_C`. To let the already-built C-GAT state modulate the transport kernel,
+use:
+
+```bash
+--consensus-graph-transport bidirectional \
+--consensus-graph-transport-state cgnn-reliability
+```
+
+This first runs the internal C graph propagation:
+
+```text
+Z_C = C-GNN(C0, A_C)
+r_c = exp(0.5 * tanh(MLP([Z_C, entropy(A_C[c]), attrs_c])))
+T'_C(c,d) = T_C(c,d) * sqrt(r_c r_d)
+```
+
+The reliability head is initialized near `r_c=1`, so this mode starts close
+to topology-only transport while allowing propagated C states to emphasize or
+down-weight C-mediated routes.
 
 For a deeper C-routing-prior cross attention message, replace the fixed
 `Beta V` message with Q/K attention constrained by the same C-mediated routing

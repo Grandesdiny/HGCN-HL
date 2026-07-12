@@ -225,6 +225,18 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--consensus-graph-transport-state",
+        choices=("topology-only", "cgnn-reliability"),
+        default="topology-only",
+        help=(
+            "How the mediator C graph controls bidirectional transport. "
+            "'topology-only' preserves the current implementation. "
+            "'cgnn-reliability' runs C-GAT first and uses the propagated "
+            "C state to modulate the C transport kernel. "
+            "Default: topology-only."
+        ),
+    )
+    parser.add_argument(
         "--consensus-graph-transport-prior-weight",
         type=float,
         default=1.0,
@@ -425,6 +437,7 @@ def consensus_graph_configuration_tag(args, class_count):
         f"tp{args.consensus_graph_transport}-"
         f"tf{args.consensus_graph_transport_fusion}-"
         f"tm{args.consensus_graph_transport_message}-"
+        f"ts{args.consensus_graph_transport_state}-"
         f"tw{args.consensus_graph_transport_prior_weight:g}-"
         f"tl{args.consensus_graph_transport_lambda:g}-"
         f"tg{args.consensus_graph_transport_gamma_init:g}-"
@@ -1249,6 +1262,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
         transport_lambda=0.5,
         transport_fusion="residual",
         transport_message="fixed",
+        transport_state="topology-only",
         transport_prior_weight=1.0,
         transport_gamma_init=0.0,
         spatial_prior_weight=1.0,
@@ -1265,6 +1279,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
         self.transport_lambda = transport_lambda
         self.transport_fusion = transport_fusion
         self.transport_message = transport_message
+        self.transport_state = transport_state
         self.transport_prior_weight = transport_prior_weight
         anchor_count = int(bridge_data["anchor_count"])
         self.bridge_embedding = nn.Parameter(
@@ -1308,6 +1323,19 @@ class PostGATMediatedConsensusGraph(nn.Module):
             nn.Linear(2 * channels, channels),
         )
         self.c_ffn_norm = nn.LayerNorm(channels)
+        reliability_input_dim = channels + attribute_channels + 1
+        reliability_hidden = max(16, channels // 4)
+        self.c_reliability_head = nn.Sequential(
+            nn.Linear(reliability_input_dim, reliability_hidden),
+            nn.LeakyReLU(),
+            nn.Linear(reliability_hidden, 1),
+        )
+        nn.init.normal_(
+            self.c_reliability_head[-1].weight,
+            mean=0.0,
+            std=1e-3,
+        )
+        nn.init.zeros_(self.c_reliability_head[-1].bias)
         self.graph_projection = nn.Sequential(
             nn.Linear(channels, channels),
             nn.BatchNorm1d(channels),
@@ -1685,15 +1713,10 @@ class PostGATMediatedConsensusGraph(nn.Module):
             "diagnostics": diagnostics,
         }
 
-    def forward(self, hsi_nodes, lidar_nodes, hsi_adjacency, lidar_adjacency):
-        c_graph = self._build_c_graph(
-            hsi_nodes,
-            lidar_nodes,
-            hsi_adjacency,
-            lidar_adjacency,
-        )
+    def _propagate_c_state(self, c_graph):
         bridge_nodes = c_graph["bridge_nodes"]
         attention_cc = c_graph["attention_cc"]
+
         c_gat_output = self.c_gat(bridge_nodes, attention_cc)
         c_graph_features = self.c_graph_norm(
             bridge_nodes + self.c_gat_gamma * c_gat_output
@@ -1701,6 +1724,48 @@ class PostGATMediatedConsensusGraph(nn.Module):
         c_ffn_delta = self.c_ffn(c_graph_features)
         updated_bridge = self.c_ffn_norm(
             c_graph_features + c_ffn_delta
+        )
+
+        propagation_diagnostics = {
+            "c_gat_output_norm": float(
+                c_gat_output.detach().norm(dim=1).mean().item()
+            ),
+            "c_ffn_delta_norm": float(
+                c_ffn_delta.detach().norm(dim=1).mean().item()
+            ),
+            "updated_c_state_norm": float(
+                updated_bridge.detach().norm(dim=1).mean().item()
+            ),
+        }
+        return updated_bridge, propagation_diagnostics
+
+    def _c_state_reliability(self, updated_bridge, attention_cc):
+        entropy = self._row_entropy(attention_cc)
+        entropy_scale = max(
+            float(np.log(max(attention_cc.shape[1], 2))),
+            1e-6,
+        )
+        normalized_entropy = (entropy / entropy_scale).unsqueeze(1)
+        reliability_inputs = [updated_bridge, normalized_entropy]
+        if self.cell_attributes is not None:
+            reliability_inputs.append(self.cell_attributes)
+        reliability_logit = self.c_reliability_head(
+            torch.cat(reliability_inputs, dim=1)
+        )
+        reliability = torch.exp(
+            0.5 * torch.tanh(reliability_logit)
+        ).squeeze(1)
+        return reliability
+
+    def forward(self, hsi_nodes, lidar_nodes, hsi_adjacency, lidar_adjacency):
+        c_graph = self._build_c_graph(
+            hsi_nodes,
+            lidar_nodes,
+            hsi_adjacency,
+            lidar_adjacency,
+        )
+        updated_bridge, propagation_diagnostics = (
+            self._propagate_c_state(c_graph)
         )
         consensus_pixel_features = torch.sparse.mm(
             self.bridge_projection_assignment,
@@ -1711,13 +1776,8 @@ class PostGATMediatedConsensusGraph(nn.Module):
         )
         self.last_diagnostics = {
             **c_graph["diagnostics"],
+            **propagation_diagnostics,
             "transport_mode": "none",
-            "c_gat_output_norm": float(
-                c_gat_output.detach().norm(dim=1).mean().item()
-            ),
-            "c_ffn_delta_norm": float(
-                c_ffn_delta.detach().norm(dim=1).mean().item()
-            ),
             "consensus_pixel_norm": float(
                 consensus_pixel_features.detach()
                 .norm(dim=1)
@@ -1748,10 +1808,31 @@ class PostGATMediatedConsensusGraph(nn.Module):
             dtype=attention_cc.dtype,
             device=attention_cc.device,
         )
-        transport_kernel = (
+        base_transport_kernel = (
             (1.0 - self.transport_lambda) * identity
             + self.transport_lambda * attention_cc
         )
+        propagation_diagnostics = {}
+        c_reliability = None
+        if self.transport_state == "topology-only":
+            transport_kernel = base_transport_kernel
+        elif self.transport_state == "cgnn-reliability":
+            updated_bridge, propagation_diagnostics = (
+                self._propagate_c_state(c_graph)
+            )
+            c_reliability = self._c_state_reliability(
+                updated_bridge,
+                attention_cc,
+            )
+            pair_reliability = torch.sqrt(
+                c_reliability.unsqueeze(1)
+                * c_reliability.unsqueeze(0)
+            )
+            transport_kernel = base_transport_kernel * pair_reliability
+        else:
+            raise ValueError(
+                f"Unsupported transport state: {self.transport_state}"
+            )
 
         beta_l_to_h = self._row_normalize(
             (self.prior_hc @ transport_kernel @ self.prior_cl)
@@ -2029,11 +2110,28 @@ class PostGATMediatedConsensusGraph(nn.Module):
 
         self.last_diagnostics = {
             **c_graph["diagnostics"],
+            **propagation_diagnostics,
             "transport_mode": "bidirectional",
             "transport_fusion": self.transport_fusion,
             "transport_message": self.transport_message,
+            "transport_state": self.transport_state,
             "transport_prior_weight": float(self.transport_prior_weight),
             "transport_lambda": float(self.transport_lambda),
+            "c_reliability_mean": (
+                None
+                if c_reliability is None
+                else float(c_reliability.detach().mean().item())
+            ),
+            "c_reliability_min": (
+                None
+                if c_reliability is None
+                else float(c_reliability.detach().min().item())
+            ),
+            "c_reliability_max": (
+                None
+                if c_reliability is None
+                else float(c_reliability.detach().max().item())
+            ),
             "l_to_h_beta_density": float(
                 (beta_l_to_h > 0.0).float().detach().mean().item()
             ),
@@ -2845,6 +2943,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         consensus_graph_transport="none",
         consensus_graph_transport_fusion="residual",
         consensus_graph_transport_message="fixed",
+        consensus_graph_transport_state="topology-only",
         consensus_graph_transport_prior_weight=1.0,
         consensus_graph_transport_lambda=0.5,
         consensus_graph_transport_gamma_init=0.0,
@@ -2965,6 +3064,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     transport_lambda=consensus_graph_transport_lambda,
                     transport_fusion=consensus_graph_transport_fusion,
                     transport_message=consensus_graph_transport_message,
+                    transport_state=consensus_graph_transport_state,
                     transport_prior_weight=(
                         consensus_graph_transport_prior_weight
                     ),
@@ -3471,6 +3571,9 @@ def train_one_run(
             consensus_graph_transport_message=(
                 args.consensus_graph_transport_message
             ),
+            consensus_graph_transport_state=(
+                args.consensus_graph_transport_state
+            ),
             consensus_graph_transport_prior_weight=(
                 args.consensus_graph_transport_prior_weight
             ),
@@ -3601,6 +3704,10 @@ def train_one_run(
                         "transport_message",
                         "fixed",
                     )
+                    transport_state = consensus_graph_record.get(
+                        "transport_state",
+                        "topology-only",
+                    )
                     if transport_fusion == "tri-gate":
                         h_tri = np.asarray(
                             consensus_graph_record["h_tri_gate_mean"]
@@ -3640,6 +3747,8 @@ def train_one_run(
                         f"{transport_fusion}"
                         ", msg="
                         f"{transport_message}"
+                        ", state="
+                        f"{transport_state}"
                         ", h_gamma="
                         f"{consensus_graph_record['h_transport_gamma']:.4f}"
                         ", l_gamma="
@@ -3647,6 +3756,14 @@ def train_one_run(
                         ", "
                         f"{gate_text}"
                     )
+                    c_reliability_mean = consensus_graph_record.get(
+                        "c_reliability_mean"
+                    )
+                    if c_reliability_mean is not None:
+                        fusion_suffix += (
+                            ", c_rel="
+                            f"{c_reliability_mean:.3f}"
+                        )
                 elif "residual_gamma" in consensus_graph_record:
                     fusion_suffix = (
                         ", residual="
@@ -3840,6 +3957,14 @@ def validate_args(args):
             "--consensus-graph-transport-message qk-prior requires "
             "--consensus-graph-transport bidirectional."
         )
+    if (
+        args.consensus_graph_transport == "none"
+        and args.consensus_graph_transport_state != "topology-only"
+    ):
+        raise ValueError(
+            "--consensus-graph-transport-state cgnn-reliability requires "
+            "--consensus-graph-transport bidirectional."
+        )
     if args.graph_layout == "joint" and args.cnn_branch != "original":
         raise ValueError(
             "--cnn-branch gsdg currently requires "
@@ -3908,6 +4033,7 @@ def main():
                     "C-mediated bidirectional transport, "
                     f"fusion={args.consensus_graph_transport_fusion}, "
                     f"message={args.consensus_graph_transport_message}, "
+                    f"state={args.consensus_graph_transport_state}, "
                     f"lambda={args.consensus_graph_transport_lambda:g}, "
                     f"eta={args.consensus_graph_transport_prior_weight:g}, "
                     f"gamma-init={args.consensus_graph_transport_gamma_init:g}; "
