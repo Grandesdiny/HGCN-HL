@@ -374,6 +374,18 @@ def parse_args():
     )
     parser.add_argument("--fusion-lambda", type=float, default=0.5)
     parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument(
+        "--dummy-logit-dim",
+        type=int,
+        default=0,
+        help=(
+            "DuRM-style enlarged classifier output dimension. If set "
+            "larger than the dataset class count, cross entropy is "
+            "computed over all logits but train/test predictions use "
+            "only the first real dataset classes. Default: 0 "
+            "(disabled)."
+        ),
+    )
     parser.add_argument("--dropout", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-interval", type=int, default=10)
@@ -433,6 +445,12 @@ def consensus_graph_configuration_tag(args, class_count):
         f"{args.consensus_graph_hsi_prior_weight:g}-"
         f"{args.consensus_graph_lidar_prior_weight:g}"
     )
+
+
+def dummy_logit_configuration_tag(args, class_count):
+    if args.dummy_logit_dim <= 0:
+        return "dummy-none"
+    return f"dummy{args.dummy_logit_dim}-real{class_count}"
 
 
 def safe_output_filename(stem, suffix, maximum_bytes=240):
@@ -3412,6 +3430,16 @@ def train_one_run(
 ):
     run_seed = args.seed + run_index
     set_seed(run_seed)
+    classifier_output_dim = (
+        class_count
+        if args.dummy_logit_dim <= 0
+        else args.dummy_logit_dim
+    )
+    if classifier_output_dim < class_count:
+        raise ValueError(
+            "--dummy-logit-dim must be zero/disabled or at least the "
+            f"dataset class count ({class_count})."
+        )
     train_indices, test_indices = split_fixed_samples_per_class(
         gt,
         class_count,
@@ -3435,7 +3463,7 @@ def train_one_run(
     common_options = {
         "height": joint_input.shape[0],
         "width": joint_input.shape[1],
-        "class_count": class_count,
+        "class_count": classifier_output_dim,
         "hidden_dim": args.hidden_dim,
         "fusion_lambda": args.fusion_lambda,
         "dynamic_d_k": args.dynamic_dk,
@@ -3526,6 +3554,7 @@ def train_one_run(
         model.train()
         optimizer.zero_grad()
         logits = forward_model()
+        real_class_logits = logits[:, :class_count]
         classification_loss = criterion(
             logits.index_select(0, train_index),
             train_labels,
@@ -3567,9 +3596,12 @@ def train_one_run(
                     }
                     consensus_graph_diagnostics.append(
                         consensus_graph_record
-                    )
+            )
             train_predictions = (
-                logits.index_select(0, train_index).argmax(dim=1)
+                real_class_logits.index_select(
+                    0,
+                    train_index,
+                ).argmax(dim=1)
             )
             train_oa = (
                 train_predictions == train_labels
@@ -3683,6 +3715,7 @@ def train_one_run(
     with torch.no_grad():
         predictions = (
             forward_model()
+            [:, :class_count]
             .index_select(0, test_index)
             .argmax(dim=1)
             .cpu()
@@ -3704,6 +3737,7 @@ def train_one_run(
         f"fdsm-{args.fdsm_scope}_"
         f"cnn-{args.cnn_branch}_"
         f"lidarmod-{args.lidar_modulation}_"
+        f"{dummy_logit_configuration_tag(args, class_count)}_"
         f"run{run_index + 1}"
     )
     checkpoint = args.output_dir / safe_output_filename(
@@ -3723,13 +3757,74 @@ def train_one_run(
         "class_accuracy": class_accuracy.tolist(),
         "training_time": training_time,
         "checkpoint": str(checkpoint),
+        "classifier_output_dim": classifier_output_dim,
+        "real_class_count": class_count,
+        "dummy_logit_count": classifier_output_dim - class_count,
         "consensus_graph_diagnostics": (
             consensus_graph_diagnostics
         ),
     }
 
 
+def normalize_joint_layout_args(args):
+    """Treat separate-only switches as no-ops for the joint graph layout."""
+    if args.graph_layout != "joint":
+        return
+
+    ignored = []
+
+    def reset_if_needed(attribute, default, flag):
+        if getattr(args, attribute) != default:
+            ignored.append(flag)
+            setattr(args, attribute, default)
+
+    reset_if_needed(
+        "post_gat_consensus_graph",
+        "none",
+        "--post-gat-consensus-graph",
+    )
+    reset_if_needed(
+        "consensus_graph_transport",
+        "none",
+        "--consensus-graph-transport",
+    )
+    reset_if_needed(
+        "consensus_graph_transport_fusion",
+        "residual",
+        "--consensus-graph-transport-fusion",
+    )
+    reset_if_needed(
+        "consensus_graph_transport_message",
+        "fixed",
+        "--consensus-graph-transport-message",
+    )
+    reset_if_needed(
+        "consensus_graph_cell_edge",
+        "binary",
+        "--consensus-graph-cell-edge",
+    )
+    reset_if_needed(
+        "lidar_graph_prior",
+        "centroid",
+        "--lidar-graph-prior",
+    )
+    reset_if_needed(
+        "lidar_modulation",
+        "none",
+        "--lidar-modulation",
+    )
+    reset_if_needed("fdsm_scope", "none", "--fdsm-scope")
+    reset_if_needed("cnn_branch", "original", "--cnn-branch")
+
+    if ignored:
+        print(
+            "Joint graph layout: ignoring separate-only options: "
+            + ", ".join(ignored)
+        )
+
+
 def validate_args(args):
+    normalize_joint_layout_args(args)
     if args.train_samples_per_class <= 0:
         raise ValueError("--train-samples-per-class must be positive.")
     if args.epochs <= 0 or args.runs <= 0:
@@ -3855,6 +3950,8 @@ def validate_args(args):
         )
     if args.hidden_dim <= 0:
         raise ValueError("--hidden-dim must be positive.")
+    if args.dummy_logit_dim < 0:
+        raise ValueError("--dummy-logit-dim must be nonnegative.")
     if not 0.0 <= args.dropout < 1.0:
         raise ValueError("--dropout must be in [0, 1).")
 
@@ -3989,6 +4086,16 @@ def main():
         f"top-k={args.dynamic_topk}, tau={args.dynamic_tau}, "
         f"spatial-prior-k={args.spatial_prior_k}"
     )
+    classifier_output_dim = (
+        class_count
+        if args.dummy_logit_dim <= 0
+        else args.dummy_logit_dim
+    )
+    print(
+        f"Classifier logits: {classifier_output_dim} | "
+        f"evaluated real classes: {class_count} | "
+        f"dummy logits: {max(0, classifier_output_dim - class_count)}"
+    )
     print(
         f"Split: exactly {args.train_samples_per_class} "
         "training pixels per class"
@@ -4046,7 +4153,8 @@ def main():
         f"{consensus_graph_configuration_tag(args, class_count)}_"
         f"fdsm-{args.fdsm_scope}_"
         f"cnn-{args.cnn_branch}_"
-        f"lidarmod-{args.lidar_modulation}_results"
+        f"lidarmod-{args.lidar_modulation}_"
+        f"{dummy_logit_configuration_tag(args, class_count)}_results"
     )
     result_path = args.output_dir / safe_output_filename(
         result_stem,
