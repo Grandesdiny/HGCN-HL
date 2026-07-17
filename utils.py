@@ -3,31 +3,80 @@ import numpy as np
 import random
 import torch
 import torch.nn as nn
+from pathlib import Path
 from operator import index, truediv
 from sklearn.decomposition import PCA
 from skimage.segmentation import slic,  felzenszwalb
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, hstack
 from sklearn.metrics import confusion_matrix,ConfusionMatrixDisplay, accuracy_score, classification_report, cohen_kappa_score
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-def get_HSI_LiDAR_data(name):
+def _dataset_dir(name, data_root=None):
+    if data_root is None:
+        return Path(__file__).resolve().parent / "data" / name
+
+    data_root = Path(data_root).expanduser().resolve()
+    if data_root.name.lower() == name.lower():
+        return data_root
+    return data_root / name
+
+
+def _load_first_mat(dataset_dir, candidates):
+    for filename, key in candidates:
+        path = dataset_dir / filename
+        if path.exists():
+            data = sio.loadmat(path)
+            if key not in data:
+                raise KeyError(f"Variable '{key}' was not found in {path}.")
+            return data[key]
+    filenames = ", ".join(filename for filename, _ in candidates)
+    raise FileNotFoundError(
+        f"None of the expected files were found in {dataset_dir}: {filenames}"
+    )
+
+
+def get_HSI_LiDAR_data(name, data_root=None):
+    dataset_dir = _dataset_dir(name, data_root)
+
     if name == 'MUUFL':
-        X_HSI = sio.loadmat('data\MUUFL\hsi_data.mat')['hsi_data']
-        X_LiDAR = sio.loadmat('data\MUUFL\lidar_data.mat')['lidar_data']
-        Y = sio.loadmat('data\MUUFL\labels.mat')['labels']
+        X_HSI = sio.loadmat(dataset_dir / 'HSI.mat')['HSI']
+        X_LiDAR = sio.loadmat(dataset_dir / 'LiDAR.mat')['LiDAR']
+        Y = sio.loadmat(dataset_dir / 'gt.mat')['gt']
 
         Y = np.where(Y==-1,0,Y)
 
-        X_LiDAR = X_LiDAR[:,:,0]
+        if X_LiDAR.ndim == 3:
+            X_LiDAR = X_LiDAR[:, :, 0]
         target_names = ['Trees','Grass_Pure','Grass_Groundsurface','Dirt_And_Sand', 'Road_Materials','Water',"Buildings'_Shadow",
                     'Buildings','Sidewalk','Yellow_Curb','ClothPanels']
         class_num = 11
         n_input_size = 64
     elif name == 'Houston2013':
-        X_HSI = sio.loadmat('data\Houston2013\Houston_HS.mat')['Houston_HS']
-        X_LiDAR = sio.loadmat('data\Houston2013\Houston_LiDAR.mat')['Houston_LiDAR']
-        Y = sio.loadmat('data\Houston2013\Houston_Label.mat')['Houston_Label']
+        X_HSI = _load_first_mat(
+            dataset_dir,
+            [
+                ('houston_hsi.mat', 'houston_hsi'),
+                ('HSI.mat', 'HSI'),
+                ('Houston_HS.mat', 'Houston_HS'),
+            ],
+        )
+        X_LiDAR = _load_first_mat(
+            dataset_dir,
+            [
+                ('houston_lidar.mat', 'houston_lidar'),
+                ('LiDAR.mat', 'LiDAR'),
+                ('Houston_LiDAR.mat', 'Houston_LiDAR'),
+            ],
+        )
+        Y = _load_first_mat(
+            dataset_dir,
+            [
+                ('houston_gt.mat', 'gt'),
+                ('gt.mat', 'gt'),
+                ('Houston_Label.mat', 'Houston_Label'),
+            ],
+        )
         target_names = ['Healthy grass', 'Stressed grass', 'Synthetic grass'
                         ,'Trees', 'Soil', 'Water', 
                         'Residential', 'Commercial', 'Road', 'Highway',
@@ -36,9 +85,12 @@ def get_HSI_LiDAR_data(name):
         class_num = 15
         n_input_size = 144
     elif name == 'Trento':
-        X_HSI = sio.loadmat('data\Trento\HSI.mat')['HSI']
-        X_LiDAR = sio.loadmat('data\Trento\LiDAR.mat')['LiDAR']
-        Y = sio.loadmat('data\Trento\Label.mat')['Label']
+        X_HSI = sio.loadmat(dataset_dir / 'HSI.mat')['HSI']
+        X_LiDAR = sio.loadmat(dataset_dir / 'LiDAR.mat')['LiDAR']
+        Y = _load_first_mat(
+            dataset_dir,
+            [('trento_gt.mat', 'gt'), ('Label.mat', 'Label')],
+        )
         target_names = ['Healthy grass', 'Stressed grass', 'Synthetic grass'
                         ,'Trees', 'Soil', 'Water', 
                         'Residential', 'Commercial', 'Road', 'Highway',
@@ -47,9 +99,9 @@ def get_HSI_LiDAR_data(name):
         class_num = 6
         n_input_size = 63
     elif name == 'Augsburg':
-        X_HSI = sio.loadmat(r'data\Augsburg\augsburg_hsi.mat')['augsburg_hsi']
-        X_LiDAR = sio.loadmat(r'data\Augsburg\augsburg_sar.mat')['augsburg_sar']
-        Y = sio.loadmat(r'data\Augsburg\augsburg_gt.mat')['augsburg_gt']
+        X_HSI = sio.loadmat(dataset_dir / 'augsburg_hsi.mat')['augsburg_hsi']
+        X_LiDAR = sio.loadmat(dataset_dir / 'augsburg_sar.mat')['augsburg_sar']
+        Y = sio.loadmat(dataset_dir / 'augsburg_gt.mat')['augsburg_gt']
         X_LiDAR = X_LiDAR[:,:,3]
         target_names = ['Healthy grass', 'Stressed grass', 'Synthetic grass'
                         ,'Trees', 'Soil', 'Water', 
@@ -60,22 +112,24 @@ def get_HSI_LiDAR_data(name):
         n_input_size = 180
     
     return X_HSI,X_LiDAR,Y,class_num,n_input_size,target_names
-def get_dataset(FLAG):
+
+
+def get_dataset(FLAG, data_root=None):
     if FLAG == 1:
         name = 'MUUFL'
-        (X_HSI,X_LiDAR,gt,class_num,n_input_size,target_names) = get_HSI_LiDAR_data(name)
+        (X_HSI,X_LiDAR,gt,class_num,n_input_size,target_names) = get_HSI_LiDAR_data(name, data_root)
         pass
     elif FLAG == 2:
         name = 'Houston2013'
-        (X_HSI,X_LiDAR,gt,class_num,n_input_size,target_names) = get_HSI_LiDAR_data(name)
+        (X_HSI,X_LiDAR,gt,class_num,n_input_size,target_names) = get_HSI_LiDAR_data(name, data_root)
         pass
     elif FLAG == 3:
         name = 'Trento'
-        (X_HSI,X_LiDAR,gt,class_num,n_input_size,target_names) = get_HSI_LiDAR_data(name)
+        (X_HSI,X_LiDAR,gt,class_num,n_input_size,target_names) = get_HSI_LiDAR_data(name, data_root)
         pass
     elif FLAG == 4:
         name = 'Augsburg'
-        (X_HSI,X_LiDAR,gt,class_num,n_input_size,target_names) = get_HSI_LiDAR_data(name)
+        (X_HSI,X_LiDAR,gt,class_num,n_input_size,target_names) = get_HSI_LiDAR_data(name, data_root)
         pass
     return X_HSI,X_LiDAR, gt, class_num
 
@@ -137,8 +191,8 @@ def get_TrainValTest_Sets(seed: int, gt: np.array, class_count: int, train_ratio
         val_data_index = list(val_data_index)
     
     if samples_type == 'same_num':
-        if int(train_ratio) == 0 or int(val_ratio) == 0:
-            print("ERROR: The number of samples for train. or val. is equal to 0.")
+        if int(train_ratio) == 0:
+            print("ERROR: The number of samples for training is equal to 0.")
             exit(-1)
         for i in range(class_count):
             idx = np.where(gt_reshape == i + 1)[-1]
@@ -279,33 +333,71 @@ class CResult():
         # return self
 
 
-def get_SLIC_Segs(Img, SLIC_scale):
+def _segments_to_assignment(segments, sparse_output=False):
+    flat_segments = np.reshape(segments, (-1,))
+    segment_ids = np.unique(flat_segments)
+    remap = {segment_id: index for index, segment_id in enumerate(segment_ids)}
+    columns = np.fromiter(
+        (remap[segment_id] for segment_id in flat_segments),
+        dtype=np.int64,
+        count=flat_segments.size,
+    )
+    rows = np.arange(flat_segments.size)
+    values = np.ones(flat_segments.size, dtype=np.float32)
+    assignment = coo_matrix(
+        (values, (rows, columns)),
+        shape=(flat_segments.size, segment_ids.size),
+        dtype=np.float32,
+    ).tocsr()
+    return assignment if sparse_output else assignment.toarray()
+
+
+def get_SLIC_Segs(Img, SLIC_scale, sparse_output=False):
     h,w = Img.shape[0],Img.shape[1]
     # SLIC Parameters
     ###### SLIC  #########
-    n_SLIC_segs = h*w/SLIC_scale
-    SLIC_segs = slic(Img, n_SLIC_segs)
-    SLIC_segs = np.reshape(SLIC_segs,(-1))
-    id_Segs = np.unique(SLIC_segs)
-    n_Segs = len(id_Segs)
-    H_SLIC = coo_matrix((h*w,n_Segs),dtype=np.int8).toarray()
-    for j in range(len(id_Segs)):
-        idx = np.where(SLIC_segs == id_Segs[j])
-        H_SLIC[idx, j] = 1
-    
-    return H_SLIC
-def get_felzenszwalb_Segs(Img, SLIC_scale):
+    if Img.ndim == 3 and Img.shape[-1] == 1:
+        Img = Img[:, :, 0]
+    channel_axis = -1 if Img.ndim == 3 else None
+    n_SLIC_segs = max(1, int(round(h*w/SLIC_scale)))
+    SLIC_segs = slic(
+        Img,
+        n_segments=n_SLIC_segs,
+        channel_axis=channel_axis,
+        start_label=0,
+    )
+    return _segments_to_assignment(SLIC_segs, sparse_output)
+
+
+def get_felzenszwalb_Segs(Img, SLIC_scale, sparse_output=False):
     h,w = Img.shape[0],Img.shape[1]
-    SLIC_segs = felzenszwalb(Img, scale=1,sigma=0.5,min_size=SLIC_scale)
-    SLIC_segs = np.reshape(SLIC_segs,(-1))
-    id_Segs = np.unique(SLIC_segs)
-    n_Segs = len(id_Segs)
-    H_SLIC = coo_matrix((h*w,n_Segs),dtype=np.int8).toarray()
-    for j in range(len(id_Segs)):
-        idx = np.where(SLIC_segs == id_Segs[j])
-        H_SLIC[idx, j] = 1
-    return H_SLIC
-def obtain_H_from_HSI_with_LiDAR(HSI,LiDAR, scales):   
+    if Img.ndim == 3 and Img.shape[-1] == 1:
+        Img = Img[:, :, 0]
+    channel_axis = -1 if Img.ndim == 3 else None
+    SLIC_segs = felzenszwalb(
+        Img,
+        scale=1,
+        sigma=0.5,
+        min_size=int(SLIC_scale),
+        channel_axis=channel_axis,
+    )
+    return _segments_to_assignment(SLIC_segs, sparse_output)
+
+
+def obtain_H_from_HSI_with_LiDAR(
+    HSI,
+    LiDAR,
+    scales,
+    lidar_segmentation='felzenszwalb',
+    return_separate=False,
+    sparse_output=False,
+):
+    lidar_segmentation = lidar_segmentation.lower()
+    if lidar_segmentation not in {'felzenszwalb', 'slic'}:
+        raise ValueError(
+            "lidar_segmentation must be either 'felzenszwalb' or 'slic'."
+        )
+
     h,w = HSI.shape[0],HSI.shape[1]
     Img = np.reshape(HSI,(-1,HSI.shape[2]))
     
@@ -319,21 +411,52 @@ def obtain_H_from_HSI_with_LiDAR(HSI,LiDAR, scales):
     X_3Band = (X_3Band - min_value) * 255 / (max_value - min_value)
     # 将数据转换为整型
     X_3Band = X_3Band.astype(np.uint8)
-    H = None
-    index = 0
+    hsi_incidence_parts = []
+    lidar_incidence_parts = []
+    joint_incidence_parts = []
     for scale in scales:
-        H_HSI = get_SLIC_Segs(Img,scale)
-        H_LiDAR = get_felzenszwalb_Segs(LiDAR,scale)
-        H_HSI_LiDAR = np.concatenate([H_HSI,H_LiDAR],axis = 1)
-        # H_HSI_LiDAR = H_LiDAR
-        # H_HSI_LiDAR = H_HSI
-        if index == 0:
-            H = H_HSI_LiDAR
-            index = 1
+        H_HSI = get_SLIC_Segs(
+            Img,
+            scale,
+            sparse_output=sparse_output,
+        )
+        if lidar_segmentation == 'slic':
+            H_LiDAR = get_SLIC_Segs(
+                LiDAR,
+                scale,
+                sparse_output=sparse_output,
+            )
         else:
-            H = np.concatenate([H,H_HSI_LiDAR],axis = 1)
+            H_LiDAR = get_felzenszwalb_Segs(
+                LiDAR,
+                scale,
+                sparse_output=sparse_output,
+            )
+        hsi_incidence_parts.append(H_HSI)
+        lidar_incidence_parts.append(H_LiDAR)
+        if not return_separate:
+            if sparse_output:
+                joint_incidence_parts.append(
+                    hstack([H_HSI, H_LiDAR], format='csr')
+                )
+            else:
+                joint_incidence_parts.append(
+                    np.concatenate([H_HSI, H_LiDAR], axis=1)
+                )
 
-    return H
+    if return_separate:
+        concatenate = (
+            lambda parts: hstack(parts, format='csr')
+            if sparse_output
+            else np.concatenate(parts, axis=1)
+        )
+        return (
+            concatenate(hsi_incidence_parts),
+            concatenate(lidar_incidence_parts),
+        )
+    if sparse_output:
+        return hstack(joint_incidence_parts, format='csr')
+    return np.concatenate(joint_incidence_parts, axis=1)
 def getnestedgeindex(x:torch.tensor,block_size:int = 500,k:int = 50,startedgeid = 100):
     edge_index = []
     edge_weight = []
