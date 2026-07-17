@@ -4,9 +4,11 @@ The fixed hypergraph/HGCN path is replaced by GSDG graph/GAT propagation.
 The default uses independent HSI and LiDAR graphs; the previous concatenated
 node graph remains selectable. The LiDAR graph can additionally restrict its
 dynamic neighbors with a local RAG and an elevation-similarity KNN. The
-original joint CNN and fusion remain. The only exposed cross-modal graph
-branch is a post-GAT2 intersection-cell mediator C graph with its own C-GAT
-message passing and pixel readout.
+original joint CNN and fusion remain. Cross-modal interaction is optional:
+the older post-GAT2 intersection-cell mediator C graph is retained, while the
+newer path treats C as a cross-modal overlap bipartite graph over HSI/LiDAR
+superpixel nodes and performs alternating propagation between private GAT
+stages.
 """
 
 import argparse
@@ -131,6 +133,67 @@ def parse_args():
         type=float,
         default=0.5,
         help="HSI weight when fusing the two separate graph outputs.",
+    )
+    parser.add_argument(
+        "--cross-graph",
+        choices=("none", "overlap-bipartite"),
+        default="none",
+        help=(
+            "Optional cross-modal graph. 'overlap-bipartite' treats "
+            "C as E_HL over HSI/LiDAR superpixel nodes instead of an "
+            "extra intersection-cell node graph. Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--cross-propagation",
+        choices=("single", "alternating"),
+        default="alternating",
+        help=(
+            "Propagation schedule for --cross-graph overlap-bipartite. "
+            "'single' applies one cross update after GAT2; "
+            "'alternating' applies Cross1 after GAT1 and optional "
+            "Cross2 after GAT2. Default: alternating."
+        ),
+    )
+    parser.add_argument(
+        "--cross-affinity",
+        choices=("bilinear",),
+        default="bilinear",
+        help=(
+            "Semantic confidence used on overlap bipartite edges. "
+            "Default: bilinear."
+        ),
+    )
+    parser.add_argument(
+        "--cross-rounds",
+        type=int,
+        default=2,
+        help=(
+            "Number of overlap-bipartite cross propagation rounds. "
+            "Use 1 for GAT1->Cross1->GAT2, 2 for "
+            "GAT1->Cross1->GAT2->Cross2. Default: 2."
+        ),
+    )
+    parser.add_argument(
+        "--cross-gamma-init",
+        type=float,
+        default=0.1,
+        help="Initial gamma for the first bipartite cross update.",
+    )
+    parser.add_argument(
+        "--cross-second-gamma-init",
+        type=float,
+        default=0.0,
+        help="Initial gamma for the second bipartite cross update.",
+    )
+    parser.add_argument(
+        "--cross-share-weights",
+        action="store_true",
+        help=(
+            "Use the same bilinear/message/gate parameters for both "
+            "overlap-bipartite rounds. Current implementation uses "
+            "shared weights and separate gammas."
+        ),
     )
     # Archived ablation switches are kept as hidden compatibility flags
     # but their active choices are removed from the main entry point.
@@ -451,6 +514,20 @@ def dummy_logit_configuration_tag(args, class_count):
     if args.dummy_logit_dim <= 0:
         return "dummy-none"
     return f"dummy{args.dummy_logit_dim}-real{class_count}"
+
+
+def cross_graph_configuration_tag(args):
+    if args.cross_graph == "none":
+        return "xg-none"
+    return (
+        f"xg-{args.cross_graph}-"
+        f"prop{args.cross_propagation}-"
+        f"aff{args.cross_affinity}-"
+        f"r{args.cross_rounds}-"
+        f"g{args.cross_gamma_init:g}-"
+        f"g2{args.cross_second_gamma_init:g}-"
+        f"share{int(args.cross_share_weights)}"
+    )
 
 
 def safe_output_filename(stem, suffix, maximum_bytes=240):
@@ -934,6 +1011,28 @@ def _dense_overlap(source_assignment, target_assignment):
     if issparse(overlap):
         overlap = overlap.toarray()
     return np.asarray(overlap, dtype=np.float32)
+
+
+def build_symmetric_cross_modal_overlap(hsi_assignment, lidar_assignment):
+    """Build O_ij / sqrt(|S_i^H| |S_j^L|) for HSI-LiDAR edges."""
+    overlap = _dense_overlap(hsi_assignment, lidar_assignment)
+    hsi_area = np.asarray(
+        hsi_assignment.sum(axis=0)
+    ).reshape(-1).astype(np.float32)
+    lidar_area = np.asarray(
+        lidar_assignment.sum(axis=0)
+    ).reshape(-1).astype(np.float32)
+    denominator = np.sqrt(
+        np.maximum(hsi_area[:, None], 1.0)
+        * np.maximum(lidar_area[None, :], 1.0)
+    )
+    normalized = np.divide(
+        overlap,
+        denominator,
+        out=np.zeros_like(overlap, dtype=np.float32),
+        where=overlap > 0,
+    )
+    return normalized.astype(np.float32)
 
 
 def _directional_overlap_prior(
@@ -2459,6 +2558,189 @@ class RAGLowHighModulation(nn.Module):
         return self.output_norm(modulated)
 
 
+class OverlapBipartiteCrossPropagation(nn.Module):
+    """Cross-modal bipartite propagation over nonzero HSI/LiDAR overlap."""
+
+    def __init__(
+        self,
+        channels,
+        overlap_prior,
+        gamma_init=0.1,
+        second_gamma_init=0.0,
+        affinity_dim=None,
+    ):
+        super().__init__()
+        overlap_prior = torch.as_tensor(
+            overlap_prior,
+            dtype=torch.float32,
+        )
+        if overlap_prior.ndim != 2:
+            raise ValueError("overlap_prior must be a 2-D matrix.")
+        self.register_buffer(
+            "overlap_prior",
+            overlap_prior,
+            persistent=False,
+        )
+        self.register_buffer(
+            "support_mask",
+            overlap_prior > 0,
+            persistent=False,
+        )
+        affinity_dim = (
+            max(16, channels // 2)
+            if affinity_dim is None
+            else affinity_dim
+        )
+        self.affinity_dim = affinity_dim
+        self.h_bilinear = nn.Linear(
+            channels,
+            affinity_dim,
+            bias=False,
+        )
+        self.l_bilinear = nn.Linear(
+            channels,
+            affinity_dim,
+            bias=False,
+        )
+        self.l_to_h_value = nn.Linear(
+            channels,
+            channels,
+            bias=False,
+        )
+        self.h_to_l_value = nn.Linear(
+            channels,
+            channels,
+            bias=False,
+        )
+        self.h_gate = nn.Sequential(
+            nn.Linear(4 * channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+            nn.Sigmoid(),
+        )
+        self.l_gate = nn.Sequential(
+            nn.Linear(4 * channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+            nn.Sigmoid(),
+        )
+        self.h_gamma1 = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.l_gamma1 = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.h_gamma2 = nn.Parameter(
+            torch.tensor(float(second_gamma_init))
+        )
+        self.l_gamma2 = nn.Parameter(
+            torch.tensor(float(second_gamma_init))
+        )
+        self.last_diagnostics = {}
+
+    @staticmethod
+    def _entropy(attention):
+        return -torch.sum(
+            attention * torch.log(attention.clamp_min(1e-12)),
+            dim=1,
+        )
+
+    def _messages(self, h_nodes, l_nodes):
+        h_affinity = self.h_bilinear(h_nodes)
+        l_affinity = self.l_bilinear(l_nodes)
+        logits = (
+            h_affinity @ l_affinity.transpose(0, 1)
+        ) / (float(self.affinity_dim) ** 0.5)
+        semantic_confidence = torch.sigmoid(logits)
+        confidence = self.overlap_prior * semantic_confidence
+        confidence = confidence * self.support_mask.to(confidence.dtype)
+
+        l_to_h_attention = confidence / (
+            confidence.sum(dim=1, keepdim=True) + 1e-6
+        )
+        h_to_l_attention = confidence.transpose(0, 1) / (
+            confidence.transpose(0, 1).sum(dim=1, keepdim=True)
+            + 1e-6
+        )
+        l_to_h_message = l_to_h_attention @ self.l_to_h_value(l_nodes)
+        h_to_l_message = h_to_l_attention @ self.h_to_l_value(h_nodes)
+        supported_confidence = confidence.detach()[self.support_mask]
+        supported_semantic = semantic_confidence.detach()[self.support_mask]
+        diagnostics = {
+            "edge_density": float(
+                self.support_mask.float().mean().detach().item()
+            ),
+            "confidence_mean": float(
+                supported_confidence.mean().item()
+                if supported_confidence.numel() > 0
+                else 0.0
+            ),
+            "semantic_mean": float(
+                supported_semantic.mean().item()
+                if supported_semantic.numel() > 0
+                else 0.0
+            ),
+            "l_to_h_entropy": float(
+                self._entropy(l_to_h_attention).detach().mean().item()
+            ),
+            "h_to_l_entropy": float(
+                self._entropy(h_to_l_attention).detach().mean().item()
+            ),
+        }
+        return l_to_h_message, h_to_l_message, diagnostics
+
+    def forward(self, h_nodes, l_nodes, round_index=1):
+        if round_index == 1:
+            h_gamma = self.h_gamma1
+            l_gamma = self.l_gamma1
+        elif round_index == 2:
+            h_gamma = self.h_gamma2
+            l_gamma = self.l_gamma2
+        else:
+            raise ValueError("round_index must be 1 or 2.")
+
+        l_to_h_message, h_to_l_message, diagnostics = self._messages(
+            h_nodes,
+            l_nodes,
+        )
+        h_gate = self.h_gate(
+            torch.cat(
+                [
+                    h_nodes,
+                    l_to_h_message,
+                    torch.abs(h_nodes - l_to_h_message),
+                    h_nodes * l_to_h_message,
+                ],
+                dim=1,
+            )
+        )
+        l_gate = self.l_gate(
+            torch.cat(
+                [
+                    l_nodes,
+                    h_to_l_message,
+                    torch.abs(l_nodes - h_to_l_message),
+                    l_nodes * h_to_l_message,
+                ],
+                dim=1,
+            )
+        )
+        updated_h = h_nodes + h_gamma * h_gate * l_to_h_message
+        updated_l = l_nodes + l_gamma * l_gate * h_to_l_message
+        diagnostics = {
+            **diagnostics,
+            "round": round_index,
+            "h_gamma": float(h_gamma.detach().item()),
+            "l_gamma": float(l_gamma.detach().item()),
+            "h_gate_mean": float(h_gate.detach().mean().item()),
+            "l_gate_mean": float(l_gate.detach().mean().item()),
+            "l_to_h_message_norm": float(
+                l_to_h_message.detach().norm(dim=1).mean().item()
+            ),
+            "h_to_l_message_norm": float(
+                h_to_l_message.detach().norm(dim=1).mean().item()
+            ),
+        }
+        self.last_diagnostics = diagnostics
+        return updated_h, updated_l, diagnostics
+
+
 class OriginalHGCNHLWithGSDGGraph(nn.Module):
     """Original HGCN-HL except for GSDG graph construction/propagation."""
 
@@ -2833,6 +3115,14 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         dynamic_d_k=16,
         dynamic_topk=8,
         dynamic_tau=1.0,
+        cross_graph="none",
+        cross_propagation="alternating",
+        cross_affinity="bilinear",
+        cross_rounds=2,
+        cross_gamma_init=0.1,
+        cross_second_gamma_init=0.0,
+        cross_share_weights=False,
+        cross_overlap_prior=None,
         cross_modal_interaction="none",
         cross_attention_d_k=16,
         overlap_metric="iou",
@@ -2901,9 +3191,14 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.consensus_graph_weight = consensus_graph_weight
         self.consensus_graph_fusion = consensus_graph_fusion
         self.consensus_graph_transport = consensus_graph_transport
+        self.cross_graph = cross_graph
+        self.cross_propagation = cross_propagation
+        self.cross_rounds = cross_rounds
+        self.cross_share_weights = cross_share_weights
         self.last_contrastive_loss = None
         self.last_variance_loss = None
         self.last_consensus_graph_gate_diagnostics = None
+        self.last_cross_bipartite_diagnostics = []
         self.cnn_branch_mode = cnn_branch
 
         self.hsi_graph = ModalityGSDGGraphEncoder(
@@ -3041,6 +3336,28 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             self.consensus_graph_residual_gamma = None
             self.consensus_graph_residual_gate = None
 
+        if cross_graph == "overlap-bipartite":
+            if cross_affinity != "bilinear":
+                raise ValueError(
+                    "overlap-bipartite currently supports only "
+                    "bilinear affinity."
+                )
+            if cross_overlap_prior is None:
+                raise ValueError(
+                    "cross_overlap_prior is required for "
+                    "overlap-bipartite."
+                )
+            self.cross_bipartite = OverlapBipartiteCrossPropagation(
+                hidden_dim,
+                cross_overlap_prior,
+                gamma_init=cross_gamma_init,
+                second_gamma_init=cross_second_gamma_init,
+            )
+        elif cross_graph == "none":
+            self.cross_bipartite = None
+        else:
+            raise ValueError(f"Unsupported cross_graph: {cross_graph}")
+
     def _encode_private_graph_nodes(self, hsi, lidar):
         hsi_nodes = self.hsi_graph.encode_nodes(hsi)
         hsi_features, hsi_adjacency = self.hsi_graph.apply_gat1(
@@ -3060,11 +3377,97 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         )
         return hsi_final_nodes, lidar_final_nodes
 
+    def _forward_overlap_bipartite(self, hsi, lidar):
+        self.last_cross_bipartite_diagnostics = []
+        hsi_nodes = self.hsi_graph.encode_nodes(hsi)
+        lidar_nodes = self.lidar_graph.encode_nodes(lidar)
+        hsi_features, hsi_adjacency = self.hsi_graph.apply_gat1(
+            hsi_nodes
+        )
+        lidar_features, lidar_adjacency = self.lidar_graph.apply_gat1(
+            lidar_nodes
+        )
+
+        if self.cross_propagation == "single":
+            hsi_final_nodes = self.hsi_graph.apply_gat2_nodes(
+                hsi_features,
+                adjacency=hsi_adjacency,
+            )
+            lidar_final_nodes = self.lidar_graph.apply_gat2_nodes(
+                lidar_features,
+                adjacency=lidar_adjacency,
+            )
+            (
+                hsi_final_nodes,
+                lidar_final_nodes,
+                diagnostics,
+            ) = self.cross_bipartite(
+                hsi_final_nodes,
+                lidar_final_nodes,
+                round_index=1,
+            )
+            self.last_cross_bipartite_diagnostics.append(diagnostics)
+        elif self.cross_propagation == "alternating":
+            if self.cross_rounds >= 1:
+                (
+                    hsi_features,
+                    lidar_features,
+                    diagnostics,
+                ) = self.cross_bipartite(
+                    hsi_features,
+                    lidar_features,
+                    round_index=1,
+                )
+                self.last_cross_bipartite_diagnostics.append(
+                    diagnostics
+                )
+            hsi_final_nodes = self.hsi_graph.apply_gat2_nodes(
+                hsi_features,
+                adjacency=hsi_adjacency,
+            )
+            lidar_final_nodes = self.lidar_graph.apply_gat2_nodes(
+                lidar_features,
+                adjacency=lidar_adjacency,
+            )
+            if self.cross_rounds >= 2:
+                (
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                    diagnostics,
+                ) = self.cross_bipartite(
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                    round_index=2,
+                )
+                self.last_cross_bipartite_diagnostics.append(
+                    diagnostics
+                )
+        else:
+            raise ValueError(
+                f"Unsupported cross_propagation: "
+                f"{self.cross_propagation}"
+            )
+
+        hsi_graph_features = self.hsi_graph.project_nodes(
+            hsi_final_nodes
+        )
+        lidar_graph_features = self.lidar_graph.project_nodes(
+            lidar_final_nodes
+        )
+        return (
+            self.graph_modality_lambda * hsi_graph_features
+            + (1.0 - self.graph_modality_lambda)
+            * lidar_graph_features
+        )
+
     def forward(self, hsi, lidar, joint_input):
         self.last_contrastive_loss = None
         self.last_variance_loss = None
         self.last_consensus_graph_gate_diagnostics = None
-        if self.consensus_graph_branch is None:
+        self.last_cross_bipartite_diagnostics = []
+        if self.cross_bipartite is not None:
+            graph_features = self._forward_overlap_bipartite(hsi, lidar)
+        elif self.consensus_graph_branch is None:
             hsi_graph_features = self.hsi_graph(hsi)
             lidar_graph_features = self.lidar_graph(lidar)
             graph_features = (
@@ -3331,6 +3734,12 @@ def prepare_data(args, config):
             lidar_rag_adjacency,
             args.lidar_height_knn_k,
         )
+    cross_overlap_prior = None
+    if args.cross_graph == "overlap-bipartite":
+        cross_overlap_prior = build_symmetric_cross_modal_overlap(
+            hsi_assignment,
+            lidar_assignment,
+        )
     joint_spatial_prior = build_superpixel_spatial_prior(
         assignment,
         hsi.shape[0],
@@ -3404,6 +3813,7 @@ def prepare_data(args, config):
         lidar_geometry_descriptors,
         cell_data,
         bridge_data,
+        cross_overlap_prior,
         joint_spatial_prior,
     )
 
@@ -3425,6 +3835,7 @@ def train_one_run(
     lidar_geometry_descriptors,
     cell_data,
     bridge_data,
+    cross_overlap_prior,
     joint_spatial_prior,
     run_index,
 ):
@@ -3483,6 +3894,14 @@ def train_one_run(
                 lidar_geometry_descriptors
             ),
             lidar_modulation=args.lidar_modulation,
+            cross_graph=args.cross_graph,
+            cross_propagation=args.cross_propagation,
+            cross_affinity=args.cross_affinity,
+            cross_rounds=args.cross_rounds,
+            cross_gamma_init=args.cross_gamma_init,
+            cross_second_gamma_init=args.cross_second_gamma_init,
+            cross_share_weights=args.cross_share_weights,
+            cross_overlap_prior=cross_overlap_prior,
             graph_modality_lambda=args.graph_modality_lambda,
             post_gat_consensus_graph=(
                 args.post_gat_consensus_graph
@@ -3708,6 +4127,29 @@ def train_one_run(
                     f"entropy={consensus_graph_record['attention_cc_entropy']:.4f}, "
                     f"fusion={fusion_mode}{fusion_suffix}"
                 )
+            cross_records = getattr(
+                model,
+                "last_cross_bipartite_diagnostics",
+                [],
+            )
+            if cross_records:
+                cross_text = []
+                for record in cross_records:
+                    cross_text.append(
+                        "r"
+                        f"{record['round']}:"
+                        f"g={record['h_gamma']:.3f}/"
+                        f"{record['l_gamma']:.3f},"
+                        f"gate={record['h_gate_mean']:.3f}/"
+                        f"{record['l_gate_mean']:.3f},"
+                        f"H={record['l_to_h_entropy']:.3f},"
+                        f"L={record['h_to_l_entropy']:.3f}"
+                    )
+                print(
+                    "  Cross-bipartite: "
+                    f"edges={cross_records[0]['edge_density']:.4f}, "
+                    + "; ".join(cross_text)
+                )
 
     training_time = time.perf_counter() - start_time
     model.load_state_dict(best_state)
@@ -3734,6 +4176,7 @@ def train_one_run(
         f"lidar-{args.lidar_segmentation}_"
         f"prior-{args.lidar_graph_prior}_"
         f"{consensus_graph_configuration_tag(args, class_count)}_"
+        f"{cross_graph_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
         f"cnn-{args.cnn_branch}_"
         f"lidarmod-{args.lidar_modulation}_"
@@ -3803,6 +4246,25 @@ def normalize_joint_layout_args(args):
         "binary",
         "--consensus-graph-cell-edge",
     )
+    reset_if_needed("cross_graph", "none", "--cross-graph")
+    reset_if_needed(
+        "cross_propagation",
+        "alternating",
+        "--cross-propagation",
+    )
+    reset_if_needed("cross_affinity", "bilinear", "--cross-affinity")
+    reset_if_needed("cross_rounds", 2, "--cross-rounds")
+    reset_if_needed("cross_gamma_init", 0.1, "--cross-gamma-init")
+    reset_if_needed(
+        "cross_second_gamma_init",
+        0.0,
+        "--cross-second-gamma-init",
+    )
+    reset_if_needed(
+        "cross_share_weights",
+        False,
+        "--cross-share-weights",
+    )
     reset_if_needed(
         "lidar_graph_prior",
         "centroid",
@@ -3839,6 +4301,10 @@ def validate_args(args):
         raise ValueError(
             "--graph-modality-lambda must be between 0 and 1."
         )
+    if args.cross_rounds not in (1, 2):
+        raise ValueError("--cross-rounds must be 1 or 2.")
+    if args.cross_gamma_init < 0 or args.cross_second_gamma_init < 0:
+        raise ValueError("Cross propagation gamma init values must be nonnegative.")
     if args.dynamic_dk <= 0 or args.dynamic_topk <= 0:
         raise ValueError("Dynamic graph dimensions must be positive.")
     if args.dynamic_tau <= 0 or args.spatial_prior_k <= 0:
@@ -3903,6 +4369,23 @@ def validate_args(args):
             "requires --post-gat-consensus-graph "
             "intersection-mediator."
         )
+    if args.cross_graph != "none":
+        if args.graph_layout != "separate":
+            raise ValueError(
+                "--cross-graph overlap-bipartite requires "
+                "--graph-layout separate."
+            )
+        if args.post_gat_consensus_graph != "none":
+            raise ValueError(
+                "--cross-graph overlap-bipartite and "
+                "--post-gat-consensus-graph intersection-mediator are "
+                "mutually exclusive."
+            )
+        if args.cross_affinity != "bilinear":
+            raise ValueError(
+                "--cross-graph overlap-bipartite currently requires "
+                "--cross-affinity bilinear."
+            )
     if args.post_gat_consensus_graph != "none":
         if args.graph_layout != "separate":
             raise ValueError(
@@ -3977,6 +4460,7 @@ def main():
         lidar_geometry_descriptors,
         cell_data,
         bridge_data,
+        cross_overlap_prior,
         joint_spatial_prior,
     ) = prepare_data(args, config)
 
@@ -3997,6 +4481,17 @@ def main():
             f"FDSM={args.fdsm_scope} | "
             f"LiDAR-mod={args.lidar_modulation}"
         )
+        if args.cross_graph != "none":
+            print(
+                "Cross graph: "
+                f"{args.cross_graph} | "
+                f"propagation={args.cross_propagation} | "
+                f"affinity={args.cross_affinity} | "
+                f"rounds={args.cross_rounds} | "
+                f"gamma={args.cross_gamma_init:g}/"
+                f"{args.cross_second_gamma_init:g} | "
+                f"shared-weights={int(args.cross_share_weights)}"
+            )
         if args.post_gat_consensus_graph != "none":
             resolved_mediator_count = cell_data["cell_count"]
             private_weight = 1.0 - args.consensus_graph_weight
@@ -4119,6 +4614,7 @@ def main():
             lidar_geometry_descriptors,
             cell_data,
             bridge_data,
+            cross_overlap_prior,
             joint_spatial_prior,
             run_index,
         )
@@ -4151,6 +4647,7 @@ def main():
         f"lidar-{args.lidar_segmentation}_"
         f"prior-{args.lidar_graph_prior}_"
         f"{consensus_graph_configuration_tag(args, class_count)}_"
+        f"{cross_graph_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
         f"cnn-{args.cnn_branch}_"
         f"lidarmod-{args.lidar_modulation}_"
