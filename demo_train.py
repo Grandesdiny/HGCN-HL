@@ -275,11 +275,12 @@ def parse_args():
     )
     parser.add_argument(
         "--consensus-graph-transport-stage",
-        choices=("post-gat2", "alternating"),
+        choices=("post-gat2", "inter-gat", "alternating"),
         default="post-gat2",
         help=(
             "Where to apply intersection-mediator transport. "
             "'post-gat2' keeps the previous single late transport; "
+            "'inter-gat' applies transport after GAT1 and before GAT2; "
             "'alternating' applies transport after GAT1 and again "
             "after GAT2. Default: post-gat2."
         ),
@@ -344,6 +345,7 @@ def parse_args():
         help=(
             "Initial residual scale for the second transport round "
             "when --consensus-graph-transport-stage alternating. "
+            "It is ignored by post-gat2 and inter-gat. "
             "Default: 0."
         ),
     )
@@ -3568,6 +3570,25 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 lidar_adjacency,
                 round_index=1,
             )
+        elif self.consensus_graph_transport_stage == "inter-gat":
+            (
+                hsi_features,
+                lidar_features,
+            ) = self.consensus_graph_branch.transport_nodes(
+                hsi_features,
+                lidar_features,
+                hsi_adjacency,
+                lidar_adjacency,
+                round_index=1,
+            )
+            hsi_final_nodes = self.hsi_graph.apply_gat2_nodes(
+                hsi_features,
+                adjacency=hsi_adjacency,
+            )
+            lidar_final_nodes = self.lidar_graph.apply_gat2_nodes(
+                lidar_features,
+                adjacency=lidar_adjacency,
+            )
         elif self.consensus_graph_transport_stage == "alternating":
             (
                 hsi_features,
@@ -4573,8 +4594,8 @@ def validate_args(args):
         and args.consensus_graph_transport_stage != "post-gat2"
     ):
         raise ValueError(
-            "--consensus-graph-transport-stage alternating requires "
-            "--consensus-graph-transport bidirectional."
+            "--consensus-graph-transport-stage inter-gat/alternating "
+            "requires --consensus-graph-transport bidirectional."
         )
     if (
         args.consensus_graph_transport == "none"
