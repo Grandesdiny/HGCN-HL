@@ -165,6 +165,18 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--cross-overlap-weighting",
+        choices=("intersection", "symmetric"),
+        default="intersection",
+        help=(
+            "Spatial weight on overlap-bipartite edges. "
+            "'intersection' uses raw pixel intersection O_ij before "
+            "directional row/column normalization; 'symmetric' uses "
+            "the previous O_ij/sqrt(|S_i^H||S_j^L|). Default: "
+            "intersection."
+        ),
+    )
+    parser.add_argument(
         "--cross-rounds",
         type=int,
         default=2,
@@ -262,6 +274,17 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--consensus-graph-transport-stage",
+        choices=("post-gat2", "alternating"),
+        default="post-gat2",
+        help=(
+            "Where to apply intersection-mediator transport. "
+            "'post-gat2' keeps the previous single late transport; "
+            "'alternating' applies transport after GAT1 and again "
+            "after GAT2. Default: post-gat2."
+        ),
+    )
+    parser.add_argument(
         "--consensus-graph-transport-fusion",
         choices=("residual", "tri-gate", "concat", "bilinear"),
         default="residual",
@@ -312,6 +335,16 @@ def parse_args():
         help=(
             "Initial residual scale for both HSI and LiDAR "
             "C-mediated transport updates. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-graph-transport-second-gamma-init",
+        type=float,
+        default=0.0,
+        help=(
+            "Initial residual scale for the second transport round "
+            "when --consensus-graph-transport-stage alternating. "
+            "Default: 0."
         ),
     )
     parser.add_argument(
@@ -500,9 +533,11 @@ def consensus_graph_configuration_tag(args, class_count):
         f"tp{args.consensus_graph_transport}-"
         f"tf{args.consensus_graph_transport_fusion}-"
         f"tm{args.consensus_graph_transport_message}-"
+        f"ts{args.consensus_graph_transport_stage}-"
         f"tw{args.consensus_graph_transport_prior_weight:g}-"
         f"tl{args.consensus_graph_transport_lambda:g}-"
         f"tg{args.consensus_graph_transport_gamma_init:g}-"
+        f"tg2{args.consensus_graph_transport_second_gamma_init:g}-"
         f"edge{args.consensus_graph_cell_edge}-"
         f"a{args.consensus_graph_spatial_prior_weight:g}-"
         f"{args.consensus_graph_hsi_prior_weight:g}-"
@@ -523,6 +558,7 @@ def cross_graph_configuration_tag(args):
         f"xg-{args.cross_graph}-"
         f"prop{args.cross_propagation}-"
         f"aff{args.cross_affinity}-"
+        f"ov{args.cross_overlap_weighting}-"
         f"r{args.cross_rounds}-"
         f"g{args.cross_gamma_init:g}-"
         f"g2{args.cross_second_gamma_init:g}-"
@@ -1013,9 +1049,20 @@ def _dense_overlap(source_assignment, target_assignment):
     return np.asarray(overlap, dtype=np.float32)
 
 
-def build_symmetric_cross_modal_overlap(hsi_assignment, lidar_assignment):
-    """Build O_ij / sqrt(|S_i^H| |S_j^L|) for HSI-LiDAR edges."""
+def build_cross_modal_overlap_prior(
+    hsi_assignment,
+    lidar_assignment,
+    weighting="intersection",
+):
+    """Build overlap-bipartite edge prior for HSI-LiDAR edges."""
     overlap = _dense_overlap(hsi_assignment, lidar_assignment)
+    if weighting == "intersection":
+        return overlap.astype(np.float32)
+    if weighting != "symmetric":
+        raise ValueError(
+            "cross overlap weighting must be 'intersection' or "
+            "'symmetric'."
+        )
     hsi_area = np.asarray(
         hsi_assignment.sum(axis=0)
     ).reshape(-1).astype(np.float32)
@@ -1368,6 +1415,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
         transport_message="fixed",
         transport_prior_weight=1.0,
         transport_gamma_init=0.0,
+        transport_second_gamma_init=0.0,
         spatial_prior_weight=1.0,
         hsi_prior_weight=0.5,
         lidar_prior_weight=0.5,
@@ -1566,6 +1614,12 @@ class PostGATMediatedConsensusGraph(nn.Module):
         )
         self.l_transport_gamma = nn.Parameter(
             torch.tensor(float(transport_gamma_init))
+        )
+        self.h_transport_gamma2 = nn.Parameter(
+            torch.tensor(float(transport_second_gamma_init))
+        )
+        self.l_transport_gamma2 = nn.Parameter(
+            torch.tensor(float(transport_second_gamma_init))
         )
         self.mediator_kind = bridge_data.get(
             "mediator_kind",
@@ -1850,7 +1904,16 @@ class PostGATMediatedConsensusGraph(nn.Module):
         lidar_nodes,
         hsi_adjacency,
         lidar_adjacency,
+        round_index=1,
     ):
+        if round_index == 1:
+            h_gamma = self.h_transport_gamma
+            l_gamma = self.l_transport_gamma
+        elif round_index == 2:
+            h_gamma = self.h_transport_gamma2
+            l_gamma = self.l_transport_gamma2
+        else:
+            raise ValueError("round_index must be 1 or 2.")
         c_graph = self._build_c_graph(
             hsi_nodes,
             lidar_nodes,
@@ -1948,7 +2011,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
             )
             updated_hsi = (
                 hsi_nodes
-                + self.h_transport_gamma * h_gate * l_to_h_message
+                + h_gamma * h_gate * l_to_h_message
             )
             l_gate = torch.sigmoid(
                 self.h_to_l_gate(
@@ -1964,7 +2027,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
             )
             updated_lidar = (
                 lidar_nodes
-                + self.l_transport_gamma * l_gate * h_to_l_message
+                + l_gamma * l_gate * h_to_l_message
             )
             h_gate_mean = float(h_gate.detach().mean().item())
             l_gate_mean = float(l_gate.detach().mean().item())
@@ -1996,7 +2059,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
             )
             updated_hsi = (
                 hsi_nodes
-                + self.h_transport_gamma * (h_mix - hsi_nodes)
+                + h_gamma * (h_mix - hsi_nodes)
             )
             l_tri_gate = F.softmax(
                 self.l_tri_gate(
@@ -2019,7 +2082,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
             )
             updated_lidar = (
                 lidar_nodes
-                + self.l_transport_gamma * (l_mix - lidar_nodes)
+                + l_gamma * (l_mix - lidar_nodes)
             )
             h_gate_mean = None
             l_gate_mean = None
@@ -2046,7 +2109,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
             h_fused = self.h_concat_fuse(h_concat_input)
             updated_hsi = (
                 hsi_nodes
-                + self.h_transport_gamma * (h_fused - hsi_nodes)
+                + h_gamma * (h_fused - hsi_nodes)
             )
             l_concat_input = torch.cat(
                 [
@@ -2060,7 +2123,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
             l_fused = self.l_concat_fuse(l_concat_input)
             updated_lidar = (
                 lidar_nodes
-                + self.l_transport_gamma * (l_fused - lidar_nodes)
+                + l_gamma * (l_fused - lidar_nodes)
             )
             h_gate_mean = None
             l_gate_mean = None
@@ -2097,7 +2160,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
             )
             updated_hsi = (
                 hsi_nodes
-                + self.h_transport_gamma * (h_fused - hsi_nodes)
+                + h_gamma * (h_fused - hsi_nodes)
             )
             l_product = self.l_bilinear_out(
                 self.l_bilinear_left(lidar_nodes)
@@ -2117,7 +2180,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
             )
             updated_lidar = (
                 lidar_nodes
-                + self.l_transport_gamma * (l_fused - lidar_nodes)
+                + l_gamma * (l_fused - lidar_nodes)
             )
             h_gate_mean = None
             l_gate_mean = None
@@ -2147,6 +2210,12 @@ class PostGATMediatedConsensusGraph(nn.Module):
         self.last_diagnostics = {
             **c_graph["diagnostics"],
             "transport_mode": "bidirectional",
+            "transport_stage": getattr(
+                self,
+                "active_transport_stage",
+                "post-gat2",
+            ),
+            "transport_round": round_index,
             "transport_fusion": self.transport_fusion,
             "transport_message": self.transport_message,
             "transport_prior_weight": float(self.transport_prior_weight),
@@ -2160,10 +2229,10 @@ class PostGATMediatedConsensusGraph(nn.Module):
             "l_to_h_attention_entropy": l_to_h_attention_entropy,
             "h_to_l_attention_entropy": h_to_l_attention_entropy,
             "h_transport_gamma": float(
-                self.h_transport_gamma.detach().item()
+                h_gamma.detach().item()
             ),
             "l_transport_gamma": float(
-                self.l_transport_gamma.detach().item()
+                l_gamma.detach().item()
             ),
             "h_transport_gate_mean": h_gate_mean,
             "l_transport_gate_mean": l_gate_mean,
@@ -3151,11 +3220,13 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         consensus_graph_fusion="residual-c",
         consensus_graph_residual_init=0.0,
         consensus_graph_transport="none",
+        consensus_graph_transport_stage="post-gat2",
         consensus_graph_transport_fusion="residual",
         consensus_graph_transport_message="fixed",
         consensus_graph_transport_prior_weight=1.0,
         consensus_graph_transport_lambda=0.5,
         consensus_graph_transport_gamma_init=0.0,
+        consensus_graph_transport_second_gamma_init=0.0,
         consensus_graph_spatial_prior_weight=1.0,
         consensus_graph_hsi_prior_weight=0.5,
         consensus_graph_lidar_prior_weight=0.5,
@@ -3191,6 +3262,9 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.consensus_graph_weight = consensus_graph_weight
         self.consensus_graph_fusion = consensus_graph_fusion
         self.consensus_graph_transport = consensus_graph_transport
+        self.consensus_graph_transport_stage = (
+            consensus_graph_transport_stage
+        )
         self.cross_graph = cross_graph
         self.cross_propagation = cross_propagation
         self.cross_rounds = cross_rounds
@@ -3283,6 +3357,9 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     ),
                     transport_gamma_init=(
                         consensus_graph_transport_gamma_init
+                    ),
+                    transport_second_gamma_init=(
+                        consensus_graph_transport_second_gamma_init
                     ),
                     spatial_prior_weight=(
                         consensus_graph_spatial_prior_weight
@@ -3460,6 +3537,90 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             * lidar_graph_features
         )
 
+    def _forward_mediator_transport(self, hsi, lidar):
+        self.consensus_graph_branch.active_transport_stage = (
+            self.consensus_graph_transport_stage
+        )
+        hsi_nodes = self.hsi_graph.encode_nodes(hsi)
+        lidar_nodes = self.lidar_graph.encode_nodes(lidar)
+        hsi_features, hsi_adjacency = self.hsi_graph.apply_gat1(
+            hsi_nodes
+        )
+        lidar_features, lidar_adjacency = self.lidar_graph.apply_gat1(
+            lidar_nodes
+        )
+        if self.consensus_graph_transport_stage == "post-gat2":
+            hsi_final_nodes = self.hsi_graph.apply_gat2_nodes(
+                hsi_features,
+                adjacency=hsi_adjacency,
+            )
+            lidar_final_nodes = self.lidar_graph.apply_gat2_nodes(
+                lidar_features,
+                adjacency=lidar_adjacency,
+            )
+            (
+                hsi_final_nodes,
+                lidar_final_nodes,
+            ) = self.consensus_graph_branch.transport_nodes(
+                hsi_final_nodes,
+                lidar_final_nodes,
+                hsi_adjacency,
+                lidar_adjacency,
+                round_index=1,
+            )
+        elif self.consensus_graph_transport_stage == "alternating":
+            (
+                hsi_features,
+                lidar_features,
+            ) = self.consensus_graph_branch.transport_nodes(
+                hsi_features,
+                lidar_features,
+                hsi_adjacency,
+                lidar_adjacency,
+                round_index=1,
+            )
+            hsi_final_nodes = self.hsi_graph.apply_gat2_nodes(
+                hsi_features,
+                adjacency=hsi_adjacency,
+            )
+            lidar_final_nodes = self.lidar_graph.apply_gat2_nodes(
+                lidar_features,
+                adjacency=lidar_adjacency,
+            )
+            (
+                hsi_final_nodes,
+                lidar_final_nodes,
+            ) = self.consensus_graph_branch.transport_nodes(
+                hsi_final_nodes,
+                lidar_final_nodes,
+                hsi_adjacency,
+                lidar_adjacency,
+                round_index=2,
+            )
+        else:
+            raise ValueError(
+                "Unsupported consensus graph transport stage: "
+                f"{self.consensus_graph_transport_stage}"
+            )
+        hsi_graph_features = self.hsi_graph.project_nodes(
+            hsi_final_nodes
+        )
+        lidar_graph_features = self.lidar_graph.project_nodes(
+            lidar_final_nodes
+        )
+        self.last_consensus_graph_gate_diagnostics = {
+            "fusion_mode": "transport-private-fusion",
+            "private_weights": [
+                self.graph_modality_lambda,
+                1.0 - self.graph_modality_lambda,
+            ],
+        }
+        return (
+            self.graph_modality_lambda * hsi_graph_features
+            + (1.0 - self.graph_modality_lambda)
+            * lidar_graph_features
+        )
+
     def forward(self, hsi, lidar, joint_input):
         self.last_contrastive_loss = None
         self.last_variance_loss = None
@@ -3475,6 +3636,8 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 + (1.0 - self.graph_modality_lambda)
                 * lidar_graph_features
             )
+        elif self.consensus_graph_transport == "bidirectional":
+            graph_features = self._forward_mediator_transport(hsi, lidar)
         else:
             (
                 hsi_final_nodes,
@@ -3487,40 +3650,12 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     "Mediator consensus graph requires both private "
                     "GAT2 adjacencies."
                 )
-            if self.consensus_graph_transport == "bidirectional":
-                (
-                    hsi_final_nodes,
-                    lidar_final_nodes,
-                ) = self.consensus_graph_branch.transport_nodes(
-                    hsi_final_nodes,
-                    lidar_final_nodes,
-                    hsi_adjacency,
-                    lidar_adjacency,
-                )
-                hsi_graph_features = self.hsi_graph.project_nodes(
-                    hsi_final_nodes
-                )
-                lidar_graph_features = self.lidar_graph.project_nodes(
-                    lidar_final_nodes
-                )
-                graph_features = (
-                    self.graph_modality_lambda * hsi_graph_features
-                    + (1.0 - self.graph_modality_lambda)
-                    * lidar_graph_features
-                )
-                self.last_consensus_graph_gate_diagnostics = {
-                    "fusion_mode": "transport-private-fusion",
-                    "private_weights": [
-                        self.graph_modality_lambda,
-                        1.0 - self.graph_modality_lambda,
-                    ],
-                }
-            elif self.consensus_graph_transport != "none":
+            if self.consensus_graph_transport != "none":
                 raise ValueError(
                     f"Unsupported consensus graph transport: "
                     f"{self.consensus_graph_transport}"
                 )
-            else:
+            if self.consensus_graph_transport == "none":
                 hsi_graph_features = self.hsi_graph.project_nodes(
                     hsi_final_nodes
                 )
@@ -3736,9 +3871,10 @@ def prepare_data(args, config):
         )
     cross_overlap_prior = None
     if args.cross_graph == "overlap-bipartite":
-        cross_overlap_prior = build_symmetric_cross_modal_overlap(
+        cross_overlap_prior = build_cross_modal_overlap_prior(
             hsi_assignment,
             lidar_assignment,
+            weighting=args.cross_overlap_weighting,
         )
     joint_spatial_prior = build_superpixel_spatial_prior(
         assignment,
@@ -3912,6 +4048,9 @@ def train_one_run(
                 args.consensus_graph_residual_init
             ),
             consensus_graph_transport=args.consensus_graph_transport,
+            consensus_graph_transport_stage=(
+                args.consensus_graph_transport_stage
+            ),
             consensus_graph_transport_fusion=(
                 args.consensus_graph_transport_fusion
             ),
@@ -3926,6 +4065,9 @@ def train_one_run(
             ),
             consensus_graph_transport_gamma_init=(
                 args.consensus_graph_transport_gamma_init
+            ),
+            consensus_graph_transport_second_gamma_init=(
+                args.consensus_graph_transport_second_gamma_init
             ),
             consensus_graph_spatial_prior_weight=(
                 args.consensus_graph_spatial_prior_weight
@@ -4085,6 +4227,10 @@ def train_one_run(
                             f"{consensus_graph_record['l_transport_gate_mean']:.4f}"
                         )
                     fusion_suffix = (
+                        ", stage="
+                        f"{consensus_graph_record.get('transport_stage', 'post-gat2')}"
+                        ", round="
+                        f"{consensus_graph_record.get('transport_round', 1)}"
                         ", lambda="
                         f"{consensus_graph_record['transport_lambda']:.2f}"
                         ", mode="
@@ -4232,6 +4378,11 @@ def normalize_joint_layout_args(args):
         "--consensus-graph-transport",
     )
     reset_if_needed(
+        "consensus_graph_transport_stage",
+        "post-gat2",
+        "--consensus-graph-transport-stage",
+    )
+    reset_if_needed(
         "consensus_graph_transport_fusion",
         "residual",
         "--consensus-graph-transport-fusion",
@@ -4240,6 +4391,11 @@ def normalize_joint_layout_args(args):
         "consensus_graph_transport_message",
         "fixed",
         "--consensus-graph-transport-message",
+    )
+    reset_if_needed(
+        "consensus_graph_transport_second_gamma_init",
+        0.0,
+        "--consensus-graph-transport-second-gamma-init",
     )
     reset_if_needed(
         "consensus_graph_cell_edge",
@@ -4253,6 +4409,11 @@ def normalize_joint_layout_args(args):
         "--cross-propagation",
     )
     reset_if_needed("cross_affinity", "bilinear", "--cross-affinity")
+    reset_if_needed(
+        "cross_overlap_weighting",
+        "intersection",
+        "--cross-overlap-weighting",
+    )
     reset_if_needed("cross_rounds", 2, "--cross-rounds")
     reset_if_needed("cross_gamma_init", 0.1, "--cross-gamma-init")
     reset_if_needed(
@@ -4335,6 +4496,11 @@ def validate_args(args):
         raise ValueError(
             "--consensus-graph-transport-gamma-init must be nonnegative."
         )
+    if args.consensus_graph_transport_second_gamma_init < 0:
+        raise ValueError(
+            "--consensus-graph-transport-second-gamma-init must be "
+            "nonnegative."
+        )
     if args.consensus_graph_transport_prior_weight < 0:
         raise ValueError(
             "--consensus-graph-transport-prior-weight must be nonnegative."
@@ -4401,6 +4567,14 @@ def validate_args(args):
         raise ValueError(
             "--consensus-graph-transport requires "
             "--post-gat-consensus-graph intersection-mediator."
+        )
+    if (
+        args.consensus_graph_transport == "none"
+        and args.consensus_graph_transport_stage != "post-gat2"
+    ):
+        raise ValueError(
+            "--consensus-graph-transport-stage alternating requires "
+            "--consensus-graph-transport bidirectional."
         )
     if (
         args.consensus_graph_transport == "none"
@@ -4487,6 +4661,7 @@ def main():
                 f"{args.cross_graph} | "
                 f"propagation={args.cross_propagation} | "
                 f"affinity={args.cross_affinity} | "
+                f"overlap={args.cross_overlap_weighting} | "
                 f"rounds={args.cross_rounds} | "
                 f"gamma={args.cross_gamma_init:g}/"
                 f"{args.cross_second_gamma_init:g} | "
@@ -4498,11 +4673,14 @@ def main():
             if args.consensus_graph_transport == "bidirectional":
                 fusion_detail = (
                     "C-mediated bidirectional transport, "
+                    f"stage={args.consensus_graph_transport_stage}, "
                     f"fusion={args.consensus_graph_transport_fusion}, "
                     f"message={args.consensus_graph_transport_message}, "
                     f"lambda={args.consensus_graph_transport_lambda:g}, "
                     f"eta={args.consensus_graph_transport_prior_weight:g}, "
-                    f"gamma-init={args.consensus_graph_transport_gamma_init:g}; "
+                    "gamma-init="
+                    f"{args.consensus_graph_transport_gamma_init:g}/"
+                    f"{args.consensus_graph_transport_second_gamma_init:g}; "
                     "pixel C fusion disabled"
                 )
             elif args.consensus_graph_fusion == "c-guided-gate":
