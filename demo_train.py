@@ -286,6 +286,48 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--consensus-graph-transport-operator",
+        choices=("transport", "sheaf"),
+        default="transport",
+        help=(
+            "Operator used inside bidirectional intersection-mediator "
+            "transport. 'transport' keeps the existing C-mediated "
+            "Beta/QK message route. 'sheaf' treats intersection cells "
+            "as edge stalks on the HSI-LiDAR bipartite graph and applies "
+            "a cellular-sheaf diffusion half-step. Default: transport."
+        ),
+    )
+    parser.add_argument(
+        "--sheaf-restriction",
+        choices=("diag", "lowrank"),
+        default="diag",
+        help=(
+            "Restriction-map parameterization for "
+            "--consensus-graph-transport-operator sheaf. Default: diag."
+        ),
+    )
+    parser.add_argument(
+        "--sheaf-rank",
+        type=int,
+        default=4,
+        help="Low-rank restriction rank for --sheaf-restriction lowrank.",
+    )
+    parser.add_argument(
+        "--sheaf-steps",
+        type=int,
+        default=1,
+        help="Number of cellular-sheaf diffusion half-steps. Default: 1.",
+    )
+    parser.add_argument(
+        "--sheaf-energy-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional weight for the sheaf Dirichlet energy regularizer. "
+            "Use 0 to validate pure diffusion. Default: 0."
+        ),
+    )
+    parser.add_argument(
         "--consensus-graph-transport-fusion",
         choices=("residual", "tri-gate", "concat", "bilinear"),
         default="residual",
@@ -524,6 +566,14 @@ def consensus_graph_configuration_tag(args, class_count):
     if args.post_gat_consensus_graph == "none":
         return "cg-none"
     anchor_tag = "cells"
+    sheaf_tag = ""
+    if args.consensus_graph_transport_operator == "sheaf":
+        sheaf_tag = (
+            f"sh{args.sheaf_restriction}-"
+            f"r{args.sheaf_rank}-"
+            f"s{args.sheaf_steps}-"
+            f"e{args.sheaf_energy_weight:g}-"
+        )
     return (
         f"cg-{args.post_gat_consensus_graph}-k{anchor_tag}-"
         f"dk{args.bridge_attention_dk}-"
@@ -533,6 +583,8 @@ def consensus_graph_configuration_tag(args, class_count):
         f"rg{args.consensus_graph_residual_init:g}-"
         f"cg{args.consensus_graph_c_gamma_init:g}-"
         f"tp{args.consensus_graph_transport}-"
+        f"to{args.consensus_graph_transport_operator}-"
+        f"{sheaf_tag}"
         f"tf{args.consensus_graph_transport_fusion}-"
         f"tm{args.consensus_graph_transport_message}-"
         f"ts{args.consensus_graph_transport_stage}-"
@@ -1395,6 +1447,186 @@ def build_intersection_mediator_data(
 
 
 
+def inverse_softplus_scalar(value):
+    """Return x where softplus(x) is approximately value."""
+    value = float(max(value, 1e-8))
+    return torch.log(torch.expm1(torch.tensor(value)))
+
+
+def apply_edge_restriction(restriction, edge_features, transpose=False):
+    mode, payload = restriction
+    if mode == "diag":
+        return edge_features * payload
+    if mode != "lowrank":
+        raise ValueError(f"Unsupported sheaf restriction mode: {mode}")
+    left, right = payload
+    if transpose:
+        latent = torch.einsum("cdr,cd->cr", left, edge_features)
+        return edge_features + torch.einsum("cdr,cr->cd", right, latent)
+    latent = torch.einsum("cdr,cd->cr", right, edge_features)
+    return edge_features + torch.einsum("cdr,cr->cd", left, latent)
+
+
+class RestrictionMapGenerator(nn.Module):
+    """Generate edge-conditioned sheaf restriction maps."""
+
+    def __init__(self, descriptor_dim, channels, mode="diag", rank=4):
+        super().__init__()
+        self.mode = mode
+        self.channels = channels
+        self.rank = rank
+        if mode == "diag":
+            self.diag_head = nn.Sequential(
+                nn.Linear(descriptor_dim, channels),
+                nn.LeakyReLU(),
+                nn.Linear(channels, channels),
+            )
+            nn.init.zeros_(self.diag_head[-1].weight)
+            nn.init.zeros_(self.diag_head[-1].bias)
+        elif mode == "lowrank":
+            self.left_head = nn.Sequential(
+                nn.Linear(descriptor_dim, channels),
+                nn.LeakyReLU(),
+                nn.Linear(channels, channels * rank),
+            )
+            self.right_head = nn.Sequential(
+                nn.Linear(descriptor_dim, channels),
+                nn.LeakyReLU(),
+                nn.Linear(channels, channels * rank),
+            )
+            nn.init.normal_(self.left_head[-1].weight, std=1e-3)
+            nn.init.zeros_(self.left_head[-1].bias)
+            nn.init.zeros_(self.right_head[-1].weight)
+            nn.init.zeros_(self.right_head[-1].bias)
+        else:
+            raise ValueError(
+                "--sheaf-restriction must be 'diag' or 'lowrank'."
+            )
+
+    def forward(self, descriptor):
+        if self.mode == "diag":
+            scale = 1.0 + 0.5 * torch.tanh(self.diag_head(descriptor))
+            return "diag", scale
+        left = self.left_head(descriptor).view(
+            descriptor.shape[0],
+            self.channels,
+            self.rank,
+        )
+        right = self.right_head(descriptor).view(
+            descriptor.shape[0],
+            self.channels,
+            self.rank,
+        )
+        return "lowrank", (left, right)
+
+
+class SheafConsensusDiffusion(nn.Module):
+    """Cellular-sheaf half-step over HSI/LiDAR superpixel bipartite cells."""
+
+    def __init__(
+        self,
+        channels,
+        descriptor_dim,
+        restriction="diag",
+        rank=4,
+        steps=1,
+        alpha_init=0.1,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.restriction = restriction
+        self.rank = rank
+        self.steps = steps
+        self.h_restriction = RestrictionMapGenerator(
+            descriptor_dim,
+            channels,
+            mode=restriction,
+            rank=rank,
+        )
+        self.l_restriction = RestrictionMapGenerator(
+            descriptor_dim,
+            channels,
+            mode=restriction,
+            rank=rank,
+        )
+        initial_alpha = inverse_softplus_scalar(alpha_init)
+        self.h_alpha_raw = nn.Parameter(initial_alpha.clone())
+        self.l_alpha_raw = nn.Parameter(initial_alpha.clone())
+
+    @staticmethod
+    def _scatter_mean(edge_values, parent_index, node_count):
+        sums = edge_values.new_zeros(node_count, edge_values.shape[1])
+        sums.index_add_(0, parent_index, edge_values)
+        counts = torch.bincount(
+            parent_index,
+            minlength=node_count,
+        ).to(edge_values.dtype).clamp_min(1.0)
+        return sums / counts.unsqueeze(1)
+
+    def forward(
+        self,
+        hsi_nodes,
+        lidar_nodes,
+        h_parent_index,
+        l_parent_index,
+        descriptor,
+    ):
+        h_current = hsi_nodes
+        l_current = lidar_nodes
+        h_alpha = F.softplus(self.h_alpha_raw)
+        l_alpha = F.softplus(self.l_alpha_raw)
+        final_delta = None
+
+        h_map = self.h_restriction(descriptor)
+        l_map = self.l_restriction(descriptor)
+        for _ in range(self.steps):
+            h_edge = h_current.index_select(0, h_parent_index)
+            l_edge = l_current.index_select(0, l_parent_index)
+            h_stalk = apply_edge_restriction(h_map, h_edge)
+            l_stalk = apply_edge_restriction(l_map, l_edge)
+            delta = h_stalk - l_stalk
+            final_delta = delta
+            h_edge_grad = apply_edge_restriction(
+                h_map,
+                delta,
+                transpose=True,
+            )
+            l_edge_grad = -apply_edge_restriction(
+                l_map,
+                delta,
+                transpose=True,
+            )
+            h_grad = self._scatter_mean(
+                h_edge_grad,
+                h_parent_index,
+                h_current.shape[0],
+            )
+            l_grad = self._scatter_mean(
+                l_edge_grad,
+                l_parent_index,
+                l_current.shape[0],
+            )
+            h_current = h_current - h_alpha * h_grad
+            l_current = l_current - l_alpha * l_grad
+
+        energy = final_delta.pow(2).sum(dim=1)
+        diagnostics = {
+            "sheaf_restriction": self.restriction,
+            "sheaf_rank": int(self.rank),
+            "sheaf_steps": int(self.steps),
+            "sheaf_alpha_h": float(h_alpha.detach().item()),
+            "sheaf_alpha_l": float(l_alpha.detach().item()),
+            "sheaf_energy_mean": float(energy.detach().mean().item()),
+            "sheaf_energy_std": float(
+                energy.detach().std(unbiased=False).item()
+            ),
+            "sheaf_delta_norm": float(
+                final_delta.detach().norm(dim=1).mean().item()
+            ),
+        }
+        return h_current, l_current, energy, diagnostics
+
+
 class PostGATMediatedConsensusGraph(nn.Module):
     """Independent mediator graph branch over public center anchors.
 
@@ -1415,9 +1647,13 @@ class PostGATMediatedConsensusGraph(nn.Module):
         transport_lambda=0.5,
         transport_fusion="residual",
         transport_message="fixed",
+        transport_operator="transport",
         transport_prior_weight=1.0,
         transport_gamma_init=0.0,
         transport_second_gamma_init=0.0,
+        sheaf_restriction="diag",
+        sheaf_rank=4,
+        sheaf_steps=1,
         spatial_prior_weight=1.0,
         hsi_prior_weight=0.5,
         lidar_prior_weight=0.5,
@@ -1432,6 +1668,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
         self.transport_lambda = transport_lambda
         self.transport_fusion = transport_fusion
         self.transport_message = transport_message
+        self.transport_operator = transport_operator
         self.transport_prior_weight = transport_prior_weight
         anchor_count = int(bridge_data["anchor_count"])
         self.bridge_embedding = nn.Parameter(
@@ -1623,9 +1860,39 @@ class PostGATMediatedConsensusGraph(nn.Module):
         self.l_transport_gamma2 = nn.Parameter(
             torch.tensor(float(transport_second_gamma_init))
         )
+        descriptor_channels = 5 * channels + attribute_channels
+        self.sheaf_diffusion = None
+        if transport_operator == "sheaf":
+            self.sheaf_diffusion = SheafConsensusDiffusion(
+                channels,
+                descriptor_channels,
+                restriction=sheaf_restriction,
+                rank=sheaf_rank,
+                steps=sheaf_steps,
+                alpha_init=transport_gamma_init,
+            )
         self.mediator_kind = bridge_data.get(
             "mediator_kind",
             "center",
+        )
+
+        prior_ch_array = np.asarray(bridge_data["prior_ch"])
+        prior_cl_array = np.asarray(bridge_data["prior_cl"])
+        self.register_buffer(
+            "h_parent_index",
+            torch.as_tensor(
+                prior_ch_array.argmax(axis=1),
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_parent_index",
+            torch.as_tensor(
+                prior_cl_array.argmax(axis=1),
+                dtype=torch.long,
+            ),
+            persistent=False,
         )
 
         for name in (
@@ -1694,6 +1961,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
             persistent=False,
         )
         self.last_diagnostics = None
+        self.last_sheaf_energy_loss = None
 
     @staticmethod
     def _topk_softmax(logits, topk):
@@ -1858,6 +2126,28 @@ class PostGATMediatedConsensusGraph(nn.Module):
             "diagnostics": diagnostics,
         }
 
+    def _build_sheaf_descriptor(self, hsi_nodes, lidar_nodes):
+        h_value = self.h_value(hsi_nodes)
+        l_value = self.l_value(lidar_nodes)
+        h_context = self.prior_ch @ h_value
+        l_context = self.prior_cl @ l_value
+        node_value = torch.cat([h_value, l_value], dim=0)
+        node_to_c = torch.cat([self.prior_hc, self.prior_lc], dim=0)
+        c_degree = node_to_c.sum(dim=0).clamp_min(1e-6)
+        incidence_context = (
+            node_to_c.transpose(0, 1) @ node_value
+        ) / c_degree.unsqueeze(1)
+        descriptor_parts = [
+            h_context,
+            l_context,
+            incidence_context,
+            torch.abs(h_context - l_context),
+            h_context * l_context,
+        ]
+        if self.cell_attributes is not None:
+            descriptor_parts.append(self.cell_attributes)
+        return torch.cat(descriptor_parts, dim=1)
+
     def forward(self, hsi_nodes, lidar_nodes, hsi_adjacency, lidar_adjacency):
         c_graph = self._build_c_graph(
             hsi_nodes,
@@ -1916,6 +2206,48 @@ class PostGATMediatedConsensusGraph(nn.Module):
             l_gamma = self.l_transport_gamma2
         else:
             raise ValueError("round_index must be 1 or 2.")
+        self.last_sheaf_energy_loss = None
+        if self.transport_operator == "sheaf":
+            if self.sheaf_diffusion is None:
+                raise ValueError("Sheaf diffusion module is not initialized.")
+            sheaf_descriptor = self._build_sheaf_descriptor(
+                hsi_nodes,
+                lidar_nodes,
+            )
+            (
+                updated_hsi,
+                updated_lidar,
+                energy,
+                sheaf_diagnostics,
+            ) = self.sheaf_diffusion(
+                hsi_nodes,
+                lidar_nodes,
+                self.h_parent_index,
+                self.l_parent_index,
+                sheaf_descriptor,
+            )
+            self.last_sheaf_energy_loss = (
+                energy.mean() / float(self.channels)
+            )
+            self.last_diagnostics = {
+                "transport_operator": "sheaf",
+                "transport_mode": "bidirectional",
+                "transport_stage": getattr(
+                    self,
+                    "active_transport_stage",
+                    "post-gat2",
+                ),
+                "transport_round": round_index,
+                "transport_fusion": "sheaf-diffusion",
+                "transport_message": "sheaf-restriction",
+                "h_transport_gamma": sheaf_diagnostics["sheaf_alpha_h"],
+                "l_transport_gamma": sheaf_diagnostics["sheaf_alpha_l"],
+                "bridge_count": int(self.prior_ch.shape[0]),
+                "mediator_kind": self.mediator_kind,
+                **sheaf_diagnostics,
+            }
+            return updated_hsi, updated_lidar
+
         c_graph = self._build_c_graph(
             hsi_nodes,
             lidar_nodes,
@@ -2211,6 +2543,7 @@ class PostGATMediatedConsensusGraph(nn.Module):
 
         self.last_diagnostics = {
             **c_graph["diagnostics"],
+            "transport_operator": self.transport_operator,
             "transport_mode": "bidirectional",
             "transport_stage": getattr(
                 self,
@@ -3225,10 +3558,15 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         consensus_graph_transport_stage="post-gat2",
         consensus_graph_transport_fusion="residual",
         consensus_graph_transport_message="fixed",
+        consensus_graph_transport_operator="transport",
         consensus_graph_transport_prior_weight=1.0,
         consensus_graph_transport_lambda=0.5,
         consensus_graph_transport_gamma_init=0.0,
         consensus_graph_transport_second_gamma_init=0.0,
+        sheaf_restriction="diag",
+        sheaf_rank=4,
+        sheaf_steps=1,
+        sheaf_energy_weight=0.0,
         consensus_graph_spatial_prior_weight=1.0,
         consensus_graph_hsi_prior_weight=0.5,
         consensus_graph_lidar_prior_weight=0.5,
@@ -3267,6 +3605,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.consensus_graph_transport_stage = (
             consensus_graph_transport_stage
         )
+        self.sheaf_energy_weight = sheaf_energy_weight
         self.cross_graph = cross_graph
         self.cross_propagation = cross_propagation
         self.cross_rounds = cross_rounds
@@ -3354,6 +3693,9 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     transport_lambda=consensus_graph_transport_lambda,
                     transport_fusion=consensus_graph_transport_fusion,
                     transport_message=consensus_graph_transport_message,
+                    transport_operator=(
+                        consensus_graph_transport_operator
+                    ),
                     transport_prior_weight=(
                         consensus_graph_transport_prior_weight
                     ),
@@ -3363,6 +3705,9 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     transport_second_gamma_init=(
                         consensus_graph_transport_second_gamma_init
                     ),
+                    sheaf_restriction=sheaf_restriction,
+                    sheaf_rank=sheaf_rank,
+                    sheaf_steps=sheaf_steps,
                     spatial_prior_weight=(
                         consensus_graph_spatial_prior_weight
                     ),
@@ -4078,6 +4423,9 @@ def train_one_run(
             consensus_graph_transport_message=(
                 args.consensus_graph_transport_message
             ),
+            consensus_graph_transport_operator=(
+                args.consensus_graph_transport_operator
+            ),
             consensus_graph_transport_prior_weight=(
                 args.consensus_graph_transport_prior_weight
             ),
@@ -4090,6 +4438,10 @@ def train_one_run(
             consensus_graph_transport_second_gamma_init=(
                 args.consensus_graph_transport_second_gamma_init
             ),
+            sheaf_restriction=args.sheaf_restriction,
+            sheaf_rank=args.sheaf_rank,
+            sheaf_steps=args.sheaf_steps,
+            sheaf_energy_weight=args.sheaf_energy_weight,
             consensus_graph_spatial_prior_weight=(
                 args.consensus_graph_spatial_prior_weight
             ),
@@ -4142,6 +4494,21 @@ def train_one_run(
             train_labels,
         )
         loss = classification_loss
+        consensus_graph_module = getattr(
+            model,
+            "consensus_graph_branch",
+            None,
+        )
+        sheaf_energy_loss = None
+        if consensus_graph_module is not None:
+            sheaf_energy = getattr(
+                consensus_graph_module,
+                "last_sheaf_energy_loss",
+                None,
+            )
+            if sheaf_energy is not None and args.sheaf_energy_weight > 0:
+                sheaf_energy_loss = args.sheaf_energy_weight * sheaf_energy
+                loss = loss + sheaf_energy_loss
         loss.backward()
         optimizer.step()
         if loss.item() < best_loss:
@@ -4196,104 +4563,126 @@ def train_one_run(
                 f"train_OA={train_oa:.4f}"
             )
             if consensus_graph_record is not None:
-                fusion_mode = consensus_graph_record.get(
-                    "fusion_mode",
-                    "unknown",
-                )
-                fusion_suffix = ""
-                transport_mode = consensus_graph_record.get(
-                    "transport_mode",
-                    "none",
-                )
-                if transport_mode == "bidirectional":
-                    fusion_mode = "bidirectional-transport"
-                    transport_fusion = consensus_graph_record.get(
-                        "transport_fusion",
-                        "residual",
+                if (
+                    consensus_graph_record.get("transport_operator")
+                    == "sheaf"
+                ):
+                    print(
+                        "  C-sheaf: "
+                        f"stage={consensus_graph_record.get('transport_stage', 'post-gat2')}, "
+                        f"round={consensus_graph_record.get('transport_round', 1)}, "
+                        f"restriction={consensus_graph_record['sheaf_restriction']}, "
+                        f"rank={consensus_graph_record['sheaf_rank']}, "
+                        f"steps={consensus_graph_record['sheaf_steps']}, "
+                        "alpha="
+                        f"{consensus_graph_record['sheaf_alpha_h']:.4f}/"
+                        f"{consensus_graph_record['sheaf_alpha_l']:.4f}, "
+                        "energy="
+                        f"{consensus_graph_record['sheaf_energy_mean']:.4f}"
                     )
-                    transport_message = consensus_graph_record.get(
-                        "transport_message",
-                        "fixed",
+                else:
+                    fusion_mode = consensus_graph_record.get(
+                        "fusion_mode",
+                        "unknown",
                     )
-                    if transport_fusion == "tri-gate":
-                        h_tri = np.asarray(
-                            consensus_graph_record["h_tri_gate_mean"]
+                    fusion_suffix = ""
+                    transport_mode = consensus_graph_record.get(
+                        "transport_mode",
+                        "none",
+                    )
+                    if transport_mode == "bidirectional":
+                        fusion_mode = "bidirectional-transport"
+                        transport_fusion = consensus_graph_record.get(
+                            "transport_fusion",
+                            "residual",
                         )
-                        l_tri = np.asarray(
-                            consensus_graph_record["l_tri_gate_mean"]
+                        transport_message = consensus_graph_record.get(
+                            "transport_message",
+                            "fixed",
                         )
-                        gate_text = (
-                            f"tri={h_tri.round(2).tolist()}/"
-                            f"{l_tri.round(2).tolist()}"
+                        if transport_fusion == "tri-gate":
+                            h_tri = np.asarray(
+                                consensus_graph_record[
+                                    "h_tri_gate_mean"
+                                ]
+                            )
+                            l_tri = np.asarray(
+                                consensus_graph_record[
+                                    "l_tri_gate_mean"
+                                ]
+                            )
+                            gate_text = (
+                                f"tri={h_tri.round(2).tolist()}/"
+                                f"{l_tri.round(2).tolist()}"
+                            )
+                        elif transport_fusion == "concat":
+                            gate_text = (
+                                "concat_delta="
+                                f"{consensus_graph_record['h_concat_delta_norm']:.4f}/"
+                                f"{consensus_graph_record['l_concat_delta_norm']:.4f}"
+                            )
+                        elif transport_fusion == "bilinear":
+                            gate_text = (
+                                "bilinear_delta="
+                                f"{consensus_graph_record['h_concat_delta_norm']:.4f}/"
+                                f"{consensus_graph_record['l_concat_delta_norm']:.4f}"
+                                ", product="
+                                f"{consensus_graph_record['h_bilinear_product_norm']:.4f}/"
+                                f"{consensus_graph_record['l_bilinear_product_norm']:.4f}"
+                            )
+                        else:
+                            gate_text = (
+                                "gates="
+                                f"{consensus_graph_record['h_transport_gate_mean']:.4f}/"
+                                f"{consensus_graph_record['l_transport_gate_mean']:.4f}"
+                            )
+                        fusion_suffix = (
+                            ", stage="
+                            f"{consensus_graph_record.get('transport_stage', 'post-gat2')}"
+                            ", round="
+                            f"{consensus_graph_record.get('transport_round', 1)}"
+                            ", lambda="
+                            f"{consensus_graph_record['transport_lambda']:.2f}"
+                            ", mode="
+                            f"{transport_fusion}"
+                            ", msg="
+                            f"{transport_message}"
+                            ", h_gamma="
+                            f"{consensus_graph_record['h_transport_gamma']:.4f}"
+                            ", l_gamma="
+                            f"{consensus_graph_record['l_transport_gamma']:.4f}"
+                            ", "
+                            f"{gate_text}"
                         )
-                    elif transport_fusion == "concat":
-                        gate_text = (
-                            "concat_delta="
-                            f"{consensus_graph_record['h_concat_delta_norm']:.4f}/"
-                            f"{consensus_graph_record['l_concat_delta_norm']:.4f}"
+                    elif "residual_gamma" in consensus_graph_record:
+                        fusion_suffix = (
+                            ", residual="
+                            f"{consensus_graph_record['residual_gamma']:.4f}"
+                            ", gate="
+                            f"{consensus_graph_record.get('residual_gate_mean', 0.0):.4f}"
                         )
-                    elif transport_fusion == "bilinear":
-                        gate_text = (
-                            "bilinear_delta="
-                            f"{consensus_graph_record['h_concat_delta_norm']:.4f}/"
-                            f"{consensus_graph_record['l_concat_delta_norm']:.4f}"
-                            ", product="
-                            f"{consensus_graph_record['h_bilinear_product_norm']:.4f}/"
-                            f"{consensus_graph_record['l_bilinear_product_norm']:.4f}"
+                    elif "fixed_weights" in consensus_graph_record:
+                        fixed_weights = np.asarray(
+                            consensus_graph_record["fixed_weights"]
                         )
-                    else:
-                        gate_text = (
-                            "gates="
-                            f"{consensus_graph_record['h_transport_gate_mean']:.4f}/"
-                            f"{consensus_graph_record['l_transport_gate_mean']:.4f}"
+                        fusion_suffix = (
+                            ", weights="
+                            f"{fixed_weights.round(2).tolist()}"
                         )
-                    fusion_suffix = (
-                        ", stage="
-                        f"{consensus_graph_record.get('transport_stage', 'post-gat2')}"
-                        ", round="
-                        f"{consensus_graph_record.get('transport_round', 1)}"
-                        ", lambda="
-                        f"{consensus_graph_record['transport_lambda']:.2f}"
-                        ", mode="
-                        f"{transport_fusion}"
-                        ", msg="
-                        f"{transport_message}"
-                        ", h_gamma="
-                        f"{consensus_graph_record['h_transport_gamma']:.4f}"
-                        ", l_gamma="
-                        f"{consensus_graph_record['l_transport_gamma']:.4f}"
-                        ", "
-                        f"{gate_text}"
+                    elif "gate_mean" in consensus_graph_record:
+                        gate_mean = np.asarray(
+                            consensus_graph_record["gate_mean"]
+                        )
+                        fusion_suffix = (
+                            ", gate="
+                            f"{gate_mean.round(2).tolist()}"
+                        )
+                    print(
+                        "  C-mediator: "
+                        f"gamma={consensus_graph_record['c_gamma']:.4f}, "
+                        f"entropy={consensus_graph_record['attention_cc_entropy']:.4f}, "
+                        f"fusion={fusion_mode}{fusion_suffix}"
                     )
-                elif "residual_gamma" in consensus_graph_record:
-                    fusion_suffix = (
-                        ", residual="
-                        f"{consensus_graph_record['residual_gamma']:.4f}"
-                        ", gate="
-                        f"{consensus_graph_record.get('residual_gate_mean', 0.0):.4f}"
-                    )
-                elif "fixed_weights" in consensus_graph_record:
-                    fixed_weights = np.asarray(
-                        consensus_graph_record["fixed_weights"]
-                    )
-                    fusion_suffix = (
-                        ", weights="
-                        f"{fixed_weights.round(2).tolist()}"
-                    )
-                elif "gate_mean" in consensus_graph_record:
-                    gate_mean = np.asarray(
-                        consensus_graph_record["gate_mean"]
-                    )
-                    fusion_suffix = (
-                        ", gate="
-                        f"{gate_mean.round(2).tolist()}"
-                    )
-                print(
-                    "  C-mediator: "
-                    f"gamma={consensus_graph_record['c_gamma']:.4f}, "
-                    f"entropy={consensus_graph_record['attention_cc_entropy']:.4f}, "
-                    f"fusion={fusion_mode}{fusion_suffix}"
-                )
             cross_records = getattr(
                 model,
                 "last_cross_bipartite_diagnostics",
@@ -4404,6 +4793,11 @@ def normalize_joint_layout_args(args):
         "--consensus-graph-transport-stage",
     )
     reset_if_needed(
+        "consensus_graph_transport_operator",
+        "transport",
+        "--consensus-graph-transport-operator",
+    )
+    reset_if_needed(
         "consensus_graph_transport_fusion",
         "residual",
         "--consensus-graph-transport-fusion",
@@ -4418,6 +4812,10 @@ def normalize_joint_layout_args(args):
         0.0,
         "--consensus-graph-transport-second-gamma-init",
     )
+    reset_if_needed("sheaf_restriction", "diag", "--sheaf-restriction")
+    reset_if_needed("sheaf_rank", 4, "--sheaf-rank")
+    reset_if_needed("sheaf_steps", 1, "--sheaf-steps")
+    reset_if_needed("sheaf_energy_weight", 0.0, "--sheaf-energy-weight")
     reset_if_needed(
         "consensus_graph_cell_edge",
         "binary",
@@ -4526,6 +4924,12 @@ def validate_args(args):
         raise ValueError(
             "--consensus-graph-transport-prior-weight must be nonnegative."
         )
+    if args.sheaf_rank <= 0:
+        raise ValueError("--sheaf-rank must be positive.")
+    if args.sheaf_steps <= 0:
+        raise ValueError("--sheaf-steps must be positive.")
+    if args.sheaf_energy_weight < 0:
+        raise ValueError("--sheaf-energy-weight must be nonnegative.")
     if any(
         weight < 0
         for weight in (
@@ -4613,6 +5017,22 @@ def validate_args(args):
             "--consensus-graph-transport-message qk-prior requires "
             "--consensus-graph-transport bidirectional."
         )
+    if (
+        args.consensus_graph_transport == "none"
+        and args.consensus_graph_transport_operator != "transport"
+    ):
+        raise ValueError(
+            "--consensus-graph-transport-operator sheaf requires "
+            "--consensus-graph-transport bidirectional."
+        )
+    if (
+        args.consensus_graph_transport_operator == "sheaf"
+        and args.post_gat_consensus_graph != "intersection-mediator"
+    ):
+        raise ValueError(
+            "--consensus-graph-transport-operator sheaf requires "
+            "--post-gat-consensus-graph intersection-mediator."
+        )
     if args.graph_layout == "joint" and args.cnn_branch != "original":
         raise ValueError(
             "--cnn-branch gsdg currently requires "
@@ -4692,18 +5112,31 @@ def main():
             resolved_mediator_count = cell_data["cell_count"]
             private_weight = 1.0 - args.consensus_graph_weight
             if args.consensus_graph_transport == "bidirectional":
-                fusion_detail = (
-                    "C-mediated bidirectional transport, "
-                    f"stage={args.consensus_graph_transport_stage}, "
-                    f"fusion={args.consensus_graph_transport_fusion}, "
-                    f"message={args.consensus_graph_transport_message}, "
-                    f"lambda={args.consensus_graph_transport_lambda:g}, "
-                    f"eta={args.consensus_graph_transport_prior_weight:g}, "
-                    "gamma-init="
-                    f"{args.consensus_graph_transport_gamma_init:g}/"
-                    f"{args.consensus_graph_transport_second_gamma_init:g}; "
-                    "pixel C fusion disabled"
-                )
+                if args.consensus_graph_transport_operator == "sheaf":
+                    fusion_detail = (
+                        "cellular-sheaf diffusion, "
+                        f"stage={args.consensus_graph_transport_stage}, "
+                        f"restriction={args.sheaf_restriction}, "
+                        f"rank={args.sheaf_rank}, "
+                        f"steps={args.sheaf_steps}, "
+                        f"lambdaE={args.sheaf_energy_weight:g}, "
+                        "alpha-init="
+                        f"{args.consensus_graph_transport_gamma_init:g}; "
+                        "pixel C fusion disabled"
+                    )
+                else:
+                    fusion_detail = (
+                        "C-mediated bidirectional transport, "
+                        f"stage={args.consensus_graph_transport_stage}, "
+                        f"fusion={args.consensus_graph_transport_fusion}, "
+                        f"message={args.consensus_graph_transport_message}, "
+                        f"lambda={args.consensus_graph_transport_lambda:g}, "
+                        f"eta={args.consensus_graph_transport_prior_weight:g}, "
+                        "gamma-init="
+                        f"{args.consensus_graph_transport_gamma_init:g}/"
+                        f"{args.consensus_graph_transport_second_gamma_init:g}; "
+                        "pixel C fusion disabled"
+                    )
             elif args.consensus_graph_fusion == "c-guided-gate":
                 fusion_detail = (
                     "gate init H/L/C="
