@@ -269,14 +269,26 @@ def parse_args():
     )
     parser.add_argument(
         "--cross-overlap-fusion",
-        choices=("bilinear", "dual-channel"),
+        choices=("bilinear", "dual-channel", "dual-path"),
         default="dual-channel",
         help=(
             "Node update after sparse overlap transport. 'bilinear' "
             "uses inter-modal message plus multiplicative evidence; "
             "'dual-channel' additionally aggregates consensus/product "
-            "and conflict/difference edge channels. Default: "
-            "dual-channel."
+            "and conflict/difference edge channels in one MLP; "
+            "'dual-path' keeps consensus and conflict in separate "
+            "MLP/gate/gamma update paths. Default: dual-channel."
+        ),
+    )
+    parser.add_argument(
+        "--cross-overlap-edge-attrs",
+        choices=("none", "physical"),
+        default="none",
+        help=(
+            "Optional edge descriptor bias for sparse overlap qk-prior "
+            "attention. 'physical' adds [coverage_H, coverage_L, IoU, "
+            "HSI-SAM, delta-height, DSM-gradient] through an edge MLP. "
+            "Default: none."
         ),
     )
     parser.add_argument(
@@ -825,6 +837,7 @@ def cross_overlap_configuration_tag(args):
         f"st{args.cross_overlap_stage}-"
         f"msg{args.cross_overlap_message}-"
         f"fu{args.cross_overlap_fusion}-"
+        f"ea{args.cross_overlap_edge_attrs}-"
         f"pw{args.cross_overlap_prior_weight:g}-"
         f"g{args.cross_overlap_gamma_init:g}-"
         f"g2{args.cross_overlap_second_gamma_init:g}"
@@ -1580,7 +1593,38 @@ def build_intersection_mediator_data(
     }
 
 
-def build_sparse_overlap_relation_data(hsi_assignment, lidar_assignment):
+def _superpixel_feature_means(assignment, pixel_features):
+    assignment = coo_matrix(assignment, dtype=np.float32).tocsr()
+    flat_features = np.asarray(pixel_features, dtype=np.float32).reshape(
+        assignment.shape[0],
+        -1,
+    )
+    area = np.asarray(assignment.sum(axis=0)).reshape(-1).astype(np.float32)
+    sums = assignment.transpose() @ flat_features
+    return np.asarray(sums, dtype=np.float32) / np.maximum(
+        area[:, None],
+        1e-6,
+    )
+
+
+def _robust_unit_scale(values):
+    values = np.asarray(values, dtype=np.float32)
+    positive = values[np.isfinite(values) & (values > 0)]
+    if positive.size == 0:
+        return np.zeros_like(values, dtype=np.float32)
+    scale = np.percentile(positive, 95)
+    return np.clip(values / max(float(scale), 1e-6), 0.0, 1.0).astype(
+        np.float32
+    )
+
+
+def build_sparse_overlap_relation_data(
+    hsi_assignment,
+    lidar_assignment,
+    hsi_features=None,
+    lidar_image=None,
+    edge_attrs="none",
+):
     """Build sparse HSI/LiDAR superpixel co-occurrence edges.
 
     Edges are the nonzero entries of M = Q_H^T Q_L. Directional edge
@@ -1603,7 +1647,7 @@ def build_sparse_overlap_relation_data(hsi_assignment, lidar_assignment):
     l_coverage = overlap_values / np.maximum(l_area[l_index], 1e-6)
     h_node_count = hsi_sparse.shape[1]
     l_node_count = lidar_sparse.shape[1]
-    return {
+    relation = {
         "h_index": h_index,
         "l_index": l_index,
         "overlap": overlap_values.astype(np.float32),
@@ -1617,7 +1661,99 @@ def build_sparse_overlap_relation_data(hsi_assignment, lidar_assignment):
         "density": float(
             overlap_values.size / max(h_node_count * l_node_count, 1)
         ),
+        "edge_attribute_mode": "none",
     }
+    if edge_attrs == "none":
+        return relation
+    if edge_attrs != "physical":
+        raise ValueError(f"Unsupported sparse overlap edge attrs: {edge_attrs}")
+    if hsi_features is None or lidar_image is None:
+        raise ValueError(
+            "Physical sparse overlap edge attributes require HSI and LiDAR "
+            "pixel features."
+        )
+
+    hsi_features = np.asarray(hsi_features, dtype=np.float32)
+    lidar_image = np.asarray(lidar_image, dtype=np.float32)
+    if lidar_image.ndim == 3:
+        lidar_image = lidar_image[:, :, 0]
+    hsi_mean_h = _superpixel_feature_means(hsi_sparse, hsi_features)
+    hsi_mean_l = _superpixel_feature_means(lidar_sparse, hsi_features)
+    hsi_left = hsi_mean_h[h_index]
+    hsi_right = hsi_mean_l[l_index]
+    sam_numerator = np.sum(hsi_left * hsi_right, axis=1)
+    sam_denominator = (
+        np.linalg.norm(hsi_left, axis=1)
+        * np.linalg.norm(hsi_right, axis=1)
+    )
+    cosine = np.clip(
+        sam_numerator / np.maximum(sam_denominator, 1e-6),
+        -1.0,
+        1.0,
+    )
+    sam = (np.arccos(cosine) / np.pi).astype(np.float32)
+
+    lidar_stack = lidar_image[:, :, np.newaxis]
+    h_height = _superpixel_feature_means(hsi_sparse, lidar_stack)[:, 0]
+    l_height = _superpixel_feature_means(lidar_sparse, lidar_stack)[:, 0]
+    delta_height = np.abs(h_height[h_index] - l_height[l_index]).astype(
+        np.float32
+    )
+
+    gradient_y, gradient_x = np.gradient(lidar_image)
+    gradient = np.sqrt(gradient_x * gradient_x + gradient_y * gradient_y)
+    weighted_lidar = lidar_sparse.multiply(
+        gradient.reshape(-1, 1).astype(np.float32)
+    )
+    gradient_overlap = (hsi_sparse.transpose() @ weighted_lidar).tocoo()
+    gradient_lookup = {
+        int(row) * l_node_count + int(col): float(value)
+        for row, col, value in zip(
+            gradient_overlap.row,
+            gradient_overlap.col,
+            gradient_overlap.data,
+        )
+    }
+    edge_keys = h_index * l_node_count + l_index
+    gradient_sum = np.asarray(
+        [gradient_lookup.get(int(key), 0.0) for key in edge_keys],
+        dtype=np.float32,
+    )
+    boundary = gradient_sum / np.maximum(overlap_values, 1e-6)
+
+    iou = overlap_values / np.maximum(
+        h_area[h_index] + l_area[l_index] - overlap_values,
+        1e-6,
+    )
+    edge_attributes = np.stack(
+        [
+            h_coverage,
+            l_coverage,
+            iou.astype(np.float32),
+            sam,
+            _robust_unit_scale(delta_height),
+            _robust_unit_scale(boundary),
+        ],
+        axis=1,
+    ).astype(np.float32)
+    relation["edge_attributes"] = edge_attributes
+    relation["edge_attribute_mode"] = "physical"
+    relation["edge_attribute_names"] = [
+        "coverage_h",
+        "coverage_l",
+        "iou",
+        "sam",
+        "delta_height",
+        "boundary",
+    ]
+    relation["edge_attribute_stats"] = {
+        name: {
+            "mean": float(edge_attributes[:, index].mean()),
+            "std": float(edge_attributes[:, index].std()),
+        }
+        for index, name in enumerate(relation["edge_attribute_names"])
+    }
+    return relation
 
 
 def normalized_cell_fragmentation(
@@ -3924,6 +4060,34 @@ class SparseOverlapCrossModalRelation(nn.Module):
         self.l_node_count = int(relation_data["l_node_count"])
         self.edge_count = int(relation_data["edge_count"])
         self.density = float(relation_data["density"])
+        self.edge_attribute_mode = relation_data.get(
+            "edge_attribute_mode",
+            "none",
+        )
+        edge_attributes = relation_data.get("edge_attributes")
+        if edge_attributes is not None:
+            edge_attributes = np.asarray(edge_attributes, dtype=np.float32)
+            self.register_buffer(
+                "edge_attributes",
+                torch.as_tensor(edge_attributes, dtype=torch.float32),
+                persistent=False,
+            )
+            edge_hidden = max(8, 2 * edge_attributes.shape[1])
+            edge_bias_output = nn.Linear(edge_hidden, 1)
+            nn.init.zeros_(edge_bias_output.weight)
+            nn.init.zeros_(edge_bias_output.bias)
+            self.edge_bias = nn.Sequential(
+                nn.Linear(edge_attributes.shape[1], edge_hidden),
+                nn.LeakyReLU(),
+                edge_bias_output,
+            )
+        else:
+            self.register_buffer(
+                "edge_attributes",
+                None,
+                persistent=False,
+            )
+            self.edge_bias = None
 
         self.h_query = nn.Linear(channels, attention_d_k, bias=False)
         self.l_key = nn.Linear(channels, attention_d_k, bias=False)
@@ -3987,6 +4151,30 @@ class SparseOverlapCrossModalRelation(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(channels, channels),
         )
+        self.h_consensus_path = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
+        self.h_conflict_path = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
+        self.l_consensus_path = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
+        self.l_conflict_path = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
 
         def make_gate(input_channels):
             output = nn.Linear(channels, 1)
@@ -4002,10 +4190,30 @@ class SparseOverlapCrossModalRelation(nn.Module):
         self.l_bilinear_gate = make_gate(4 * channels)
         self.h_dual_gate = make_gate(5 * channels)
         self.l_dual_gate = make_gate(5 * channels)
+        self.h_consensus_gate = make_gate(3 * channels)
+        self.h_conflict_gate = make_gate(3 * channels)
+        self.l_consensus_gate = make_gate(3 * channels)
+        self.l_conflict_gate = make_gate(3 * channels)
         self.h_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
         self.l_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
         self.h_gamma2 = nn.Parameter(torch.tensor(float(second_gamma_init)))
         self.l_gamma2 = nn.Parameter(torch.tensor(float(second_gamma_init)))
+        self.h_consensus_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.h_conflict_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.l_consensus_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.l_conflict_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.h_consensus_gamma2 = nn.Parameter(
+            torch.tensor(float(second_gamma_init))
+        )
+        self.h_conflict_gamma2 = nn.Parameter(
+            torch.tensor(float(second_gamma_init))
+        )
+        self.l_consensus_gamma2 = nn.Parameter(
+            torch.tensor(float(second_gamma_init))
+        )
+        self.l_conflict_gamma2 = nn.Parameter(
+            torch.tensor(float(second_gamma_init))
+        )
         self.last_diagnostics = None
 
     @staticmethod
@@ -4066,6 +4274,9 @@ class SparseOverlapCrossModalRelation(nn.Module):
             return self.h_coverage, self.l_coverage
         if self.message != "qk-prior":
             raise ValueError(f"Unsupported sparse overlap message: {self.message}")
+        edge_bias = None
+        if self.edge_bias is not None:
+            edge_bias = self.edge_bias(self.edge_attributes).squeeze(1)
 
         h_logits = (
             self.h_query(hsi_nodes)[self.h_index]
@@ -4074,6 +4285,8 @@ class SparseOverlapCrossModalRelation(nn.Module):
         h_logits = h_logits + self.prior_weight * torch.log(
             self.h_coverage.clamp_min(1e-6)
         )
+        if edge_bias is not None:
+            h_logits = h_logits + edge_bias
         h_weights = self._segment_softmax(
             h_logits,
             self.h_index,
@@ -4087,6 +4300,8 @@ class SparseOverlapCrossModalRelation(nn.Module):
         l_logits = l_logits + self.prior_weight * torch.log(
             self.l_coverage.clamp_min(1e-6)
         )
+        if edge_bias is not None:
+            l_logits = l_logits + edge_bias
         l_weights = self._segment_softmax(
             l_logits,
             self.l_index,
@@ -4108,10 +4323,24 @@ class SparseOverlapCrossModalRelation(nn.Module):
         dual_fuse,
         bilinear_gate,
         dual_gate,
+        consensus_gamma,
+        conflict_gamma,
+        consensus_path,
+        conflict_path,
+        consensus_gate,
+        conflict_gate,
     ):
         product = bilinear_out(
             bilinear_left(nodes) * bilinear_right(message)
         )
+        path_stats = {
+            "consensus_gate_mean": None,
+            "conflict_gate_mean": None,
+            "consensus_delta_norm": None,
+            "conflict_delta_norm": None,
+            "consensus_gamma": None,
+            "conflict_gamma": None,
+        }
         if self.fusion == "bilinear":
             fuse_input = torch.cat(
                 [
@@ -4137,18 +4366,81 @@ class SparseOverlapCrossModalRelation(nn.Module):
             )
             delta = dual_fuse(fuse_input)
             gate = torch.sigmoid(dual_gate(fuse_input))
+        elif self.fusion == "dual-path":
+            consensus_delta = consensus_path(consensus)
+            conflict_delta = conflict_path(conflict)
+            consensus_gate_value = torch.sigmoid(
+                consensus_gate(
+                    torch.cat(
+                        [
+                            nodes,
+                            consensus,
+                            product,
+                        ],
+                        dim=1,
+                    )
+                )
+            )
+            conflict_gate_value = torch.sigmoid(
+                conflict_gate(
+                    torch.cat(
+                        [
+                            nodes,
+                            conflict,
+                            torch.abs(nodes - message),
+                        ],
+                        dim=1,
+                    )
+                )
+            )
+            updated = (
+                nodes
+                + consensus_gamma
+                * consensus_gate_value
+                * consensus_delta
+                + conflict_gamma
+                * conflict_gate_value
+                * conflict_delta
+            )
+            gate = 0.5 * (consensus_gate_value + conflict_gate_value)
+            delta = consensus_delta + conflict_delta
+            path_stats = {
+                "consensus_gate_mean": float(
+                    consensus_gate_value.detach().mean().item()
+                ),
+                "conflict_gate_mean": float(
+                    conflict_gate_value.detach().mean().item()
+                ),
+                "consensus_delta_norm": float(
+                    consensus_delta.detach().norm(dim=1).mean().item()
+                ),
+                "conflict_delta_norm": float(
+                    conflict_delta.detach().norm(dim=1).mean().item()
+                ),
+                "consensus_gamma": float(consensus_gamma.detach().item()),
+                "conflict_gamma": float(conflict_gamma.detach().item()),
+            }
+            return updated, gate, product, delta, path_stats
         else:
             raise ValueError(f"Unsupported sparse overlap fusion: {self.fusion}")
         updated = nodes + gamma * gate * delta
-        return updated, gate, product, delta
+        return updated, gate, product, delta, path_stats
 
     def forward(self, hsi_nodes, lidar_nodes, round_index=1):
         if round_index == 1:
             h_gamma = self.h_gamma
             l_gamma = self.l_gamma
+            h_consensus_gamma = self.h_consensus_gamma
+            h_conflict_gamma = self.h_conflict_gamma
+            l_consensus_gamma = self.l_consensus_gamma
+            l_conflict_gamma = self.l_conflict_gamma
         elif round_index == 2:
             h_gamma = self.h_gamma2
             l_gamma = self.l_gamma2
+            h_consensus_gamma = self.h_consensus_gamma2
+            h_conflict_gamma = self.h_conflict_gamma2
+            l_consensus_gamma = self.l_consensus_gamma2
+            l_conflict_gamma = self.l_conflict_gamma2
         else:
             raise ValueError("round_index must be 1 or 2.")
 
@@ -4198,7 +4490,13 @@ class SparseOverlapCrossModalRelation(nn.Module):
             self.l_node_count,
         )
 
-        updated_hsi, h_gate, h_product, h_delta = self._update_side(
+        (
+            updated_hsi,
+            h_gate,
+            h_product,
+            h_delta,
+            h_path_stats,
+        ) = self._update_side(
             hsi_nodes,
             h_message,
             h_consensus,
@@ -4211,8 +4509,20 @@ class SparseOverlapCrossModalRelation(nn.Module):
             self.h_dual_fuse,
             self.h_bilinear_gate,
             self.h_dual_gate,
+            h_consensus_gamma,
+            h_conflict_gamma,
+            self.h_consensus_path,
+            self.h_conflict_path,
+            self.h_consensus_gate,
+            self.h_conflict_gate,
         )
-        updated_lidar, l_gate, l_product, l_delta = self._update_side(
+        (
+            updated_lidar,
+            l_gate,
+            l_product,
+            l_delta,
+            l_path_stats,
+        ) = self._update_side(
             lidar_nodes,
             l_message,
             l_consensus,
@@ -4225,6 +4535,12 @@ class SparseOverlapCrossModalRelation(nn.Module):
             self.l_dual_fuse,
             self.l_bilinear_gate,
             self.l_dual_gate,
+            l_consensus_gamma,
+            l_conflict_gamma,
+            self.l_consensus_path,
+            self.l_conflict_path,
+            self.l_consensus_gate,
+            self.l_conflict_gate,
         )
 
         h_entropy = self._edge_entropy(
@@ -4237,12 +4553,23 @@ class SparseOverlapCrossModalRelation(nn.Module):
             self.l_index,
             self.l_node_count,
         )
+        edge_bias_mean = None
+        edge_bias_std = None
+        if self.edge_bias is not None:
+            edge_bias_values = self.edge_bias(self.edge_attributes).detach()
+            edge_bias_mean = float(edge_bias_values.mean().item())
+            edge_bias_std = float(
+                edge_bias_values.std(unbiased=False).item()
+            )
         self.last_diagnostics = {
             "transport_operator": "sparse-overlap",
             "transport_mode": "sparse-overlap",
             "transport_round": int(round_index),
             "transport_message": self.message,
             "transport_fusion": self.fusion,
+            "edge_attribute_mode": self.edge_attribute_mode,
+            "edge_bias_mean": edge_bias_mean,
+            "edge_bias_std": edge_bias_std,
             "edge_count": int(self.edge_count),
             "edge_density": float(self.density),
             "h_transport_gamma": float(h_gamma.detach().item()),
@@ -4269,6 +4596,34 @@ class SparseOverlapCrossModalRelation(nn.Module):
             "l_product_norm": float(
                 l_product.detach().norm(dim=1).mean().item()
             ),
+            "h_consensus_gate_mean": h_path_stats[
+                "consensus_gate_mean"
+            ],
+            "h_conflict_gate_mean": h_path_stats[
+                "conflict_gate_mean"
+            ],
+            "l_consensus_gate_mean": l_path_stats[
+                "consensus_gate_mean"
+            ],
+            "l_conflict_gate_mean": l_path_stats[
+                "conflict_gate_mean"
+            ],
+            "h_consensus_delta_norm": h_path_stats[
+                "consensus_delta_norm"
+            ],
+            "h_conflict_delta_norm": h_path_stats[
+                "conflict_delta_norm"
+            ],
+            "l_consensus_delta_norm": l_path_stats[
+                "consensus_delta_norm"
+            ],
+            "l_conflict_delta_norm": l_path_stats[
+                "conflict_delta_norm"
+            ],
+            "h_consensus_gamma": h_path_stats["consensus_gamma"],
+            "h_conflict_gamma": h_path_stats["conflict_gamma"],
+            "l_consensus_gamma": l_path_stats["consensus_gamma"],
+            "l_conflict_gamma": l_path_stats["conflict_gamma"],
         }
         return updated_hsi, updated_lidar
 
@@ -6180,6 +6535,15 @@ def prepare_data(args, config):
                 lidar,
             )
         )
+    cross_overlap_data = None
+    if args.cross_overlap_relation == "sparse":
+        cross_overlap_data = build_sparse_overlap_relation_data(
+            hsi_assignment,
+            lidar_assignment,
+            hsi_features=hsi,
+            lidar_image=lidar,
+            edge_attrs=args.cross_overlap_edge_attrs,
+        )
     bridge_data = None
     if args.post_gat_consensus_graph == "intersection-mediator":
         bridge_data = build_intersection_mediator_data(
@@ -6204,6 +6568,7 @@ def prepare_data(args, config):
         lidar_geometry_descriptors,
         cell_data,
         bridge_data,
+        cross_overlap_data,
         joint_spatial_prior,
     )
 
@@ -6225,6 +6590,7 @@ def train_one_run(
     lidar_geometry_descriptors,
     cell_data,
     bridge_data,
+    cross_overlap_data,
     joint_spatial_prior,
     run_index,
 ):
@@ -6346,6 +6712,7 @@ def train_one_run(
             cross_overlap_second_gamma_init=(
                 args.cross_overlap_second_gamma_init
             ),
+            cross_overlap_data=cross_overlap_data,
             bridge_attention_d_k=args.bridge_attention_dk,
             bridge_attention_topk=args.bridge_attention_topk,
             bridge_gamma_init=args.consensus_graph_c_gamma_init,
@@ -6517,19 +6884,41 @@ def train_one_run(
                     f"L[{topology_side_text(topology_rewiring_record['lidar'])}]"
                 )
             if cross_overlap_record is not None:
+                if (
+                    cross_overlap_record["transport_fusion"]
+                    == "dual-path"
+                ):
+                    sparse_suffix = (
+                        "gamma-con/conf="
+                        f"{cross_overlap_record['h_consensus_gamma']:.3f}/"
+                        f"{cross_overlap_record['h_conflict_gamma']:.3f};"
+                        f"{cross_overlap_record['l_consensus_gamma']:.3f}/"
+                        f"{cross_overlap_record['l_conflict_gamma']:.3f}, "
+                        "gate-con/conf="
+                        f"{cross_overlap_record['h_consensus_gate_mean']:.3f}/"
+                        f"{cross_overlap_record['h_conflict_gate_mean']:.3f};"
+                        f"{cross_overlap_record['l_consensus_gate_mean']:.3f}/"
+                        f"{cross_overlap_record['l_conflict_gate_mean']:.3f}"
+                    )
+                else:
+                    sparse_suffix = (
+                        "gamma="
+                        f"{cross_overlap_record['h_transport_gamma']:.3f}/"
+                        f"{cross_overlap_record['l_transport_gamma']:.3f}, "
+                        "gate="
+                        f"{cross_overlap_record['h_gate_mean']:.3f}/"
+                        f"{cross_overlap_record['l_gate_mean']:.3f}"
+                    )
                 print(
                     "  Sparse overlap: "
                     f"stage={cross_overlap_record['stage']}, "
                     f"round={cross_overlap_record['transport_round']}, "
                     f"msg={cross_overlap_record['transport_message']}, "
                     f"fusion={cross_overlap_record['transport_fusion']}, "
+                    f"edge-attrs={cross_overlap_record['edge_attribute_mode']}, "
+                    f"edge-bias={cross_overlap_record.get('edge_bias_mean', 0.0) or 0.0:.3f}, "
                     f"edges={cross_overlap_record['edge_count']}, "
-                    f"gamma="
-                    f"{cross_overlap_record['h_transport_gamma']:.3f}/"
-                    f"{cross_overlap_record['l_transport_gamma']:.3f}, "
-                    f"gate="
-                    f"{cross_overlap_record['h_gate_mean']:.3f}/"
-                    f"{cross_overlap_record['l_gate_mean']:.3f}"
+                    f"{sparse_suffix}"
                 )
             if consensus_graph_record is not None:
                 if (
@@ -6913,6 +7302,11 @@ def normalize_joint_layout_args(args):
         "--cross-overlap-fusion",
     )
     reset_if_needed(
+        "cross_overlap_edge_attrs",
+        "none",
+        "--cross-overlap-edge-attrs",
+    )
+    reset_if_needed(
         "cross_overlap_prior_weight",
         1.0,
         "--cross-overlap-prior-weight",
@@ -7106,6 +7500,19 @@ def validate_args(args):
             raise ValueError(
                 "--cross-overlap-second-gamma-init must be nonnegative."
             )
+        if (
+            args.cross_overlap_edge_attrs != "none"
+            and args.cross_overlap_message != "qk-prior"
+        ):
+            raise ValueError(
+                "--cross-overlap-edge-attrs physical requires "
+                "--cross-overlap-message qk-prior."
+            )
+    elif args.cross_overlap_edge_attrs != "none":
+        raise ValueError(
+            "--cross-overlap-edge-attrs physical requires "
+            "--cross-overlap-relation sparse."
+        )
     if args.post_gat_consensus_graph != "none":
         if args.graph_layout != "separate":
             raise ValueError(
@@ -7214,6 +7621,7 @@ def main():
         lidar_geometry_descriptors,
         cell_data,
         bridge_data,
+        cross_overlap_data,
         joint_spatial_prior,
     ) = prepare_data(args, config)
 
@@ -7259,6 +7667,7 @@ def main():
                 f"stage={args.cross_overlap_stage} | "
                 f"message={args.cross_overlap_message} | "
                 f"fusion={args.cross_overlap_fusion} | "
+                f"edge-attrs={args.cross_overlap_edge_attrs} | "
                 f"prior-weight={args.cross_overlap_prior_weight:g} | "
                 "gamma-init="
                 f"{args.cross_overlap_gamma_init:g}/"
@@ -7435,6 +7844,7 @@ def main():
             lidar_geometry_descriptors,
             cell_data,
             bridge_data,
+            cross_overlap_data,
             joint_spatial_prior,
             run_index,
         )
