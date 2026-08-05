@@ -1,14 +1,9 @@
-"""Stage-8 demo: private dual GSDG graphs plus mediator C-GAT.
+"""Demo trainer: private dual GSDG graphs plus active lightweight ablations.
 
 The fixed hypergraph/HGCN path is replaced by GSDG graph/GAT propagation.
 The default uses independent HSI and LiDAR graphs; the previous concatenated
-node graph remains selectable. The LiDAR graph can additionally restrict its
-dynamic neighbors with a local RAG and an elevation-similarity KNN. The
-original joint CNN and fusion remain. Cross-modal interaction is optional:
-the older post-GAT2 intersection-cell mediator C graph is retained, while the
-newer path treats C as a cross-modal overlap bipartite graph over HSI/LiDAR
-superpixel nodes and performs alternating propagation between private GAT
-stages.
+node graph remains selectable. Retired experimental branches are archived
+outside this main demo entry.
 """
 
 import argparse
@@ -33,16 +28,13 @@ from train import (
     OriginalSSConv,
     WMF,
     build_common_boundary_strength,
-    build_common_refinement_cells,
     build_rag_hop_candidates,
     build_superpixel_spatial_prior,
     minmax_normalize,
     normalized_sparse_assignments,
-    scipy_sparse_to_torch,
     set_seed,
     split_fixed_samples_per_class,
     superpixel_height_distribution,
-    symmetrically_normalize_sparse_adjacency,
 )
 from utils import (
     get_felzenszwalb_Segs,
@@ -52,7 +44,7 @@ from utils import (
 )
 
 
-STAGE = "stage8_intersection_mediator_cgat"
+STAGE = "stage8_clean_demo"
 
 
 def parse_args():
@@ -134,103 +126,180 @@ def parse_args():
         help="HSI weight when fusing the two separate graph outputs.",
     )
     parser.add_argument(
-        "--topology-rewiring",
-        choices=("none", "cell-veto-advocacy"),
+        "--dual-transport-arbitration",
+        choices=("none", "post-gat2", "post-gat", "postgat"),
         default="none",
         help=(
-            "Cross-modal topology rewiring for private dynamic graphs. "
-            "'cell-veto-advocacy' uses intersection cells to build "
-            "opposite-modality evidence profiles and modulates Q/K "
-            "graph logits without feature transport. Default: none."
+            "Geometry-semantic dual transport arbitration after private "
+            "GAT2 and before graph readout. It compares overlap coverage "
+            "transport with feature-similarity transport on the same "
+            "nonzero overlap support. Default: none."
         ),
     )
     parser.add_argument(
-        "--topology-advocacy-k",
+        "--dta-dk",
         type=int,
-        default=0,
+        default=64,
+        help="Query/key dimension for dual transport arbitration.",
+    )
+    parser.add_argument(
+        "--dta-tau",
+        type=float,
+        default=0.1,
+        help="Semantic softmax temperature for dual transport arbitration.",
+    )
+    parser.add_argument(
+        "--dta-gamma-init",
+        type=float,
+        default=0.0,
         help=(
-            "Extra opposite-evidence KNN candidates used for advocacy "
-            "rewiring when a hard support mask exists. Keep 0 for "
-            "pure veto/logit modulation. Default: 0."
+            "Initial residual scale for dual transport arbitration. "
+            "Zero makes the initial forward pass match the baseline."
         ),
     )
     parser.add_argument(
-        "--topology-advocacy-rag-hops",
+        "--dta-variant",
+        choices=("simple", "full"),
+        default="simple",
+        help=(
+            "Dual transport arbitration variant. 'simple' keeps semantic "
+            "transport on overlap edges only; 'full' adds optional "
+            "nonlocal retrieval, Sinkhorn normalization, and auxiliary "
+            "regularization. Default: simple."
+        ),
+    )
+    parser.add_argument(
+        "--dta-nonlocal-topk",
         type=int,
-        choices=(1, 2),
-        default=2,
+        default=10,
         help=(
-            "Local LiDAR RAG support used only for advocacy candidates. "
-            "This does not change --lidar-rag-hops for the base LiDAR "
-            "graph. Default: 2."
+            "Extra full-image semantic neighbors per receiver node for "
+            "--dta-variant full. Set 0 to disable nonlocal retrieval. "
+            "Default: 10."
         ),
     )
     parser.add_argument(
-        "--topology-audit-side",
-        choices=("both", "hsi", "lidar"),
-        default="both",
+        "--dta-normalization",
+        choices=("softmax", "sinkhorn"),
+        default="sinkhorn",
         help=(
-            "Which private graph is audited by opposite-modality cell "
-            "evidence. 'hsi' means LiDAR evidence rewires HSI edges; "
-            "'lidar' means HSI evidence rewires LiDAR edges. "
-            "Default: both."
+            "Semantic transport normalization used by --dta-variant full. "
+            "The simple variant always uses sparse row-softmax. "
+            "Default: sinkhorn."
         ),
     )
     parser.add_argument(
-        "--topology-evidence",
-        choices=("learned", "physical"),
-        default="learned",
+        "--dta-sinkhorn-iters",
+        type=int,
+        default=5,
+        help="Sinkhorn iterations for --dta-variant full. Default: 5.",
+    )
+    parser.add_argument(
+        "--dta-aux-sparse-weight",
+        type=float,
+        default=0.05,
         help=(
-            "Opposite evidence profile used by topology rewiring. "
-            "'learned' uses opposite encoded node features; 'physical' "
-            "uses fixed LiDAR height/gradient statistics for HSI and "
-            "fixed HSI PCA means for LiDAR. Default: learned."
+            "Weight for the full-DTA gate sparsity auxiliary loss. "
+            "Only active with --dta-variant full. Default: 0.05."
         ),
     )
     parser.add_argument(
-        "--topology-impurity-mode",
-        choices=("none", "target", "source-temperature", "both"),
-        default="target",
+        "--dta-aux-align-weight",
+        type=float,
+        default=0.10,
         help=(
-            "How fragmentation affects rewired logits. 'target' "
-            "penalizes impure message-source nodes; "
-            "'source-temperature' flattens attention emitted by impure "
-            "receiver/source rows; 'both' applies both. Default: target."
+            "Weight for the full-DTA harmonious overlap alignment loss. "
+            "Only active with --dta-variant full. Default: 0.10."
         ),
     )
     parser.add_argument(
-        "--topology-freeze-advocacy",
+        "--dta-aux-entropy-weight",
+        type=float,
+        default=0.01,
+        help=(
+            "Weight for the full-DTA semantic transport entropy penalty. "
+            "Only active with --dta-variant full. Default: 0.01."
+        ),
+    )
+    parser.add_argument(
+        "--dta-film",
         action="store_true",
         help=(
-            "Freeze the advocacy alpha scalar. Use with "
-            "--topology-advocacy-init 0 for strict veto-only ablation."
+            "Enable conflict-aware FiLM after DTA. It uses DTA's "
+            "arbitrated cross-modal context to modulate only a shared "
+            "prefix of each modality node feature, with conflict-driven "
+            "shrinkage. Default: disabled."
         ),
     )
     parser.add_argument(
-        "--topology-veto-init",
-        type=float,
-        default=0.0,
+        "--dta-film-ds",
+        type=int,
+        default=64,
         help=(
-            "Initial beta for opposite-evidence distance veto. Zero "
-            "keeps the initial logits equal to the base graph."
+            "Number of leading channels treated as the shared FiLM "
+            "subspace. Remaining channels are private bypass. Default: 64."
         ),
     )
     parser.add_argument(
-        "--topology-advocacy-init",
+        "--dta-film-gamma-init",
         type=float,
         default=0.0,
         help=(
-            "Initial alpha for opposite-evidence similarity advocacy. "
-            "Zero keeps the initial logits equal to the base graph."
+            "Initial residual scale for DTA-FiLM. Zero makes the initial "
+            "forward pass match DTA without FiLM. Default: 0."
         ),
     )
     parser.add_argument(
-        "--topology-impurity-init",
+        "--assignment-graph",
+        choices=("none", "post-gat2", "post-gat", "postgat"),
+        default="none",
+        help=(
+            "SEGMN-style overlap-restricted assignment graph. It runs "
+            "after private HSI/LiDAR GAT2, treats every nonzero overlap "
+            "pair (HSI-SP i, LiDAR-SP j) as an assignment node, applies "
+            "one assignment graph convolution, and writes back to the "
+            "private nodes with zero-init residual scales. Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--assignment-graph-topk",
+        type=int,
+        default=8,
+        help=(
+            "Top-k assignment neighbors retained per overlap-pair node. "
+            "Default: 8."
+        ),
+    )
+    parser.add_argument(
+        "--assignment-graph-gamma-init",
         type=float,
         default=0.0,
         help=(
-            "Initial node fragmentation penalty read from the common "
-            "refinement cells. Zero disables it at initialization."
+            "Initial residual scale for assignment graph writeback. "
+            "Zero makes the initial forward pass match the private "
+            "GAT2 baseline. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--assignment-graph-output",
+        choices=("writeback", "third-branch", "both"),
+        default="writeback",
+        help=(
+            "How the assignment graph contributes after its C-GNN. "
+            "'writeback' applies post-GAT2 residual node correction; "
+            "'third-branch' projects assignment nodes directly to pixels "
+            "and fuses them with private graph pixels; 'both' does both. "
+            "Default: writeback."
+        ),
+    )
+    parser.add_argument(
+        "--assignment-graph-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "Weight of the assignment third branch when "
+            "--assignment-graph-output is third-branch or both. "
+            "Default: 0.1."
         ),
     )
     parser.add_argument(
@@ -315,337 +384,252 @@ def parse_args():
             "when --cross-overlap-stage alternating. Default: 0."
         ),
     )
-    # Archived ablation switches are kept as hidden compatibility flags
-    # but their active choices are removed from the main entry point.
     parser.add_argument(
-        "--post-gat-consensus-graph",
-        choices=("none", "intersection-mediator"),
-        default="none",
-        help=(
-            "Optional post-GAT2 mediator consensus graph as an "
-            "independent third pixel branch. 'intersection-mediator' "
-            "uses HSI-superpixel ∩ LiDAR-superpixel cells. "
-            "Default: none."
-        ),
-    )
-    parser.add_argument(
-        "--consensus-graph-weight",
-        type=float,
-        default=0.1,
-        help=(
-            "Pixel-fusion weight of the mediator consensus graph "
-            "branch. The remaining weight is split between HSI and "
-            "LiDAR according to --graph-modality-lambda. Default: "
-            "0.1."
-        ),
-    )
-    parser.add_argument(
-        "--consensus-graph-fusion",
-        choices=("fixed", "c-guided-gate", "residual-c"),
-        default="residual-c",
-        help=(
-            "Fuse HSI/LiDAR/mediator graph pixels with fixed weights "
-            "or a C-guided pixel-wise tri-graph gate. 'residual-c' "
-            "starts exactly from the private HSI/LiDAR baseline. "
-            "Default: residual-c."
-        ),
-    )
-    parser.add_argument(
-        "--consensus-graph-residual-init",
+        "--cross-overlap-min-coverage",
         type=float,
         default=0.0,
         help=(
-            "Initial residual scale for residual-c fusion. Zero makes "
-            "the initial forward pass exactly match private HSI/LiDAR "
-            "graph fusion. Default: 0."
+            "Prune sparse overlap edges whose HSI and LiDAR coverage "
+            "are both below this threshold. Use 0.05 for the 2a "
+            "edge-pruning ablation. Default: 0 disables coverage "
+            "pruning."
         ),
     )
     parser.add_argument(
-        "--consensus-graph-c-gamma-init",
+        "--cross-overlap-iou-topk",
+        type=int,
+        default=0,
+        help=(
+            "After coverage pruning, keep only edges that are in the "
+            "IoU top-k of both endpoint nodes. Use 3 for the 2a "
+            "edge-pruning ablation. Default: 0 disables top-k pruning."
+        ),
+    )
+    parser.add_argument(
+        "--cross-overlap-fragmentation-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "Fixed alpha for 2c fragmentation gating on sparse overlap "
+            "node updates: gate=exp(-alpha*(1-max_iou)). Try 1, 2, "
+            "or 4 after 2b/2a is validated. Default: 0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--overlap-distill-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of confidence-weighted mutual distillation on "
+            "HSI/LiDAR overlap edges. Default: 0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--overlap-distill-temperature",
+        type=float,
+        default=2.0,
+        help="Temperature used by overlap-edge distillation. Default: 2.",
+    )
+    parser.add_argument(
+        "--overlap-distill-iou-threshold",
+        type=float,
+        default=0.3,
+        help=(
+            "Only overlap edges with IoU above this threshold are used "
+            "for distillation. Default: 0.3."
+        ),
+    )
+    parser.add_argument(
+        "--overlap-distill-margin",
         type=float,
         default=0.1,
         help=(
-            "Initial residual scale of the mediator C-GAT branch "
-            "inside the C graph. Default: 0.1."
+            "Teacher confidence must exceed student confidence by this "
+            "margin. Default: 0.1."
         ),
     )
     parser.add_argument(
-        "--consensus-graph-transport",
-        choices=("none", "bidirectional"),
+        "--overlap-distill-warmup-ratio",
+        type=float,
+        default=0.2,
+        help=(
+            "Fraction of epochs with zero distillation before linear "
+            "ramp-up. Default: 0.2."
+        ),
+    )
+    parser.add_argument(
+        "--overlap-distill-confidence",
+        choices=("max-prob", "neg-entropy"),
+        default="max-prob",
+        help=(
+            "Confidence score used to pick the teacher on each overlap "
+            "edge. 'neg-entropy' is normalized as 1-H(p)/log(C). "
+            "Default: max-prob."
+        ),
+    )
+    parser.add_argument(
+        "--evidence-fusion",
+        choices=("none", "dirichlet"),
         default="none",
         help=(
-            "Optional post-GAT2 C-mediated bidirectional transport. "
-            "When set to 'bidirectional', HSI/LiDAR nodes exchange "
-            "messages through the intersection C graph before pixel "
-            "projection, and the third pixel C branch is not fused. "
+            "Optional evidence decision fusion for separate HSI/LiDAR "
+            "graph branches. 'dirichlet' uses two branch evidence heads, "
+            "Dempster pixel fusion, and EDL classification loss. "
             "Default: none."
         ),
     )
     parser.add_argument(
-        "--consensus-graph-transport-stage",
-        choices=("post-gat2", "inter-gat", "alternating"),
-        default="post-gat2",
+        "--bcq-interaction",
+        choices=("none", "post-gat2", "post-gat", "postgat"),
+        default="none",
         help=(
-            "Where to apply intersection-mediator transport. "
-            "'post-gat2' keeps the previous single late transport; "
-            "'inter-gat' applies transport after GAT1 and before GAT2; "
-            "'alternating' applies transport after GAT1 and again "
-            "after GAT2. Default: post-gat2."
+            "Bipartite-grounded Consensus Quotient interaction. "
+            "The first implemented slot is post-GAT2: private GAT1/GAT2 "
+            "then BCQ membership-consistency residual writeback. "
+            "Default: none."
         ),
     )
     parser.add_argument(
-        "--consensus-graph-transport-operator",
-        choices=("transport", "sheaf", "dcsi", "cgsa"),
-        default="transport",
-        help=(
-            "Operator used inside bidirectional intersection-mediator "
-            "transport. 'transport' keeps the existing C-mediated "
-            "Beta/QK message route. 'sheaf' treats intersection cells "
-            "as edge stalks on the HSI-LiDAR bipartite graph and applies "
-            "a cellular-sheaf diffusion half-step. 'dcsi' applies the "
-            "dual-channel contextual sheaf interaction with consensus/"
-            "conflict stalk reasoning. 'cgsa' applies context-gated "
-            "sheaf alignment where the edge graph only calibrates the "
-            "conflict-correction step size. Default: transport."
-        ),
-    )
-    parser.add_argument(
-        "--sheaf-restriction",
-        choices=("diag", "lowrank"),
-        default="diag",
-        help=(
-            "Restriction-map parameterization for "
-            "--consensus-graph-transport-operator sheaf. Default: diag."
-        ),
-    )
-    parser.add_argument(
-        "--sheaf-rank",
+        "--bcq-anchor-ratio",
         type=int,
         default=4,
-        help="Low-rank restriction rank for --sheaf-restriction lowrank.",
-    )
-    parser.add_argument(
-        "--sheaf-steps",
-        type=int,
-        default=1,
-        help="Number of cellular-sheaf diffusion half-steps. Default: 1.",
-    )
-    parser.add_argument(
-        "--sheaf-energy-weight",
-        type=float,
-        default=0.0,
         help=(
-            "Optional weight for the sheaf Dirichlet energy regularizer. "
-            "Use 0 to validate pure diffusion. Default: 0."
+            "Number of shared BCQ anchors per real dataset class. "
+            "Default: 4."
         ),
     )
     parser.add_argument(
-        "--dcsi-edge-topk",
+        "--bcq-anchor-topk",
         type=int,
         default=8,
         help=(
-            "Top-K edge-stalk neighbors used by DCSI contextual "
-            "reasoning. Default: 8."
+            "Top-k anchors retained in every node-to-anchor membership "
+            "distribution. Default: 8."
         ),
     )
     parser.add_argument(
-        "--dcsi-consensus-mix",
-        type=float,
-        default=0.1,
-        help="Mu_C for DCSI consensus-channel edge reasoning.",
+        "--bcq-anchor-dk",
+        type=int,
+        default=32,
+        help="BCQ node/anchor key dimension. Default: 32.",
     )
     parser.add_argument(
-        "--dcsi-conflict-mix",
-        type=float,
-        default=0.1,
-        help="Mu_D for DCSI conflict-channel edge reasoning.",
-    )
-    parser.add_argument(
-        "--dcsi-semantic-gamma-init",
-        type=float,
-        default=0.1,
-        help="Initial DCSI consensus writeback scale. Default: 0.1.",
-    )
-    parser.add_argument(
-        "--dcsi-conflict-gamma-init",
-        type=float,
-        default=0.05,
-        help="Initial DCSI conflict correction scale. Default: 0.05.",
-    )
-    parser.add_argument(
-        "--cgsa-alpha-max",
+        "--bcq-conflict-alpha",
         type=float,
         default=2.0,
         help=(
-            "Maximum per-cell correction multiplier in CGSA. With "
-            "zero-initialized step head and alpha-max=2, CGSA starts "
-            "from alpha_e=1, matching plain sheaf step sizing. "
-            "Default: 2."
+            "Fixed JSD conflict gate strength in BCQ: "
+            "gate=exp(-alpha*JSD). Default: 2."
         ),
     )
     parser.add_argument(
-        "--cgsa-consensus-channel",
-        action="store_true",
-        help=(
-            "Enable CGSA's optional zero-initialized consensus-increment "
-            "channel. Keep off for direction A."
-        ),
-    )
-    parser.add_argument(
-        "--consensus-graph-transport-fusion",
-        choices=("residual", "tri-gate", "concat", "bilinear"),
-        default="residual",
-        help=(
-            "Fusion rule inside bidirectional C-mediated transport. "
-            "'residual' keeps the existing two-source residual update; "
-            "'tri-gate' mixes node state, private intra-graph message, "
-            "and C-mediated inter-modal message with a softmax gate; "
-            "'concat' fuses the same sources with an MLP; "
-            "'bilinear' adds low-rank multiplicative evidence before "
-            "the MLP. "
-            "Default: residual."
-        ),
-    )
-    parser.add_argument(
-        "--consensus-graph-transport-message",
-        choices=("fixed", "qk-prior"),
-        default="fixed",
-        help=(
-            "How to build C-mediated inter-modal transport messages. "
-            "'fixed' uses Beta V directly; 'qk-prior' uses cross-modal "
-            "Q/K attention regularized and hard-supported by Beta. "
-            "Default: fixed."
-        ),
-    )
-    parser.add_argument(
-        "--consensus-graph-transport-prior-weight",
-        type=float,
-        default=1.0,
-        help=(
-            "Eta multiplying log(Beta) in qk-prior transport message "
-            "attention. Default: 1."
-        ),
-    )
-    parser.add_argument(
-        "--consensus-graph-transport-lambda",
-        type=float,
-        default=0.5,
-        help=(
-            "Lambda in T_C=(1-lambda)I+lambda A_C for C-mediated "
-            "transport. Default: 0.5."
-        ),
-    )
-    parser.add_argument(
-        "--consensus-graph-transport-gamma-init",
+        "--bcq-gamma-init",
         type=float,
         default=0.0,
         help=(
-            "Initial residual scale for both HSI and LiDAR "
-            "C-mediated transport updates. Default: 0."
-        ),
-    )
-    parser.add_argument(
-        "--consensus-graph-transport-second-gamma-init",
-        type=float,
-        default=0.0,
-        help=(
-            "Initial residual scale for the second transport round "
-            "when --consensus-graph-transport-stage alternating. "
-            "It is ignored by post-gat2 and inter-gat. "
+            "Initial residual scale for BCQ writeback. Zero makes the "
+            "initial forward pass identical to the private-graph path. "
             "Default: 0."
         ),
     )
     parser.add_argument(
-        "--consensus-graph-cell-edge",
-        choices=("binary", "spectral-height-boundary"),
-        default="binary",
+        "--consensus-token-fusion",
+        choices=("none", "post-gat2", "post-gat", "postgat"),
+        default="none",
         help=(
-            "Cell RAG prior used by intersection-mediator. "
-            "'spectral-height-boundary' uses HSI SAM, LiDAR height "
-            "difference, LiDAR boundary gradient, and HSI/LiDAR "
-            "boundary conflict. Default: binary."
+            "Consensus-token classification fusion head. It runs after "
+            "the two private GAT branches, uses shared class-grouped "
+            "tokens to build HSI/LiDAR membership distributions, and "
+            "fuses token logits into the main logits with a zero-init "
+            "logit gate. Default: none."
         ),
     )
     parser.add_argument(
-        "--consensus-graph-spatial-prior-weight",
-        type=float,
-        default=1.0,
-        help=(
-            "Alpha_s for the mediator C-QK spatial prior. Default: 1."
-        ),
-    )
-    parser.add_argument(
-        "--consensus-graph-hsi-prior-weight",
-        type=float,
-        default=0.5,
-        help=(
-            "Alpha_h for the HSI private-graph prior projected into "
-            "mediator C space. Default: 0.5."
-        ),
-    )
-    parser.add_argument(
-        "--consensus-graph-lidar-prior-weight",
-        type=float,
-        default=0.5,
-        help=(
-            "Alpha_l for the LiDAR private-graph prior projected into "
-            "mediator C space. Default: 0.5."
-        ),
-    )
-    parser.add_argument(
-        "--bridge-attention-dk",
+        "--consensus-token-ratio",
         type=int,
-        default=32,
+        default=4,
         help=(
-            "Query/key dimension of the mediator C graph attention. "
-            "Default: 32."
+            "Number of consensus tokens per real dataset class. "
+            "Default: 4."
         ),
     )
     parser.add_argument(
-        "--bridge-attention-topk",
+        "--consensus-token-heads",
         type=int,
-        default=8,
-        help="Top-K entries per mediator C graph row. Default: 8.",
+        default=4,
+        help="Number of heads for token-to-node attention. Default: 4.",
     )
     parser.add_argument(
-        "--cell-sam-weight",
-        type=float,
-        default=1.0,
+        "--consensus-token-topk",
+        type=int,
+        default=0,
         help=(
-            "HSI spectral-angle weight for the intersection-mediator "
-            "spectral-height-boundary C-C prior. Default: 1."
+            "Optional top-k over token membership per node. Default: 0 "
+            "keeps dense membership."
         ),
     )
     parser.add_argument(
-        "--cell-height-weight",
+        "--consensus-token-tau",
         type=float,
         default=1.0,
+        help="Temperature for node-to-token membership. Default: 1.",
+    )
+    parser.add_argument(
+        "--consensus-token-ce-weight",
+        type=float,
+        default=0.4,
         help=(
-            "LiDAR mean-height difference weight for the "
-            "intersection-mediator spectral-height-boundary C-C prior. "
-            "Default: 1."
+            "Auxiliary CE weight for HSI/LiDAR consensus-token pixel "
+            "probabilities. Active only when --consensus-token-fusion "
+            "is enabled. Default: 0.4."
         ),
     )
     parser.add_argument(
-        "--cell-boundary-weight",
+        "--consensus-token-agreement-weight",
         type=float,
-        default=1.0,
+        default=0.1,
         help=(
-            "LiDAR boundary-gradient weight for the "
-            "intersection-mediator spectral-height-boundary C-C prior. "
-            "Default: 1."
+            "JSD agreement weight between semantic memberships and "
+            "overlap-transported memberships. Default: 0.1."
         ),
     )
     parser.add_argument(
-        "--cell-conflict-weight",
+        "--consensus-token-usage-weight",
+        type=float,
+        default=0.01,
+        help=(
+            "Anti-collapse token-usage KL weight. Default: 0.01."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-token-fusion-gate-init",
         type=float,
         default=0.0,
         help=(
-            "Weight of the absolute normalized HSI/LiDAR shared-boundary "
-            "strength disagreement in the intersection-mediator "
-            "spectral-height-boundary C-C prior. Default: 0 (disabled)."
+            "Initial logit-space fusion gate. Zero makes final logits "
+            "start exactly from the main classifier. Default: 0."
         ),
     )
+    parser.add_argument(
+        "--edl-kl-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "KL weight in EDL loss when --evidence-fusion dirichlet. "
+            "Default: 0.1."
+        ),
+    )
+    parser.add_argument(
+        "--edl-anneal-ratio",
+        type=float,
+        default=0.5,
+        help=(
+            "Fraction of epochs used to anneal the EDL KL term from 0 "
+            "to 1. Default: 0.5."
+        ),
+    )
+    # Archived ablation switches are kept as hidden compatibility flags
+    # but their active choices are removed from the main entry point.
     parser.add_argument(
         "--fdsm-scope",
         choices=("none", "hsi"),
@@ -712,7 +696,15 @@ def parse_args():
         ),
     )
     parser.add_argument("--dropout", type=float, default=0.4)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help=(
+            "Base random seed. Run k uses seed + k, so --runs 10 with "
+            "--seed 100 uses seeds 100..109. Default: 0."
+        ),
+    )
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument(
         "--device",
@@ -747,64 +739,6 @@ def resolve_options(args):
 
 
 
-def consensus_graph_configuration_tag(args, class_count):
-    if args.post_gat_consensus_graph == "none":
-        return "cg-none"
-    anchor_tag = "cells"
-    sheaf_tag = ""
-    if args.consensus_graph_transport_operator == "sheaf":
-        sheaf_tag = (
-            f"sh{args.sheaf_restriction}-"
-            f"r{args.sheaf_rank}-"
-            f"s{args.sheaf_steps}-"
-            f"e{args.sheaf_energy_weight:g}-"
-        )
-    elif args.consensus_graph_transport_operator == "dcsi":
-        sheaf_tag = (
-            f"sh{args.sheaf_restriction}-"
-            f"r{args.sheaf_rank}-"
-            f"s{args.sheaf_steps}-"
-            f"e{args.sheaf_energy_weight:g}-"
-            f"et{args.dcsi_edge_topk}-"
-            f"mu{args.dcsi_consensus_mix:g}-"
-            f"{args.dcsi_conflict_mix:g}-"
-            f"gm{args.dcsi_semantic_gamma_init:g}-"
-            f"{args.dcsi_conflict_gamma_init:g}-"
-        )
-    elif args.consensus_graph_transport_operator == "cgsa":
-        sheaf_tag = (
-            f"sh{args.sheaf_restriction}-"
-            f"r{args.sheaf_rank}-"
-            f"s{args.sheaf_steps}-"
-            f"e{args.sheaf_energy_weight:g}-"
-            f"et{args.dcsi_edge_topk}-"
-            f"amax{args.cgsa_alpha_max:g}-"
-            f"cc{int(args.cgsa_consensus_channel)}-"
-        )
-    return (
-        f"cg-{args.post_gat_consensus_graph}-k{anchor_tag}-"
-        f"dk{args.bridge_attention_dk}-"
-        f"top{args.bridge_attention_topk}-"
-        f"w{args.consensus_graph_weight:g}-"
-        f"f{args.consensus_graph_fusion}-"
-        f"rg{args.consensus_graph_residual_init:g}-"
-        f"cg{args.consensus_graph_c_gamma_init:g}-"
-        f"tp{args.consensus_graph_transport}-"
-        f"to{args.consensus_graph_transport_operator}-"
-        f"{sheaf_tag}"
-        f"tf{args.consensus_graph_transport_fusion}-"
-        f"tm{args.consensus_graph_transport_message}-"
-        f"ts{args.consensus_graph_transport_stage}-"
-        f"tw{args.consensus_graph_transport_prior_weight:g}-"
-        f"tl{args.consensus_graph_transport_lambda:g}-"
-        f"tg{args.consensus_graph_transport_gamma_init:g}-"
-        f"tg2{args.consensus_graph_transport_second_gamma_init:g}-"
-        f"edge{args.consensus_graph_cell_edge}-"
-        f"a{args.consensus_graph_spatial_prior_weight:g}-"
-        f"{args.consensus_graph_hsi_prior_weight:g}-"
-        f"{args.consensus_graph_lidar_prior_weight:g}"
-    )
-
 
 def dummy_logit_configuration_tag(args, class_count):
     if args.dummy_logit_dim <= 0:
@@ -812,21 +746,45 @@ def dummy_logit_configuration_tag(args, class_count):
     return f"dummy{args.dummy_logit_dim}-real{class_count}"
 
 
-def topology_rewiring_configuration_tag(args):
-    if args.topology_rewiring == "none":
-        return "tw-none"
-    return (
-        f"tw-{args.topology_rewiring}-"
-        f"side{args.topology_audit_side}-"
-        f"ev{args.topology_evidence}-"
-        f"im{args.topology_impurity_mode}-"
-        f"ak{args.topology_advocacy_k}-"
-        f"ar{args.topology_advocacy_rag_hops}-"
-        f"fa{int(args.topology_freeze_advocacy)}-"
-        f"v{args.topology_veto_init:g}-"
-        f"a{args.topology_advocacy_init:g}-"
-        f"i{args.topology_impurity_init:g}"
+def seed_configuration_tag(args):
+    return f"seed{args.seed}"
+
+
+def dta_configuration_tag(args):
+    if args.dual_transport_arbitration == "none":
+        return "dta-none"
+    tag = (
+        f"dta-{args.dual_transport_arbitration}-"
+        f"{args.dta_variant}-"
+        f"dk{args.dta_dk}-"
+        f"tau{args.dta_tau:g}-"
+        f"g{args.dta_gamma_init:g}"
     )
+    if args.dta_variant == "full":
+        tag += (
+            f"-nl{args.dta_nonlocal_topk}-"
+            f"{args.dta_normalization}-"
+            f"sh{args.dta_sinkhorn_iters}"
+        )
+    if args.dta_film:
+        tag += (
+            f"-filmds{args.dta_film_ds}-"
+            f"filmg{args.dta_film_gamma_init:g}"
+        )
+    return tag
+
+
+def assignment_graph_configuration_tag(args):
+    if args.assignment_graph == "none":
+        return "ag-none"
+    return (
+        f"ag-{args.assignment_graph}-"
+        f"top{args.assignment_graph_topk}-"
+        f"g{args.assignment_graph_gamma_init:g}-"
+        f"out{args.assignment_graph_output}-"
+        f"w{args.assignment_graph_weight:g}"
+    )
+
 
 
 def cross_overlap_configuration_tag(args):
@@ -840,7 +798,62 @@ def cross_overlap_configuration_tag(args):
         f"ea{args.cross_overlap_edge_attrs}-"
         f"pw{args.cross_overlap_prior_weight:g}-"
         f"g{args.cross_overlap_gamma_init:g}-"
-        f"g2{args.cross_overlap_second_gamma_init:g}"
+        f"g2{args.cross_overlap_second_gamma_init:g}-"
+        f"mc{args.cross_overlap_min_coverage:g}-"
+        f"ik{args.cross_overlap_iou_topk}-"
+        f"fa{args.cross_overlap_fragmentation_alpha:g}"
+    )
+
+
+def overlap_distill_configuration_tag(args):
+    if args.overlap_distill_weight <= 0:
+        return "od-none"
+    return (
+        f"od-w{args.overlap_distill_weight:g}-"
+        f"t{args.overlap_distill_temperature:g}-"
+        f"iou{args.overlap_distill_iou_threshold:g}-"
+        f"m{args.overlap_distill_margin:g}-"
+        f"wr{args.overlap_distill_warmup_ratio:g}-"
+        f"conf{args.overlap_distill_confidence}"
+    )
+
+
+def evidence_fusion_configuration_tag(args):
+    if args.evidence_fusion == "none":
+        return "ef-none"
+    return (
+        f"ef-{args.evidence_fusion}-"
+        f"kl{args.edl_kl_weight:g}-"
+        f"ar{args.edl_anneal_ratio:g}"
+    )
+
+
+def bcq_configuration_tag(args):
+    if args.bcq_interaction == "none":
+        return "bcq-none"
+    return (
+        f"bcq-{args.bcq_interaction}-"
+        f"r{args.bcq_anchor_ratio}-"
+        f"top{args.bcq_anchor_topk}-"
+        f"dk{args.bcq_anchor_dk}-"
+        f"a{args.bcq_conflict_alpha:g}-"
+        f"g{args.bcq_gamma_init:g}"
+    )
+
+
+def consensus_token_configuration_tag(args):
+    if args.consensus_token_fusion == "none":
+        return "ct-none"
+    return (
+        f"ct-{args.consensus_token_fusion}-"
+        f"r{args.consensus_token_ratio}-"
+        f"h{args.consensus_token_heads}-"
+        f"top{args.consensus_token_topk}-"
+        f"tau{args.consensus_token_tau:g}-"
+        f"ce{args.consensus_token_ce_weight:g}-"
+        f"ag{args.consensus_token_agreement_weight:g}-"
+        f"us{args.consensus_token_usage_weight:g}-"
+        f"g{args.consensus_token_fusion_gate_init:g}"
     )
 
 
@@ -1111,486 +1124,9 @@ class MaskedDynamicGraphBuilder(DynamicGraphBuilder):
         return adjacency
 
 
-class CellEvidenceRewiringDynamicGraphBuilder(DynamicGraphBuilder):
-    """Q/K graph rewiring audited by opposite-modality cell evidence."""
-
-    uses_topology_rewiring = True
-
-    def __init__(
-        self,
-        *args,
-        candidate_mask=None,
-        advocacy_k=0,
-        veto_init=0.0,
-        advocacy_init=0.0,
-        impurity_init=0.0,
-        impurity_mode="target",
-        freeze_advocacy=False,
-        advocacy_candidate_mask=None,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.advocacy_k = int(advocacy_k)
-        self.impurity_mode = impurity_mode
-        self.veto_beta = nn.Parameter(
-            torch.tensor(float(veto_init), dtype=torch.float32)
-        )
-        self.advocacy_alpha = nn.Parameter(
-            torch.tensor(float(advocacy_init), dtype=torch.float32)
-        )
-        if freeze_advocacy:
-            self.advocacy_alpha.requires_grad_(False)
-        self.impurity_eta = nn.Parameter(
-            torch.tensor(float(impurity_init), dtype=torch.float32)
-        )
-        self.advocacy_prior_floor = nn.Parameter(
-            torch.tensor(np.log(1e-6), dtype=torch.float32)
-        )
-        self.register_buffer(
-            "candidate_mask",
-            (
-                torch.as_tensor(candidate_mask, dtype=torch.bool)
-                if candidate_mask is not None
-                else None
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "advocacy_candidate_mask",
-            (
-                torch.as_tensor(
-                    (
-                        advocacy_candidate_mask.toarray()
-                        if hasattr(advocacy_candidate_mask, "toarray")
-                        else advocacy_candidate_mask
-                    ),
-                    dtype=torch.bool,
-                )
-                if advocacy_candidate_mask is not None
-                else None
-            ),
-            persistent=False,
-        )
-        self.last_diagnostics = None
-
-    def _advocacy_mask(self, similarity, base_mask):
-        if self.advocacy_k <= 0:
-            return torch.zeros_like(base_mask)
-        node_count = similarity.shape[0]
-        k = min(self.advocacy_k, max(node_count - 1, 1))
-        eye = torch.eye(
-            node_count,
-            dtype=torch.bool,
-            device=similarity.device,
-        )
-        allowed_mask = (
-            torch.ones_like(base_mask, dtype=torch.bool)
-            if self.advocacy_candidate_mask is None
-            else self.advocacy_candidate_mask
-        )
-        allowed_mask = torch.logical_and(allowed_mask, ~base_mask)
-        allowed_mask = torch.logical_and(allowed_mask, ~eye)
-        scores = similarity.masked_fill(
-            ~allowed_mask,
-            torch.finfo(similarity.dtype).min,
-        )
-        _, indices = torch.topk(scores, k=k, dim=-1)
-        mask = torch.zeros_like(base_mask)
-        mask.scatter_(dim=-1, index=indices, value=True)
-        mask = torch.logical_and(mask, allowed_mask)
-        return mask
-
-    def forward(
-        self,
-        node_features,
-        spatial_prior,
-        audit_context,
-        fragmentation=None,
-        audit_uncertainty=None,
-    ):
-        if audit_context.shape[0] != node_features.shape[0]:
-            raise ValueError(
-                "Audit context must have one row per target node."
-            )
-        query = self.query(node_features) + self.position_encoding
-        key = self.key(node_features) + self.position_encoding
-        qk_logits = query @ key.t() * self.scale
-        prior_logits = torch.log(spatial_prior + 1e-6)
-        base_raw_logits = qk_logits + prior_logits
-
-        normalized_context = F.normalize(
-            audit_context,
-            p=2,
-            dim=1,
-            eps=1e-6,
-        )
-        similarity = normalized_context @ normalized_context.t()
-        if audit_uncertainty is None:
-            distance = torch.cdist(audit_context, audit_context, p=2)
-            positive_distance = distance.detach()[
-                distance.detach() > 0
-            ]
-            distance_scale = (
-                positive_distance.mean()
-                if positive_distance.numel()
-                else distance.new_tensor(1.0)
-            ).clamp_min(1e-6)
-            normalized_distance = distance / distance_scale
-        else:
-            if audit_uncertainty.shape != audit_context.shape:
-                raise ValueError(
-                    "Audit uncertainty must match audit context shape."
-                )
-            delta = audit_context[:, None, :] - audit_context[None, :, :]
-            scale = torch.sqrt(
-                audit_uncertainty[:, None, :].pow(2)
-                + audit_uncertainty[None, :, :].pow(2)
-                + 1e-6
-            )
-            normalized_distance = torch.sqrt(
-                torch.mean((delta / scale).pow(2), dim=-1) + 1e-6
-            )
-
-        modulation = (
-            self.advocacy_alpha * similarity
-            - self.veto_beta * normalized_distance
-        )
-        source_temperature = None
-        if fragmentation is not None:
-            if fragmentation.shape[0] != node_features.shape[0]:
-                raise ValueError(
-                    "Fragmentation must have one value per node."
-                )
-            if self.impurity_mode in ("target", "both"):
-                modulation = (
-                    modulation
-                    - self.impurity_eta * fragmentation[None, :]
-                )
-            elif self.impurity_mode == "none":
-                pass
-            elif self.impurity_mode != "source-temperature":
-                raise ValueError(
-                    "Unsupported impurity mode: "
-                    f"{self.impurity_mode}"
-                )
-            if self.impurity_mode in ("source-temperature", "both"):
-                source_temperature = torch.exp(
-                    self.impurity_eta * fragmentation[:, None]
-                )
-
-        base_mask = (
-            torch.ones_like(base_raw_logits, dtype=torch.bool)
-            if self.candidate_mask is None
-            else self.candidate_mask
-        )
-        support_mask = base_mask
-        nonbase_advocacy_mask = torch.zeros_like(base_mask)
-        if (
-            self.candidate_mask is not None
-            and self.advocacy_k > 0
-            and abs(float(self.advocacy_alpha.detach().item())) > 1e-12
-        ):
-            advocacy_mask = self._advocacy_mask(similarity, base_mask)
-            nonbase_advocacy_mask = torch.logical_and(
-                advocacy_mask,
-                ~base_mask,
-            )
-            support_mask = torch.logical_or(base_mask, advocacy_mask)
-
-        raw_logits = base_raw_logits + modulation
-        if nonbase_advocacy_mask.any():
-            advocacy_logits = (
-                qk_logits
-                + self.advocacy_prior_floor
-                + modulation
-            )
-            raw_logits = torch.where(
-                nonbase_advocacy_mask,
-                advocacy_logits,
-                raw_logits,
-            )
-        if source_temperature is not None:
-            raw_logits = raw_logits / source_temperature.clamp_min(1e-6)
-        logits = raw_logits / self.tau
-        logits = logits.masked_fill(
-            ~support_mask,
-            torch.finfo(logits.dtype).min,
-        )
-        scores = torch.softmax(logits, dim=-1)
-
-        k = min(self.topk, scores.size(1))
-        values, indices = torch.topk(scores, k=k, dim=-1)
-        adjacency = torch.zeros_like(scores).scatter_(
-            dim=-1,
-            index=indices,
-            src=values,
-        )
-        adjacency = adjacency * support_mask.to(adjacency.dtype)
-        if self.symmetrize:
-            adjacency = torch.maximum(adjacency, adjacency.t())
-        adjacency = adjacency * support_mask.to(adjacency.dtype)
-        adjacency = adjacency / (
-            adjacency.sum(dim=-1, keepdim=True) + 1e-6
-        )
-        fragmentation_mean = (
-            float(fragmentation.detach().mean().item())
-            if fragmentation is not None
-            else 0.0
-        )
-        self.last_diagnostics = {
-            "alpha": float(self.advocacy_alpha.detach().item()),
-            "beta": float(self.veto_beta.detach().item()),
-            "impurity": float(self.impurity_eta.detach().item()),
-            "impurity_mode": self.impurity_mode,
-            "source_temperature_mean": (
-                float(source_temperature.detach().mean().item())
-                if source_temperature is not None
-                else 1.0
-            ),
-            "fragmentation_mean": fragmentation_mean,
-            "context_distance_mean": float(
-                normalized_distance.detach().mean().item()
-            ),
-            "support_density": float(
-                support_mask.detach().float().mean().item()
-            ),
-            "advocacy_density": float(
-                nonbase_advocacy_mask.detach().float().mean().item()
-            ),
-        }
-        self.last_adjacency = adjacency.detach()
-        return adjacency
 
 
-class CrossConditionedDynamicGraphBuilder(DynamicGraphBuilder):
-    """Second-layer Q/K graph conditioned by overlap-aligned other nodes."""
 
-    def __init__(
-        self,
-        *args,
-        cross_channels,
-        candidate_mask=None,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        d_k = self.query.out_features
-        self.cross_query = nn.Linear(cross_channels, d_k)
-        self.cross_key = nn.Linear(cross_channels, d_k)
-        self.register_buffer(
-            "candidate_mask",
-            (
-                torch.as_tensor(candidate_mask, dtype=torch.bool)
-                if candidate_mask is not None
-                else None
-            ),
-            persistent=False,
-        )
-        self.last_cross_context = None
-        self.last_topology_gate = None
-        self.last_topology_mask = None
-
-    def forward(
-        self,
-        node_features,
-        spatial_prior,
-        cross_context,
-        topology_gate=None,
-        topology_mask=None,
-    ):
-        if cross_context.shape[0] != node_features.shape[0]:
-            raise ValueError(
-                "Cross context must have one row per target node."
-            )
-        query = (
-            self.query(node_features)
-            + self.cross_query(cross_context)
-            + self.position_encoding
-        )
-        key = (
-            self.key(node_features)
-            + self.cross_key(cross_context)
-            + self.position_encoding
-        )
-        logits = (
-            query @ key.transpose(0, 1) * self.scale
-            + torch.log(spatial_prior + 1e-6)
-        ) / self.tau
-        if topology_gate is not None:
-            if topology_gate.shape != logits.shape:
-                raise ValueError(
-                    "Topology gate must match the Q/K graph shape."
-                )
-            logits = logits + torch.log(topology_gate + 1e-6)
-        combined_mask = topology_mask
-        if self.candidate_mask is not None:
-            combined_mask = (
-                self.candidate_mask
-                if combined_mask is None
-                else torch.logical_and(
-                    combined_mask,
-                    self.candidate_mask,
-                )
-            )
-        if combined_mask is not None:
-            logits = logits.masked_fill(
-                ~combined_mask,
-                torch.finfo(logits.dtype).min,
-            )
-        scores = torch.softmax(logits, dim=-1)
-
-        k = min(self.topk, scores.size(1))
-        values, indices = torch.topk(scores, k=k, dim=-1)
-        adjacency = torch.zeros_like(scores).scatter_(
-            dim=-1,
-            index=indices,
-            src=values,
-        )
-        if combined_mask is not None:
-            adjacency = adjacency * combined_mask.to(
-                adjacency.dtype
-            )
-        if self.symmetrize:
-            adjacency = torch.maximum(
-                adjacency,
-                adjacency.transpose(0, 1),
-            )
-        if topology_gate is not None:
-            adjacency = adjacency * topology_gate
-        if combined_mask is not None:
-            adjacency = adjacency * combined_mask.to(
-                adjacency.dtype
-            )
-        adjacency = adjacency / (
-            adjacency.sum(dim=-1, keepdim=True) + 1e-6
-        )
-        self.last_cross_context = cross_context.detach()
-        self.last_topology_gate = (
-            topology_gate.detach()
-            if topology_gate is not None
-            else None
-        )
-        self.last_topology_mask = (
-            topology_mask.detach()
-            if topology_mask is not None
-            else None
-        )
-        self.last_adjacency = adjacency.detach()
-        return adjacency
-
-
-def build_intersection_mediator_data(
-    cell_data,
-    hsi_node_count,
-    lidar_node_count,
-    edge_mode="binary",
-):
-    """Build mediator matrices from HSI/LiDAR common-refinement cells."""
-    cell_count = int(cell_data["cell_count"])
-    cell_indices = np.arange(cell_count, dtype=np.int64)
-    hsi_parent = np.asarray(
-        cell_data["hsi_parent"],
-        dtype=np.int64,
-    )
-    lidar_parent = np.asarray(
-        cell_data["lidar_parent"],
-        dtype=np.int64,
-    )
-    hsi_coverage = np.asarray(
-        cell_data["hsi_coverage"],
-        dtype=np.float32,
-    )
-    lidar_coverage = np.asarray(
-        cell_data["lidar_coverage"],
-        dtype=np.float32,
-    )
-
-    prior_ch = coo_matrix(
-        (
-            np.ones(cell_count, dtype=np.float32),
-            (cell_indices, hsi_parent),
-        ),
-        shape=(cell_count, hsi_node_count),
-        dtype=np.float32,
-    ).toarray()
-    prior_cl = coo_matrix(
-        (
-            np.ones(cell_count, dtype=np.float32),
-            (cell_indices, lidar_parent),
-        ),
-        shape=(cell_count, lidar_node_count),
-        dtype=np.float32,
-    ).toarray()
-    prior_hc = coo_matrix(
-        (
-            hsi_coverage,
-            (hsi_parent, cell_indices),
-        ),
-        shape=(hsi_node_count, cell_count),
-        dtype=np.float32,
-    ).toarray()
-    prior_lc = coo_matrix(
-        (
-            lidar_coverage,
-            (lidar_parent, cell_indices),
-        ),
-        shape=(lidar_node_count, cell_count),
-        dtype=np.float32,
-    ).toarray()
-
-    pixel_cell_index = np.asarray(
-        cell_data["pixel_cell_index"],
-        dtype=np.int64,
-    )
-    pixel_indices = np.arange(pixel_cell_index.size, dtype=np.int64)
-    assignment = coo_matrix(
-        (
-            np.ones(pixel_cell_index.size, dtype=np.float32),
-            (pixel_indices, pixel_cell_index),
-        ),
-        shape=(pixel_cell_index.size, cell_count),
-        dtype=np.float32,
-    ).tocsr()
-
-    adjacency_key = (
-        "cell_weighted_adjacency"
-        if edge_mode == "spectral-height-boundary"
-        else "cell_rag_adjacency"
-    )
-    if adjacency_key not in cell_data:
-        raise ValueError(
-            f"Missing {adjacency_key} for intersection mediator."
-        )
-    cc_prior = cell_data[adjacency_key].tocsr().astype(np.float32)
-    cc_prior = cc_prior.copy()
-    cc_prior.setdiag(1.0)
-    cc_prior.eliminate_zeros()
-    row_sum = np.asarray(cc_prior.sum(axis=1)).reshape(-1)
-    cc_prior = cc_prior.tocoo()
-    cc_values = cc_prior.data / np.maximum(row_sum[cc_prior.row], 1e-6)
-    cc_prior = coo_matrix(
-        (cc_values.astype(np.float32), (cc_prior.row, cc_prior.col)),
-        shape=(cell_count, cell_count),
-        dtype=np.float32,
-    ).toarray()
-    return {
-        "assignment": assignment.astype(np.float32),
-        "prior_hc": prior_hc.astype(np.float32),
-        "prior_ch": prior_ch.astype(np.float32),
-        "prior_lc": prior_lc.astype(np.float32),
-        "prior_cl": prior_cl.astype(np.float32),
-        "cc_prior": cc_prior.astype(np.float32),
-        "attributes": np.asarray(
-            cell_data["attributes"],
-            dtype=np.float32,
-        ),
-        "anchor_count": cell_count,
-        "area": np.asarray(
-            cell_data["cell_area"],
-            dtype=np.float32,
-        ),
-        "mediator_kind": "intersection",
-        "edge_mode": edge_mode,
-    }
 
 
 def _superpixel_feature_means(assignment, pixel_features):
@@ -1618,18 +1154,51 @@ def _robust_unit_scale(values):
     )
 
 
+def _topk_edge_mask_by_group(scores, groups, k):
+    scores = np.asarray(scores)
+    groups = np.asarray(groups, dtype=np.int64)
+    keep = np.zeros(scores.shape[0], dtype=bool)
+    if k <= 0 or scores.size == 0:
+        keep[:] = True
+        return keep
+    for group in np.unique(groups):
+        edge_index = np.flatnonzero(groups == group)
+        if edge_index.size <= k:
+            keep[edge_index] = True
+        else:
+            order = np.argsort(scores[edge_index], kind="mergesort")
+            keep[edge_index[order[-k:]]] = True
+    return keep
+
+
+def _max_edge_value_by_group(values, groups, group_count):
+    max_values = np.zeros(int(group_count), dtype=np.float32)
+    if values.size == 0:
+        return max_values
+    np.maximum.at(
+        max_values,
+        np.asarray(groups, dtype=np.int64),
+        np.asarray(values, dtype=np.float32),
+    )
+    return max_values
+
+
 def build_sparse_overlap_relation_data(
     hsi_assignment,
     lidar_assignment,
     hsi_features=None,
     lidar_image=None,
     edge_attrs="none",
+    min_coverage=0.0,
+    iou_topk=0,
 ):
     """Build sparse HSI/LiDAR superpixel co-occurrence edges.
 
     Edges are the nonzero entries of M = Q_H^T Q_L. Directional edge
     weights are receiver-normalized coverages:
     H<-L uses M_ij / |S_i^H| and L<-H uses M_ij / |S_j^L|.
+    Optional 2a pruning first removes tiny bidirectional coverages and
+    then keeps only bidirectional endpoint IoU top-k edges.
     """
     hsi_sparse = coo_matrix(hsi_assignment, dtype=np.float32).tocsr()
     lidar_sparse = coo_matrix(lidar_assignment, dtype=np.float32).tocsr()
@@ -1645,19 +1214,75 @@ def build_sparse_overlap_relation_data(
     )
     h_coverage = overlap_values / np.maximum(h_area[h_index], 1e-6)
     l_coverage = overlap_values / np.maximum(l_area[l_index], 1e-6)
+    iou = overlap_values / np.maximum(
+        h_area[h_index] + l_area[l_index] - overlap_values,
+        1e-6,
+    )
     h_node_count = hsi_sparse.shape[1]
     l_node_count = lidar_sparse.shape[1]
+    original_edge_count = int(overlap_values.size)
+    coverage_pruned_edges = 0
+    topk_pruned_edges = 0
+    min_coverage = float(min_coverage)
+    iou_topk = int(iou_topk)
+    if min_coverage > 0:
+        coverage_keep = (
+            (h_coverage >= min_coverage)
+            | (l_coverage >= min_coverage)
+        )
+        coverage_pruned_edges = int(
+            coverage_keep.size - coverage_keep.sum()
+        )
+        h_index = h_index[coverage_keep]
+        l_index = l_index[coverage_keep]
+        overlap_values = overlap_values[coverage_keep]
+        h_coverage = h_coverage[coverage_keep]
+        l_coverage = l_coverage[coverage_keep]
+        iou = iou[coverage_keep]
+    if iou_topk > 0 and iou.size:
+        before_topk = int(iou.size)
+        h_topk_keep = _topk_edge_mask_by_group(iou, h_index, iou_topk)
+        l_topk_keep = _topk_edge_mask_by_group(iou, l_index, iou_topk)
+        topk_keep = h_topk_keep & l_topk_keep
+        topk_pruned_edges = int(before_topk - topk_keep.sum())
+        h_index = h_index[topk_keep]
+        l_index = l_index[topk_keep]
+        overlap_values = overlap_values[topk_keep]
+        h_coverage = h_coverage[topk_keep]
+        l_coverage = l_coverage[topk_keep]
+        iou = iou[topk_keep]
+    if overlap_values.size == 0:
+        raise ValueError(
+            "Sparse overlap pruning removed every HSI/LiDAR edge. "
+            "Lower --cross-overlap-min-coverage or increase "
+            "--cross-overlap-iou-topk."
+        )
+    h_max_iou = _max_edge_value_by_group(iou, h_index, h_node_count)
+    l_max_iou = _max_edge_value_by_group(iou, l_index, l_node_count)
+    h_fragmentation = np.clip(1.0 - h_max_iou, 0.0, 1.0)
+    l_fragmentation = np.clip(1.0 - l_max_iou, 0.0, 1.0)
     relation = {
         "h_index": h_index,
         "l_index": l_index,
         "overlap": overlap_values.astype(np.float32),
         "h_coverage": h_coverage.astype(np.float32),
         "l_coverage": l_coverage.astype(np.float32),
+        "iou": iou.astype(np.float32),
         "h_area": h_area.astype(np.float32),
         "l_area": l_area.astype(np.float32),
+        "h_fragmentation": h_fragmentation.astype(np.float32),
+        "l_fragmentation": l_fragmentation.astype(np.float32),
         "h_node_count": int(h_node_count),
         "l_node_count": int(l_node_count),
         "edge_count": int(overlap_values.size),
+        "original_edge_count": original_edge_count,
+        "coverage_pruned_edges": coverage_pruned_edges,
+        "topk_pruned_edges": topk_pruned_edges,
+        "retained_edge_fraction": float(
+            overlap_values.size / max(original_edge_count, 1)
+        ),
+        "min_coverage": float(min_coverage),
+        "iou_topk": int(iou_topk),
         "density": float(
             overlap_values.size / max(h_node_count * l_node_count, 1)
         ),
@@ -1721,10 +1346,6 @@ def build_sparse_overlap_relation_data(
     )
     boundary = gradient_sum / np.maximum(overlap_values, 1e-6)
 
-    iou = overlap_values / np.maximum(
-        h_area[h_index] + l_area[l_index] - overlap_values,
-        1e-6,
-    )
     edge_attributes = np.stack(
         [
             h_coverage,
@@ -1756,31 +1377,330 @@ def build_sparse_overlap_relation_data(
     return relation
 
 
-def normalized_cell_fragmentation(
-    cell_data,
-    node_count,
-    parent_key,
-    coverage_key,
+def build_overlap_pair_assignment(
+    hsi_assignment,
+    lidar_assignment,
+    relation_data,
 ):
-    """Entropy of how strongly the opposite partition cuts each node."""
-    parent = np.asarray(cell_data[parent_key], dtype=np.int64)
-    coverage = np.asarray(cell_data[coverage_key], dtype=np.float32)
-    entropy = np.zeros(node_count, dtype=np.float32)
-    cell_counts = np.zeros(node_count, dtype=np.float32)
-    np.add.at(
-        entropy,
-        parent,
-        -coverage * np.log(np.maximum(coverage, 1e-12)),
+    """Build pixel-to-overlap-pair assignment from current H/L assignments."""
+
+    hsi_sparse = coo_matrix(hsi_assignment, dtype=np.float32).tocsr()
+    lidar_sparse = coo_matrix(lidar_assignment, dtype=np.float32).tocsr()
+    if hsi_sparse.shape[0] != lidar_sparse.shape[0]:
+        raise ValueError(
+            "HSI and LiDAR assignments must have the same pixel count."
+        )
+    h_indices = np.asarray(relation_data["h_index"], dtype=np.int64)
+    l_indices = np.asarray(relation_data["l_index"], dtype=np.int64)
+    edge_lookup = {
+        (int(h_node), int(l_node)): int(edge_index)
+        for edge_index, (h_node, l_node) in enumerate(
+            zip(h_indices, l_indices)
+        )
+    }
+    rows = []
+    columns = []
+    values = []
+    for pixel in range(hsi_sparse.shape[0]):
+        h_start = hsi_sparse.indptr[pixel]
+        h_end = hsi_sparse.indptr[pixel + 1]
+        l_start = lidar_sparse.indptr[pixel]
+        l_end = lidar_sparse.indptr[pixel + 1]
+        pixel_h_nodes = hsi_sparse.indices[h_start:h_end]
+        pixel_l_nodes = lidar_sparse.indices[l_start:l_end]
+        pixel_h_values = hsi_sparse.data[h_start:h_end]
+        pixel_l_values = lidar_sparse.data[l_start:l_end]
+        for h_node, h_value in zip(pixel_h_nodes, pixel_h_values):
+            for l_node, l_value in zip(pixel_l_nodes, pixel_l_values):
+                edge_index = edge_lookup.get((int(h_node), int(l_node)))
+                if edge_index is None:
+                    continue
+                rows.append(pixel)
+                columns.append(edge_index)
+                values.append(float(h_value * l_value))
+    if not values:
+        raise ValueError("No pixel-to-overlap-pair assignments were built.")
+    return coo_matrix(
+        (
+            np.asarray(values, dtype=np.float32),
+            (
+                np.asarray(rows, dtype=np.int64),
+                np.asarray(columns, dtype=np.int64),
+            ),
+        ),
+        shape=(hsi_sparse.shape[0], int(relation_data["edge_count"])),
+        dtype=np.float32,
     )
-    np.add.at(cell_counts, parent, 1.0)
-    denominator = np.log(np.maximum(cell_counts, 2.0))
-    fragmentation = np.divide(
-        entropy,
-        np.maximum(denominator, 1e-6),
-        out=np.zeros_like(entropy),
-        where=cell_counts > 1,
+
+
+def build_overlap_distill_tensors(overlap_data, device):
+    if overlap_data is None:
+        return None
+    iou = overlap_data.get("iou")
+    if iou is None:
+        overlap = np.asarray(overlap_data["overlap"], dtype=np.float32)
+        h_index = np.asarray(overlap_data["h_index"], dtype=np.int64)
+        l_index = np.asarray(overlap_data["l_index"], dtype=np.int64)
+        h_area = np.asarray(overlap_data["h_area"], dtype=np.float32)
+        l_area = np.asarray(overlap_data["l_area"], dtype=np.float32)
+        iou = overlap / np.maximum(
+            h_area[h_index] + l_area[l_index] - overlap,
+            1e-6,
+        )
+    return {
+        "h_index": torch.as_tensor(
+            overlap_data["h_index"],
+            dtype=torch.long,
+            device=device,
+        ),
+        "l_index": torch.as_tensor(
+            overlap_data["l_index"],
+            dtype=torch.long,
+            device=device,
+        ),
+        "iou": torch.as_tensor(iou, dtype=torch.float32, device=device),
+    }
+
+
+def overlap_distill_ramp(epoch, total_epochs, warmup_ratio):
+    warmup_epochs = int(round(total_epochs * warmup_ratio))
+    if warmup_epochs <= 0:
+        return 1.0
+    if epoch <= warmup_epochs:
+        return 0.0
+    return min(
+        1.0,
+        (epoch - warmup_epochs)
+        / max(total_epochs - warmup_epochs, 1),
     )
-    return np.clip(fragmentation, 0.0, 1.0).astype(np.float32)
+
+
+def _prediction_confidence(probabilities, mode):
+    if mode == "max-prob":
+        return probabilities.max(dim=1).values
+    if mode == "neg-entropy":
+        class_count = probabilities.shape[1]
+        entropy = -torch.sum(
+            probabilities * torch.log(probabilities.clamp_min(1e-12)),
+            dim=1,
+        )
+        return 1.0 - entropy / np.log(max(class_count, 2))
+    raise ValueError(f"Unsupported overlap distill confidence: {mode}")
+
+
+def _distill_edge_probabilities(values, temperature, inputs_are_probabilities):
+    if inputs_are_probabilities:
+        log_values = torch.log(values.clamp_min(1e-12))
+        return F.softmax(log_values / temperature, dim=-1)
+    return F.softmax(values / temperature, dim=-1)
+
+
+def _distill_edge_log_probabilities(
+    values,
+    temperature,
+    inputs_are_probabilities,
+):
+    if inputs_are_probabilities:
+        log_values = torch.log(values.clamp_min(1e-12))
+        return F.log_softmax(log_values / temperature, dim=-1)
+    return F.log_softmax(values / temperature, dim=-1)
+
+
+def confidence_weighted_overlap_distill_loss(
+    hsi_node_logits,
+    lidar_node_logits,
+    overlap_tensors,
+    class_count,
+    temperature=2.0,
+    iou_threshold=0.3,
+    margin=0.1,
+    confidence_mode="max-prob",
+    inputs_are_probabilities=False,
+):
+    """IoU-weighted strong-to-weak KL on HSI/LiDAR overlap edges."""
+    if overlap_tensors is None:
+        raise ValueError("Overlap distillation requires overlap tensors.")
+    zero = (
+        hsi_node_logits[:, :class_count].sum()
+        + lidar_node_logits[:, :class_count].sum()
+    ) * 0.0
+    h_index = overlap_tensors["h_index"]
+    l_index = overlap_tensors["l_index"]
+    edge_iou = overlap_tensors["iou"]
+    mask = edge_iou > iou_threshold
+    selected_count = int(mask.detach().sum().item())
+    if selected_count == 0:
+        return zero, {
+            "selected_edges": 0,
+            "h_to_l_edges": 0,
+            "l_to_h_edges": 0,
+            "h_to_l_ratio": 0.0,
+            "l_to_h_ratio": 0.0,
+            "mean_iou": 0.0,
+            "mean_conf_h": 0.0,
+            "mean_conf_l": 0.0,
+            "raw_loss": 0.0,
+        }
+
+    h_edges = h_index[mask]
+    l_edges = l_index[mask]
+    weights = edge_iou[mask]
+    h_logits = hsi_node_logits[:, :class_count]
+    l_logits = lidar_node_logits[:, :class_count]
+    h_selected = h_logits.index_select(0, h_edges)
+    l_selected = l_logits.index_select(0, l_edges)
+    p_h = _distill_edge_probabilities(
+        h_selected,
+        temperature,
+        inputs_are_probabilities,
+    )
+    p_l = _distill_edge_probabilities(
+        l_selected,
+        temperature,
+        inputs_are_probabilities,
+    )
+    conf_h = _prediction_confidence(p_h, confidence_mode)
+    conf_l = _prediction_confidence(p_l, confidence_mode)
+
+    h_teaches_l = conf_h > conf_l + margin
+    l_teaches_h = conf_l > conf_h + margin
+    h_to_l_loss = F.kl_div(
+        _distill_edge_log_probabilities(
+            l_selected,
+            temperature,
+            inputs_are_probabilities,
+        ),
+        p_h.detach(),
+        reduction="none",
+    ).sum(dim=-1)
+    l_to_h_loss = F.kl_div(
+        _distill_edge_log_probabilities(
+            h_selected,
+            temperature,
+            inputs_are_probabilities,
+        ),
+        p_l.detach(),
+        reduction="none",
+    ).sum(dim=-1)
+    edge_loss = (
+        h_teaches_l.float() * h_to_l_loss
+        + l_teaches_h.float() * l_to_h_loss
+    )
+    loss = (
+        weights * edge_loss
+    ).sum() / weights.sum().clamp_min(1e-8)
+    loss = loss * temperature * temperature
+    h_to_l_count = int(h_teaches_l.detach().sum().item())
+    l_to_h_count = int(l_teaches_h.detach().sum().item())
+    diagnostics = {
+        "selected_edges": selected_count,
+        "h_to_l_edges": h_to_l_count,
+        "l_to_h_edges": l_to_h_count,
+        "h_to_l_ratio": h_to_l_count / max(selected_count, 1),
+        "l_to_h_ratio": l_to_h_count / max(selected_count, 1),
+        "mean_iou": float(weights.detach().mean().item()),
+        "mean_conf_h": float(conf_h.detach().mean().item()),
+        "mean_conf_l": float(conf_l.detach().mean().item()),
+        "raw_loss": float(loss.detach().item()),
+    }
+    return loss, diagnostics
+
+
+def dirichlet_kl_to_uniform(alpha):
+    beta = torch.ones_like(alpha)
+    sum_alpha = alpha.sum(dim=-1, keepdim=True)
+    sum_beta = beta.sum(dim=-1, keepdim=True)
+    log_beta_alpha = (
+        torch.lgamma(sum_alpha)
+        - torch.lgamma(alpha).sum(dim=-1, keepdim=True)
+    )
+    log_beta_uniform = (
+        torch.lgamma(beta).sum(dim=-1, keepdim=True)
+        - torch.lgamma(sum_beta)
+    )
+    digamma_delta = torch.digamma(alpha) - torch.digamma(sum_alpha)
+    kl = (
+        log_beta_alpha
+        + log_beta_uniform
+        + ((alpha - beta) * digamma_delta).sum(dim=-1, keepdim=True)
+    )
+    return kl.squeeze(-1)
+
+
+def edl_classification_loss(
+    alpha,
+    labels,
+    class_count,
+    epoch,
+    total_epochs,
+    kl_weight=0.1,
+    anneal_ratio=0.5,
+):
+    y_onehot = F.one_hot(labels, num_classes=class_count).float()
+    strength = alpha.sum(dim=-1, keepdim=True)
+    ce = (
+        y_onehot
+        * (torch.digamma(strength) - torch.digamma(alpha))
+    ).sum(dim=-1)
+    alpha_t = y_onehot + (1.0 - y_onehot) * alpha
+    anneal_epochs = max(float(total_epochs) * float(anneal_ratio), 1.0)
+    anneal = min(1.0, float(epoch) / anneal_epochs)
+    kl = dirichlet_kl_to_uniform(alpha_t)
+    return (ce + anneal * float(kl_weight) * kl).mean(), {
+        "edl_ce": float(ce.detach().mean().item()),
+        "edl_kl": float(kl.detach().mean().item()),
+        "edl_anneal": float(anneal),
+    }
+
+
+def dempster_combine_dirichlet(alpha_h, alpha_l):
+    """Combine two Dirichlet opinions with the simplified TMC rule."""
+    class_count = alpha_h.shape[-1]
+    evidence_h = (alpha_h - 1.0).clamp_min(0.0)
+    evidence_l = (alpha_l - 1.0).clamp_min(0.0)
+    strength_h = alpha_h.sum(dim=-1, keepdim=True)
+    strength_l = alpha_l.sum(dim=-1, keepdim=True)
+    belief_h = evidence_h / strength_h.clamp_min(1e-8)
+    belief_l = evidence_l / strength_l.clamp_min(1e-8)
+    uncertainty_h = class_count / strength_h.clamp_min(1e-8)
+    uncertainty_l = class_count / strength_l.clamp_min(1e-8)
+    agreement = (belief_h * belief_l).sum(dim=-1, keepdim=True)
+    conflict = (
+        belief_h.sum(dim=-1, keepdim=True)
+        * belief_l.sum(dim=-1, keepdim=True)
+        - agreement
+    ).clamp(0.0, 1.0 - 1e-6)
+    normalizer = (1.0 - conflict).clamp_min(1e-8)
+    fused_belief = (
+        belief_h * belief_l
+        + belief_h * uncertainty_l
+        + belief_l * uncertainty_h
+    ) / normalizer
+    fused_uncertainty = (
+        uncertainty_h * uncertainty_l
+    ) / normalizer
+    fused_strength = class_count / fused_uncertainty.clamp_min(1e-8)
+    fused_evidence = fused_belief * fused_strength
+    fused_alpha = fused_evidence + 1.0
+    diagnostics = {
+        "h_uncertainty_mean": float(
+            uncertainty_h.detach().mean().item()
+        ),
+        "l_uncertainty_mean": float(
+            uncertainty_l.detach().mean().item()
+        ),
+        "fused_uncertainty_mean": float(
+            fused_uncertainty.detach().mean().item()
+        ),
+        "dempster_conflict_mean": float(
+            conflict.detach().mean().item()
+        ),
+        "dempster_conflict_max": float(
+            conflict.detach().max().item()
+        ),
+    }
+    return fused_alpha, diagnostics
+
 
 
 def _cell_feature_mean(cell_index, cell_count, pixel_features):
@@ -1811,129 +1731,6 @@ def _standardize_profile(mean_profile, uncertainty_profile):
     )
 
 
-def build_topology_physical_evidence(cell_data, hsi, lidar):
-    """Fixed opposite-modality profiles for cell-based topology audit."""
-    height, width, hsi_channels = hsi.shape
-    cell_index = np.asarray(
-        cell_data["pixel_cell_index"],
-        dtype=np.int64,
-    )
-    cell_count = int(cell_data["cell_count"])
-    hsi_parent = np.asarray(cell_data["hsi_parent"], dtype=np.int64)
-    lidar_parent = np.asarray(cell_data["lidar_parent"], dtype=np.int64)
-    hsi_coverage = np.asarray(
-        cell_data["hsi_coverage"],
-        dtype=np.float32,
-    )
-    lidar_coverage = np.asarray(
-        cell_data["lidar_coverage"],
-        dtype=np.float32,
-    )
-
-    flat_hsi = hsi.reshape(height * width, hsi_channels).astype(np.float32)
-    hsi_cell_mean = _cell_feature_mean(
-        cell_index,
-        cell_count,
-        flat_hsi,
-    )
-
-    lidar = lidar.astype(np.float32)
-    grad_y, grad_x = np.gradient(lidar)
-    lidar_gradient = np.sqrt(grad_y * grad_y + grad_x * grad_x)
-    lidar_cell_mean = _cell_feature_mean(
-        cell_index,
-        cell_count,
-        lidar.reshape(-1, 1),
-    )
-    lidar_cell_second = _cell_feature_mean(
-        cell_index,
-        cell_count,
-        (lidar * lidar).reshape(-1, 1),
-    )
-    lidar_cell_std = np.sqrt(
-        np.maximum(
-            lidar_cell_second - lidar_cell_mean * lidar_cell_mean,
-            0.0,
-        )
-    )
-    lidar_cell_gradient = _cell_feature_mean(
-        cell_index,
-        cell_count,
-        lidar_gradient.reshape(-1, 1).astype(np.float32),
-    )
-    lidar_cell_profile = np.concatenate(
-        [lidar_cell_mean, lidar_cell_std, lidar_cell_gradient],
-        axis=1,
-    ).astype(np.float32)
-
-    hsi_node_count = int(hsi_parent.max()) + 1
-    lidar_node_count = int(lidar_parent.max()) + 1
-    hsi_audit_mean = np.zeros(
-        (hsi_node_count, lidar_cell_profile.shape[1]),
-        dtype=np.float32,
-    )
-    lidar_audit_mean = np.zeros(
-        (lidar_node_count, hsi_channels),
-        dtype=np.float32,
-    )
-    np.add.at(
-        hsi_audit_mean,
-        hsi_parent,
-        hsi_coverage[:, None] * lidar_cell_profile,
-    )
-    np.add.at(
-        lidar_audit_mean,
-        lidar_parent,
-        lidar_coverage[:, None] * hsi_cell_mean,
-    )
-
-    hsi_audit_var = np.zeros_like(hsi_audit_mean)
-    lidar_audit_var = np.zeros_like(lidar_audit_mean)
-    np.add.at(
-        hsi_audit_var,
-        hsi_parent,
-        hsi_coverage[:, None]
-        * np.square(lidar_cell_profile - hsi_audit_mean[hsi_parent]),
-    )
-    np.add.at(
-        lidar_audit_var,
-        lidar_parent,
-        lidar_coverage[:, None]
-        * np.square(hsi_cell_mean - lidar_audit_mean[lidar_parent]),
-    )
-    hsi_audit_uncertainty = np.sqrt(np.maximum(hsi_audit_var, 0.0))
-    lidar_audit_uncertainty = np.sqrt(np.maximum(lidar_audit_var, 0.0))
-    hsi_audit_mean, hsi_audit_uncertainty = _standardize_profile(
-        hsi_audit_mean,
-        hsi_audit_uncertainty,
-    )
-    lidar_audit_mean, lidar_audit_uncertainty = _standardize_profile(
-        lidar_audit_mean,
-        lidar_audit_uncertainty,
-    )
-    return {
-        "hsi_context": hsi_audit_mean,
-        "hsi_uncertainty": hsi_audit_uncertainty,
-        "lidar_context": lidar_audit_mean,
-        "lidar_uncertainty": lidar_audit_uncertainty,
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 def inverse_softplus_scalar(value):
     """Return x where softplus(x) is approximately value."""
@@ -1955,2049 +1752,14 @@ def apply_edge_restriction(restriction, edge_features, transpose=False):
     return edge_features + torch.einsum("cdr,cr->cd", left, latent)
 
 
-class RestrictionMapGenerator(nn.Module):
-    """Generate edge-conditioned sheaf restriction maps."""
 
-    def __init__(self, descriptor_dim, channels, mode="diag", rank=4):
-        super().__init__()
-        self.mode = mode
-        self.channels = channels
-        self.rank = rank
-        if mode == "diag":
-            self.diag_head = nn.Sequential(
-                nn.Linear(descriptor_dim, channels),
-                nn.LeakyReLU(),
-                nn.Linear(channels, channels),
-            )
-            nn.init.zeros_(self.diag_head[-1].weight)
-            nn.init.zeros_(self.diag_head[-1].bias)
-        elif mode == "lowrank":
-            self.left_head = nn.Sequential(
-                nn.Linear(descriptor_dim, channels),
-                nn.LeakyReLU(),
-                nn.Linear(channels, channels * rank),
-            )
-            self.right_head = nn.Sequential(
-                nn.Linear(descriptor_dim, channels),
-                nn.LeakyReLU(),
-                nn.Linear(channels, channels * rank),
-            )
-            nn.init.normal_(self.left_head[-1].weight, std=1e-3)
-            nn.init.zeros_(self.left_head[-1].bias)
-            nn.init.zeros_(self.right_head[-1].weight)
-            nn.init.zeros_(self.right_head[-1].bias)
-        else:
-            raise ValueError(
-                "--sheaf-restriction must be 'diag' or 'lowrank'."
-            )
 
-    def forward(self, descriptor):
-        if self.mode == "diag":
-            scale = 1.0 + 0.5 * torch.tanh(self.diag_head(descriptor))
-            return "diag", scale
-        left = self.left_head(descriptor).view(
-            descriptor.shape[0],
-            self.channels,
-            self.rank,
-        )
-        right = self.right_head(descriptor).view(
-            descriptor.shape[0],
-            self.channels,
-            self.rank,
-        )
-        return "lowrank", (left, right)
 
 
-class SheafConsensusDiffusion(nn.Module):
-    """Cellular-sheaf half-step over HSI/LiDAR superpixel bipartite cells."""
 
-    def __init__(
-        self,
-        channels,
-        descriptor_dim,
-        restriction="diag",
-        rank=4,
-        steps=1,
-        alpha_init=0.1,
-    ):
-        super().__init__()
-        self.channels = channels
-        self.restriction = restriction
-        self.rank = rank
-        self.steps = steps
-        self.h_restriction = RestrictionMapGenerator(
-            descriptor_dim,
-            channels,
-            mode=restriction,
-            rank=rank,
-        )
-        self.l_restriction = RestrictionMapGenerator(
-            descriptor_dim,
-            channels,
-            mode=restriction,
-            rank=rank,
-        )
-        initial_alpha = inverse_softplus_scalar(alpha_init)
-        self.h_alpha_raw = nn.Parameter(initial_alpha.clone())
-        self.l_alpha_raw = nn.Parameter(initial_alpha.clone())
 
-    @staticmethod
-    def _scatter_mean(edge_values, parent_index, node_count):
-        sums = edge_values.new_zeros(node_count, edge_values.shape[1])
-        sums.index_add_(0, parent_index, edge_values)
-        counts = torch.bincount(
-            parent_index,
-            minlength=node_count,
-        ).to(edge_values.dtype).clamp_min(1.0)
-        return sums / counts.unsqueeze(1)
 
-    def forward(
-        self,
-        hsi_nodes,
-        lidar_nodes,
-        h_parent_index,
-        l_parent_index,
-        descriptor,
-    ):
-        h_current = hsi_nodes
-        l_current = lidar_nodes
-        h_alpha = F.softplus(self.h_alpha_raw)
-        l_alpha = F.softplus(self.l_alpha_raw)
-        final_delta = None
 
-        h_map = self.h_restriction(descriptor)
-        l_map = self.l_restriction(descriptor)
-        for _ in range(self.steps):
-            h_edge = h_current.index_select(0, h_parent_index)
-            l_edge = l_current.index_select(0, l_parent_index)
-            h_stalk = apply_edge_restriction(h_map, h_edge)
-            l_stalk = apply_edge_restriction(l_map, l_edge)
-            delta = h_stalk - l_stalk
-            final_delta = delta
-            h_edge_grad = apply_edge_restriction(
-                h_map,
-                delta,
-                transpose=True,
-            )
-            l_edge_grad = -apply_edge_restriction(
-                l_map,
-                delta,
-                transpose=True,
-            )
-            h_grad = self._scatter_mean(
-                h_edge_grad,
-                h_parent_index,
-                h_current.shape[0],
-            )
-            l_grad = self._scatter_mean(
-                l_edge_grad,
-                l_parent_index,
-                l_current.shape[0],
-            )
-            h_current = h_current - h_alpha * h_grad
-            l_current = l_current - l_alpha * l_grad
-
-        energy = final_delta.pow(2).sum(dim=1)
-        diagnostics = {
-            "sheaf_restriction": self.restriction,
-            "sheaf_rank": int(self.rank),
-            "sheaf_steps": int(self.steps),
-            "sheaf_alpha_h": float(h_alpha.detach().item()),
-            "sheaf_alpha_l": float(l_alpha.detach().item()),
-            "sheaf_energy_mean": float(energy.detach().mean().item()),
-            "sheaf_energy_std": float(
-                energy.detach().std(unbiased=False).item()
-            ),
-            "sheaf_delta_norm": float(
-                final_delta.detach().norm(dim=1).mean().item()
-            ),
-        }
-        return h_current, l_current, energy, diagnostics
-
-
-class DualChannelContextualSheafInteraction(nn.Module):
-    """Dual-channel contextual sheaf interaction over overlap edge stalks."""
-
-    def __init__(
-        self,
-        channels,
-        descriptor_dim,
-        attribute_dim=0,
-        attention_d_k=32,
-        topk=8,
-        restriction="lowrank",
-        rank=4,
-        steps=1,
-        consensus_mix_init=0.1,
-        conflict_mix_init=0.1,
-        semantic_gamma_init=0.1,
-        conflict_gamma_init=0.05,
-    ):
-        super().__init__()
-        self.channels = channels
-        self.restriction = restriction
-        self.rank = rank
-        self.steps = steps
-        self.topk = topk
-        self.scale = attention_d_k ** -0.5
-        self.h_base = nn.Linear(channels, channels, bias=False)
-        self.l_base = nn.Linear(channels, channels, bias=False)
-        nn.init.eye_(self.h_base.weight)
-        nn.init.eye_(self.l_base.weight)
-        self.h_restriction = RestrictionMapGenerator(
-            descriptor_dim,
-            channels,
-            mode=restriction,
-            rank=rank,
-        )
-        self.l_restriction = RestrictionMapGenerator(
-            descriptor_dim,
-            channels,
-            mode=restriction,
-            rank=rank,
-        )
-        edge_token_dim = 4 * channels + attribute_dim
-        self.edge_encoder = nn.Sequential(
-            nn.Linear(edge_token_dim, channels),
-            nn.LayerNorm(channels),
-            nn.LeakyReLU(),
-            nn.Linear(channels, channels),
-        )
-        self.edge_query = nn.Linear(channels, attention_d_k, bias=False)
-        self.edge_key = nn.Linear(channels, attention_d_k, bias=False)
-        self.consensus_value = nn.Linear(channels, channels, bias=False)
-        self.conflict_value = nn.Linear(channels, channels, bias=False)
-        self.consensus_mix = nn.Parameter(
-            torch.tensor(float(consensus_mix_init))
-        )
-        self.conflict_mix = nn.Parameter(
-            torch.tensor(float(conflict_mix_init))
-        )
-        self.consensus_norm = nn.LayerNorm(channels)
-        self.conflict_norm = nn.LayerNorm(channels)
-        self.consensus_ffn = nn.Sequential(
-            nn.Linear(channels, 2 * channels),
-            nn.LeakyReLU(),
-            nn.Linear(2 * channels, channels),
-        )
-        self.conflict_ffn = nn.Sequential(
-            nn.Linear(channels, 2 * channels),
-            nn.LeakyReLU(),
-            nn.Linear(2 * channels, channels),
-        )
-        self.consensus_ffn_norm = nn.LayerNorm(channels)
-        self.conflict_ffn_norm = nn.LayerNorm(channels)
-        self.h_update = nn.Linear(2 * channels, channels, bias=False)
-        self.l_update = nn.Linear(2 * channels, channels, bias=False)
-        h_gate_output = nn.Linear(channels, 1)
-        l_gate_output = nn.Linear(channels, 1)
-        nn.init.zeros_(h_gate_output.weight)
-        nn.init.zeros_(l_gate_output.weight)
-        nn.init.constant_(h_gate_output.bias, -3.0)
-        nn.init.constant_(l_gate_output.bias, -3.0)
-        self.h_gate = nn.Sequential(
-            nn.Linear(5 * channels, channels),
-            nn.LeakyReLU(),
-            h_gate_output,
-        )
-        self.l_gate = nn.Sequential(
-            nn.Linear(5 * channels, channels),
-            nn.LeakyReLU(),
-            l_gate_output,
-        )
-        self.h_update_norm = nn.LayerNorm(channels)
-        self.l_update_norm = nn.LayerNorm(channels)
-        self.semantic_gamma = nn.Parameter(
-            torch.tensor(float(semantic_gamma_init))
-        )
-        self.conflict_gamma = nn.Parameter(
-            torch.tensor(float(conflict_gamma_init))
-        )
-
-    @staticmethod
-    def _topk_softmax(logits, topk):
-        if topk <= 0 or topk >= logits.shape[1]:
-            return F.softmax(logits, dim=1)
-        values, indices = torch.topk(
-            logits,
-            k=min(topk, logits.shape[1]),
-            dim=1,
-        )
-        masked = torch.full_like(
-            logits,
-            torch.finfo(logits.dtype).min,
-        )
-        masked.scatter_(1, indices, values)
-        return F.softmax(masked, dim=1)
-
-    @staticmethod
-    def _row_entropy(attention):
-        return -torch.sum(
-            attention * torch.log(attention.clamp_min(1e-12)),
-            dim=1,
-        )
-
-    @staticmethod
-    def _scatter_mean(edge_values, parent_index, node_count):
-        sums = edge_values.new_zeros(node_count, edge_values.shape[1])
-        sums.index_add_(0, parent_index, edge_values)
-        counts = torch.bincount(
-            parent_index,
-            minlength=node_count,
-        ).to(edge_values.dtype).clamp_min(1.0)
-        return sums / counts.unsqueeze(1)
-
-    @staticmethod
-    def _base_adjoint(base_layer, edge_values):
-        return F.linear(edge_values, base_layer.weight.t())
-
-    def _edge_attention(
-        self,
-        consensus,
-        conflict,
-        cell_attributes,
-        spatial_prior,
-        hsi_prior,
-        lidar_prior,
-        spatial_prior_weight,
-        hsi_prior_weight,
-        lidar_prior_weight,
-    ):
-        edge_parts = [
-            consensus,
-            conflict,
-            torch.abs(conflict),
-            consensus * conflict,
-        ]
-        if cell_attributes is not None:
-            edge_parts.append(cell_attributes)
-        edge_token = self.edge_encoder(torch.cat(edge_parts, dim=1))
-        logits = (
-            self.edge_query(edge_token)
-            @ self.edge_key(edge_token).transpose(0, 1)
-            * self.scale
-        )
-        logits = (
-            logits
-            + spatial_prior_weight
-            * torch.log(spatial_prior.clamp_min(1e-6))
-            + hsi_prior_weight
-            * torch.log(hsi_prior.clamp_min(1e-6))
-            + lidar_prior_weight
-            * torch.log(lidar_prior.clamp_min(1e-6))
-        )
-        identity_support = torch.eye(
-            logits.shape[0],
-            dtype=torch.bool,
-            device=logits.device,
-        )
-        support_mask = (
-            (spatial_prior > 0.0)
-            | (hsi_prior > 0.0)
-            | (lidar_prior > 0.0)
-            | identity_support
-        )
-        masked_logits = logits.masked_fill(
-            ~support_mask,
-            torch.finfo(logits.dtype).min,
-        )
-        attention = self._topk_softmax(masked_logits, self.topk)
-        supported_logits = logits.detach()[support_mask]
-        return edge_token, attention, support_mask, supported_logits
-
-    def _restrict_pair(
-        self,
-        h_current,
-        l_current,
-        h_parent_index,
-        l_parent_index,
-        h_map,
-        l_map,
-    ):
-        h_edge = h_current.index_select(0, h_parent_index)
-        l_edge = l_current.index_select(0, l_parent_index)
-        h_base_edge = self.h_base(h_edge)
-        l_base_edge = self.l_base(l_edge)
-        h_stalk = apply_edge_restriction(h_map, h_base_edge)
-        l_stalk = apply_edge_restriction(l_map, l_base_edge)
-        consensus = 0.5 * (h_stalk + l_stalk)
-        conflict = h_stalk - l_stalk
-        return consensus, conflict
-
-    def _pullback_h(self, h_map, edge_values, h_parent_index, node_count):
-        edge_grad = apply_edge_restriction(
-            h_map,
-            edge_values,
-            transpose=True,
-        )
-        edge_grad = self._base_adjoint(self.h_base, edge_grad)
-        return self._scatter_mean(edge_grad, h_parent_index, node_count)
-
-    def _pullback_l(self, l_map, edge_values, l_parent_index, node_count):
-        edge_grad = apply_edge_restriction(
-            l_map,
-            edge_values,
-            transpose=True,
-        )
-        edge_grad = self._base_adjoint(self.l_base, edge_grad)
-        return self._scatter_mean(edge_grad, l_parent_index, node_count)
-
-    def forward(
-        self,
-        hsi_nodes,
-        lidar_nodes,
-        h_parent_index,
-        l_parent_index,
-        descriptor,
-        cell_attributes,
-        spatial_prior,
-        hsi_prior,
-        lidar_prior,
-        spatial_prior_weight=1.0,
-        hsi_prior_weight=0.5,
-        lidar_prior_weight=0.5,
-    ):
-        h_current = hsi_nodes
-        l_current = lidar_nodes
-        h_map = self.h_restriction(descriptor)
-        l_map = self.l_restriction(descriptor)
-        diagnostics = {}
-        final_energy = None
-
-        for _ in range(self.steps):
-            consensus, conflict = self._restrict_pair(
-                h_current,
-                l_current,
-                h_parent_index,
-                l_parent_index,
-                h_map,
-                l_map,
-            )
-            (
-                edge_token,
-                attention,
-                support_mask,
-                supported_logits,
-            ) = self._edge_attention(
-                consensus,
-                conflict,
-                cell_attributes,
-                spatial_prior,
-                hsi_prior,
-                lidar_prior,
-                spatial_prior_weight,
-                hsi_prior_weight,
-                lidar_prior_weight,
-            )
-            consensus_message = attention @ self.consensus_value(
-                consensus
-            )
-            conflict_message = attention @ self.conflict_value(conflict)
-            consensus_ctx = self.consensus_norm(
-                consensus + self.consensus_mix * consensus_message
-            )
-            conflict_ctx = self.conflict_norm(
-                conflict + self.conflict_mix * conflict_message
-            )
-            consensus_ctx = self.consensus_ffn_norm(
-                consensus_ctx + self.consensus_ffn(consensus_ctx)
-            )
-            conflict_ctx = self.conflict_ffn_norm(
-                conflict_ctx + self.conflict_ffn(conflict_ctx)
-            )
-
-            h_semantic = self._pullback_h(
-                h_map,
-                consensus_ctx,
-                h_parent_index,
-                h_current.shape[0],
-            )
-            l_semantic = self._pullback_l(
-                l_map,
-                consensus_ctx,
-                l_parent_index,
-                l_current.shape[0],
-            )
-            h_correction = -self._pullback_h(
-                h_map,
-                conflict_ctx,
-                h_parent_index,
-                h_current.shape[0],
-            )
-            l_correction = self._pullback_l(
-                l_map,
-                conflict_ctx,
-                l_parent_index,
-                l_current.shape[0],
-            )
-
-            h_gate = torch.sigmoid(
-                self.h_gate(
-                    torch.cat(
-                        [
-                            h_current,
-                            h_semantic,
-                            h_correction,
-                            h_current * h_semantic,
-                            torch.abs(h_correction),
-                        ],
-                        dim=1,
-                    )
-                )
-            )
-            l_gate = torch.sigmoid(
-                self.l_gate(
-                    torch.cat(
-                        [
-                            l_current,
-                            l_semantic,
-                            l_correction,
-                            l_current * l_semantic,
-                            torch.abs(l_correction),
-                        ],
-                        dim=1,
-                    )
-                )
-            )
-            h_update = self.h_update(
-                torch.cat(
-                    [
-                        self.semantic_gamma * h_semantic,
-                        self.conflict_gamma * h_correction,
-                    ],
-                    dim=1,
-                )
-            )
-            l_update = self.l_update(
-                torch.cat(
-                    [
-                        self.semantic_gamma * l_semantic,
-                        self.conflict_gamma * l_correction,
-                    ],
-                    dim=1,
-                )
-            )
-            h_current = self.h_update_norm(
-                h_current + h_gate * h_update
-            )
-            l_current = self.l_update_norm(
-                l_current + l_gate * l_update
-            )
-            final_energy = conflict.pow(2).sum(dim=1)
-            diagnostics = {
-                "dcsi_restriction": self.restriction,
-                "dcsi_rank": int(self.rank),
-                "dcsi_steps": int(self.steps),
-                "dcsi_edge_topk": int(self.topk),
-                "dcsi_attention_entropy": float(
-                    self._row_entropy(attention).detach().mean().item()
-                ),
-                "dcsi_support_density": float(
-                    support_mask.float().detach().mean().item()
-                ),
-                "dcsi_supported_logit_mean": float(
-                    supported_logits.mean().item()
-                ),
-                "dcsi_supported_logit_std": float(
-                    supported_logits.std(unbiased=False).item()
-                ),
-                "dcsi_consensus_mix": float(
-                    self.consensus_mix.detach().item()
-                ),
-                "dcsi_conflict_mix": float(
-                    self.conflict_mix.detach().item()
-                ),
-                "dcsi_semantic_gamma": float(
-                    self.semantic_gamma.detach().item()
-                ),
-                "dcsi_conflict_gamma": float(
-                    self.conflict_gamma.detach().item()
-                ),
-                "dcsi_h_gate_mean": float(h_gate.detach().mean().item()),
-                "dcsi_l_gate_mean": float(l_gate.detach().mean().item()),
-                "dcsi_consensus_norm": float(
-                    consensus.detach().norm(dim=1).mean().item()
-                ),
-                "dcsi_conflict_norm": float(
-                    conflict.detach().norm(dim=1).mean().item()
-                ),
-                "dcsi_edge_token_norm": float(
-                    edge_token.detach().norm(dim=1).mean().item()
-                ),
-                "sheaf_energy_mean": float(
-                    final_energy.detach().mean().item()
-                ),
-                "sheaf_energy_std": float(
-                    final_energy.detach().std(unbiased=False).item()
-                ),
-            }
-
-        return h_current, l_current, final_energy, diagnostics
-
-
-class ContextGatedSheafAlignment(nn.Module):
-    """Context-Gated Cellular Sheaf Alignment (CGSA).
-
-    Intersection cells are treated as edge stalks on the HSI/LiDAR
-    superpixel bipartite graph. The edge-stalk graph only predicts a
-    scalar correction step size; the feature writeback remains strictly
-    proportional to the measured sheaf conflict.
-    """
-
-    def __init__(
-        self,
-        channels,
-        descriptor_dim,
-        attribute_dim=0,
-        attention_d_k=32,
-        topk=8,
-        restriction="lowrank",
-        rank=4,
-        steps=1,
-        gamma_init=0.1,
-        alpha_max=2.0,
-        use_consensus_channel=False,
-        consensus_channel_gamma_init=0.05,
-    ):
-        super().__init__()
-        self.channels = channels
-        self.restriction = restriction
-        self.rank = rank
-        self.steps = steps
-        self.topk = topk
-        self.alpha_max = float(alpha_max)
-        self.use_consensus_channel = use_consensus_channel
-        self.scale = attention_d_k ** -0.5
-
-        self.h_base = nn.Linear(channels, channels, bias=False)
-        self.l_base = nn.Linear(channels, channels, bias=False)
-        nn.init.eye_(self.h_base.weight)
-        nn.init.eye_(self.l_base.weight)
-        self.h_restriction = RestrictionMapGenerator(
-            descriptor_dim,
-            channels,
-            mode=restriction,
-            rank=rank,
-        )
-        self.l_restriction = RestrictionMapGenerator(
-            descriptor_dim,
-            channels,
-            mode=restriction,
-            rank=rank,
-        )
-
-        edge_token_dim = 3 * channels + attribute_dim
-        self.edge_encoder = nn.Sequential(
-            nn.Linear(edge_token_dim, channels),
-            nn.LayerNorm(channels),
-            nn.LeakyReLU(),
-            nn.Linear(channels, channels),
-        )
-        self.edge_query = nn.Linear(channels, attention_d_k, bias=False)
-        self.edge_key = nn.Linear(channels, attention_d_k, bias=False)
-        self.edge_value = nn.Linear(channels, channels, bias=False)
-        self.step_head = nn.Linear(2 * channels, 1)
-        nn.init.zeros_(self.step_head.weight)
-        nn.init.zeros_(self.step_head.bias)
-
-        self.h_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
-        self.l_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
-        if use_consensus_channel:
-            self.consensus_out = nn.Linear(
-                channels,
-                channels,
-                bias=False,
-            )
-            nn.init.zeros_(self.consensus_out.weight)
-            self.c_gamma = nn.Parameter(
-                torch.tensor(float(consensus_channel_gamma_init))
-            )
-        else:
-            self.consensus_out = None
-            self.c_gamma = None
-
-    @staticmethod
-    def _topk_softmax(logits, topk):
-        if topk <= 0 or topk >= logits.shape[1]:
-            return F.softmax(logits, dim=1)
-        values, indices = torch.topk(
-            logits,
-            k=min(topk, logits.shape[1]),
-            dim=1,
-        )
-        masked = torch.full_like(
-            logits,
-            torch.finfo(logits.dtype).min,
-        )
-        masked.scatter_(1, indices, values)
-        return F.softmax(masked, dim=1)
-
-    @staticmethod
-    def _row_entropy(attention):
-        return -torch.sum(
-            attention * torch.log(attention.clamp_min(1e-12)),
-            dim=1,
-        )
-
-    @staticmethod
-    def _scatter_mean(edge_values, parent_index, node_count):
-        sums = edge_values.new_zeros(node_count, edge_values.shape[1])
-        sums.index_add_(0, parent_index, edge_values)
-        counts = torch.bincount(
-            parent_index,
-            minlength=node_count,
-        ).to(edge_values.dtype).clamp_min(1.0)
-        return sums / counts.unsqueeze(1)
-
-    @staticmethod
-    def _base_adjoint(base_layer, edge_values):
-        return F.linear(edge_values, base_layer.weight.t())
-
-    def _edge_attention(
-        self,
-        consensus,
-        conflict,
-        cell_attributes,
-        spatial_prior,
-        hsi_prior,
-        lidar_prior,
-        spatial_prior_weight,
-        hsi_prior_weight,
-        lidar_prior_weight,
-    ):
-        token_parts = [consensus, conflict, torch.abs(conflict)]
-        if cell_attributes is not None:
-            token_parts.append(cell_attributes)
-        edge_token = self.edge_encoder(torch.cat(token_parts, dim=1))
-        logits = (
-            self.edge_query(edge_token)
-            @ self.edge_key(edge_token).transpose(0, 1)
-            * self.scale
-            + spatial_prior_weight
-            * torch.log(spatial_prior.clamp_min(1e-6))
-            + hsi_prior_weight
-            * torch.log(hsi_prior.clamp_min(1e-6))
-            + lidar_prior_weight
-            * torch.log(lidar_prior.clamp_min(1e-6))
-        )
-        identity_support = torch.eye(
-            logits.shape[0],
-            dtype=torch.bool,
-            device=logits.device,
-        )
-        support_mask = (
-            (spatial_prior > 0.0)
-            | (hsi_prior > 0.0)
-            | (lidar_prior > 0.0)
-            | identity_support
-        )
-        masked_logits = logits.masked_fill(
-            ~support_mask,
-            torch.finfo(logits.dtype).min,
-        )
-        attention = self._topk_softmax(masked_logits, self.topk)
-        context = attention @ self.edge_value(edge_token)
-        supported_logits = logits.detach()[support_mask]
-        return edge_token, context, attention, support_mask, supported_logits
-
-    def _pullback_h(self, h_map, edge_values, h_parent_index, node_count):
-        edge_grad = apply_edge_restriction(
-            h_map,
-            edge_values,
-            transpose=True,
-        )
-        edge_grad = self._base_adjoint(self.h_base, edge_grad)
-        return self._scatter_mean(edge_grad, h_parent_index, node_count)
-
-    def _pullback_l(self, l_map, edge_values, l_parent_index, node_count):
-        edge_grad = apply_edge_restriction(
-            l_map,
-            edge_values,
-            transpose=True,
-        )
-        edge_grad = self._base_adjoint(self.l_base, edge_grad)
-        return self._scatter_mean(edge_grad, l_parent_index, node_count)
-
-    def forward(
-        self,
-        hsi_nodes,
-        lidar_nodes,
-        h_parent_index,
-        l_parent_index,
-        descriptor,
-        cell_attributes,
-        spatial_prior,
-        hsi_prior,
-        lidar_prior,
-        spatial_prior_weight=1.0,
-        hsi_prior_weight=0.5,
-        lidar_prior_weight=0.5,
-    ):
-        h_current = hsi_nodes
-        l_current = lidar_nodes
-        h_map = self.h_restriction(descriptor)
-        l_map = self.l_restriction(descriptor)
-        diagnostics = {}
-        final_energy = None
-
-        for _ in range(self.steps):
-            h_edge = self.h_base(
-                h_current.index_select(0, h_parent_index)
-            )
-            l_edge = self.l_base(
-                l_current.index_select(0, l_parent_index)
-            )
-            h_stalk = apply_edge_restriction(h_map, h_edge)
-            l_stalk = apply_edge_restriction(l_map, l_edge)
-            conflict = h_stalk - l_stalk
-            consensus = 0.5 * (h_stalk + l_stalk)
-
-            (
-                edge_token,
-                context,
-                attention,
-                support_mask,
-                supported_logits,
-            ) = self._edge_attention(
-                consensus,
-                conflict,
-                cell_attributes,
-                spatial_prior,
-                hsi_prior,
-                lidar_prior,
-                spatial_prior_weight,
-                hsi_prior_weight,
-                lidar_prior_weight,
-            )
-            alpha = self.alpha_max * torch.sigmoid(
-                self.step_head(torch.cat([edge_token, context], dim=1))
-            )
-            scaled_conflict = alpha * conflict
-            h_grad = self._pullback_h(
-                h_map,
-                scaled_conflict,
-                h_parent_index,
-                h_current.shape[0],
-            )
-            l_grad = self._pullback_l(
-                l_map,
-                scaled_conflict,
-                l_parent_index,
-                l_current.shape[0],
-            )
-            h_current = h_current - self.h_gamma * h_grad
-            l_current = l_current + self.l_gamma * l_grad
-
-            consensus_delta_norm = None
-            if self.consensus_out is not None:
-                consensus_delta = self.consensus_out(
-                    attention @ consensus - consensus
-                )
-                h_current = h_current + self.c_gamma * self._pullback_h(
-                    h_map,
-                    consensus_delta,
-                    h_parent_index,
-                    h_current.shape[0],
-                )
-                l_current = l_current + self.c_gamma * self._pullback_l(
-                    l_map,
-                    consensus_delta,
-                    l_parent_index,
-                    l_current.shape[0],
-                )
-                consensus_delta_norm = float(
-                    consensus_delta.detach().norm(dim=1).mean().item()
-                )
-
-            final_energy = conflict.pow(2).sum(dim=1)
-            diagnostics = {
-                "cgsa_restriction": self.restriction,
-                "cgsa_rank": int(self.rank),
-                "cgsa_steps": int(self.steps),
-                "cgsa_edge_topk": int(self.topk),
-                "cgsa_alpha_max": float(self.alpha_max),
-                "cgsa_alpha_mean": float(alpha.detach().mean().item()),
-                "cgsa_alpha_std": float(
-                    alpha.detach().std(unbiased=False).item()
-                ),
-                "cgsa_alpha_min": float(alpha.detach().min().item()),
-                "cgsa_alpha_max_observed": float(
-                    alpha.detach().max().item()
-                ),
-                "cgsa_gamma_h": float(self.h_gamma.detach().item()),
-                "cgsa_gamma_l": float(self.l_gamma.detach().item()),
-                "cgsa_attention_entropy": float(
-                    self._row_entropy(attention).detach().mean().item()
-                ),
-                "cgsa_support_density": float(
-                    support_mask.float().detach().mean().item()
-                ),
-                "cgsa_supported_logit_mean": float(
-                    supported_logits.mean().item()
-                ),
-                "cgsa_supported_logit_std": float(
-                    supported_logits.std(unbiased=False).item()
-                ),
-                "cgsa_conflict_norm": float(
-                    conflict.detach().norm(dim=1).mean().item()
-                ),
-                "cgsa_consensus_norm": float(
-                    consensus.detach().norm(dim=1).mean().item()
-                ),
-                "cgsa_context_norm": float(
-                    context.detach().norm(dim=1).mean().item()
-                ),
-                "cgsa_consensus_channel": bool(
-                    self.consensus_out is not None
-                ),
-                "cgsa_consensus_delta_norm": consensus_delta_norm,
-                "sheaf_energy_mean": float(
-                    final_energy.detach().mean().item()
-                ),
-                "sheaf_energy_std": float(
-                    final_energy.detach().std(unbiased=False).item()
-                ),
-            }
-            if self.c_gamma is not None:
-                diagnostics["cgsa_gamma_c"] = float(
-                    self.c_gamma.detach().item()
-                )
-
-        return h_current, l_current, final_energy, diagnostics
-
-
-class PostGATMediatedConsensusGraph(nn.Module):
-    """Independent mediator graph branch over public center anchors.
-
-    The module consumes post-GAT2 HSI/LiDAR private graph nodes, builds
-    public center anchors from both modalities, builds a C-C dynamic graph
-    with C's own Q/K and HSI/LiDAR projected topology priors, then projects
-    the updated mediator graph directly back to pixels. It intentionally
-    does not write messages back to HSI or LiDAR superpixel nodes.
-    """
-
-    def __init__(
-        self,
-        channels,
-        bridge_data,
-        attention_d_k=32,
-        topk=8,
-        gamma_init=0.0,
-        transport_lambda=0.5,
-        transport_fusion="residual",
-        transport_message="fixed",
-        transport_operator="transport",
-        transport_prior_weight=1.0,
-        transport_gamma_init=0.0,
-        transport_second_gamma_init=0.0,
-        sheaf_restriction="diag",
-        sheaf_rank=4,
-        sheaf_steps=1,
-        dcsi_edge_topk=8,
-        dcsi_consensus_mix=0.1,
-        dcsi_conflict_mix=0.1,
-        dcsi_semantic_gamma_init=0.1,
-        dcsi_conflict_gamma_init=0.05,
-        cgsa_alpha_max=2.0,
-        cgsa_consensus_channel=False,
-        spatial_prior_weight=1.0,
-        hsi_prior_weight=0.5,
-        lidar_prior_weight=0.5,
-    ):
-        super().__init__()
-        self.channels = channels
-        self.attention_d_k = attention_d_k
-        self.topk = topk
-        self.spatial_prior_weight = spatial_prior_weight
-        self.hsi_prior_weight = hsi_prior_weight
-        self.lidar_prior_weight = lidar_prior_weight
-        self.transport_lambda = transport_lambda
-        self.transport_fusion = transport_fusion
-        self.transport_message = transport_message
-        self.transport_operator = transport_operator
-        self.transport_prior_weight = transport_prior_weight
-        anchor_count = int(bridge_data["anchor_count"])
-        self.bridge_embedding = nn.Parameter(
-            torch.empty(anchor_count, channels)
-        )
-        nn.init.xavier_uniform_(self.bridge_embedding)
-        self.bridge_norm = nn.LayerNorm(channels)
-        attribute_channels = (
-            bridge_data["attributes"].shape[1]
-            if "attributes" in bridge_data
-            else 0
-        )
-        self.cell_encoder = nn.Sequential(
-            nn.Linear(5 * channels + attribute_channels, channels),
-            nn.LayerNorm(channels),
-            nn.LeakyReLU(),
-            nn.Linear(channels, channels),
-            nn.LeakyReLU(),
-        )
-
-        self.h_value = nn.Linear(channels, channels, bias=False)
-        self.c_query = nn.Linear(channels, attention_d_k, bias=False)
-        self.c_key = nn.Linear(channels, attention_d_k, bias=False)
-        self.l_value = nn.Linear(channels, channels, bias=False)
-        self.scale = attention_d_k ** -0.5
-
-        self.c_gat = MultiHeadGAT(
-            channels,
-            head_channels=60,
-            out_channels=channels,
-            dropout=0.2,
-            heads=4,
-            alpha=0.2,
-            use_edge_weights=True,
-        )
-        self.c_gat_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
-        self.c_graph_norm = nn.LayerNorm(channels)
-        self.c_ffn = nn.Sequential(
-            nn.Linear(channels, 2 * channels),
-            nn.LeakyReLU(),
-            nn.Linear(2 * channels, channels),
-        )
-        self.c_ffn_norm = nn.LayerNorm(channels)
-        self.graph_projection = nn.Sequential(
-            nn.Linear(channels, channels),
-            nn.BatchNorm1d(channels),
-            nn.LeakyReLU(),
-        )
-        self.l_to_h_transport = nn.Linear(
-            channels,
-            channels,
-            bias=False,
-        )
-        self.h_to_l_transport = nn.Linear(
-            channels,
-            channels,
-            bias=False,
-        )
-        self.h_transport_query = nn.Linear(
-            channels,
-            attention_d_k,
-            bias=False,
-        )
-        self.l_transport_key = nn.Linear(
-            channels,
-            attention_d_k,
-            bias=False,
-        )
-        self.l_transport_query = nn.Linear(
-            channels,
-            attention_d_k,
-            bias=False,
-        )
-        self.h_transport_key = nn.Linear(
-            channels,
-            attention_d_k,
-            bias=False,
-        )
-        self.h_intra_proj = nn.Linear(
-            channels,
-            channels,
-            bias=False,
-        )
-        self.l_intra_proj = nn.Linear(
-            channels,
-            channels,
-            bias=False,
-        )
-        h_gate_output = nn.Linear(channels, 1)
-        l_gate_output = nn.Linear(channels, 1)
-        nn.init.zeros_(h_gate_output.weight)
-        nn.init.zeros_(l_gate_output.weight)
-        nn.init.constant_(h_gate_output.bias, -3.0)
-        nn.init.constant_(l_gate_output.bias, -3.0)
-        self.l_to_h_gate = nn.Sequential(
-            nn.Linear(3 * channels, channels),
-            nn.LeakyReLU(),
-            h_gate_output,
-        )
-        self.h_to_l_gate = nn.Sequential(
-            nn.Linear(3 * channels, channels),
-            nn.LeakyReLU(),
-            l_gate_output,
-        )
-        h_tri_gate_output = nn.Linear(channels, 3)
-        l_tri_gate_output = nn.Linear(channels, 3)
-        nn.init.zeros_(h_tri_gate_output.weight)
-        nn.init.zeros_(l_tri_gate_output.weight)
-        tri_gate_init = torch.log(
-            torch.tensor([0.80, 0.15, 0.05], dtype=torch.float32)
-        )
-        with torch.no_grad():
-            h_tri_gate_output.bias.copy_(tri_gate_init)
-            l_tri_gate_output.bias.copy_(tri_gate_init)
-        self.h_tri_gate = nn.Sequential(
-            nn.Linear(4 * channels, channels),
-            nn.LeakyReLU(),
-            h_tri_gate_output,
-        )
-        self.l_tri_gate = nn.Sequential(
-            nn.Linear(4 * channels, channels),
-            nn.LeakyReLU(),
-            l_tri_gate_output,
-        )
-        self.h_concat_fuse = nn.Sequential(
-            nn.Linear(4 * channels, channels),
-            nn.LayerNorm(channels),
-            nn.LeakyReLU(),
-            nn.Linear(channels, channels),
-        )
-        self.l_concat_fuse = nn.Sequential(
-            nn.Linear(4 * channels, channels),
-            nn.LayerNorm(channels),
-            nn.LeakyReLU(),
-            nn.Linear(channels, channels),
-        )
-        bilinear_rank = max(16, channels // 2)
-        self.h_bilinear_left = nn.Linear(
-            channels,
-            bilinear_rank,
-            bias=False,
-        )
-        self.h_bilinear_right = nn.Linear(
-            channels,
-            bilinear_rank,
-            bias=False,
-        )
-        self.h_bilinear_out = nn.Linear(
-            bilinear_rank,
-            channels,
-            bias=False,
-        )
-        self.l_bilinear_left = nn.Linear(
-            channels,
-            bilinear_rank,
-            bias=False,
-        )
-        self.l_bilinear_right = nn.Linear(
-            channels,
-            bilinear_rank,
-            bias=False,
-        )
-        self.l_bilinear_out = nn.Linear(
-            bilinear_rank,
-            channels,
-            bias=False,
-        )
-        self.h_bilinear_fuse = nn.Sequential(
-            nn.Linear(5 * channels, channels),
-            nn.LayerNorm(channels),
-            nn.LeakyReLU(),
-            nn.Linear(channels, channels),
-        )
-        self.l_bilinear_fuse = nn.Sequential(
-            nn.Linear(5 * channels, channels),
-            nn.LayerNorm(channels),
-            nn.LeakyReLU(),
-            nn.Linear(channels, channels),
-        )
-        self.h_transport_gamma = nn.Parameter(
-            torch.tensor(float(transport_gamma_init))
-        )
-        self.l_transport_gamma = nn.Parameter(
-            torch.tensor(float(transport_gamma_init))
-        )
-        self.h_transport_gamma2 = nn.Parameter(
-            torch.tensor(float(transport_second_gamma_init))
-        )
-        self.l_transport_gamma2 = nn.Parameter(
-            torch.tensor(float(transport_second_gamma_init))
-        )
-        descriptor_channels = 5 * channels + attribute_channels
-        self.sheaf_diffusion = None
-        if transport_operator == "sheaf":
-            self.sheaf_diffusion = SheafConsensusDiffusion(
-                channels,
-                descriptor_channels,
-                restriction=sheaf_restriction,
-                rank=sheaf_rank,
-                steps=sheaf_steps,
-                alpha_init=transport_gamma_init,
-            )
-        self.dcsi_interaction = None
-        if transport_operator == "dcsi":
-            self.dcsi_interaction = (
-                DualChannelContextualSheafInteraction(
-                    channels,
-                    descriptor_channels,
-                    attribute_dim=attribute_channels,
-                    attention_d_k=attention_d_k,
-                    topk=dcsi_edge_topk,
-                    restriction=sheaf_restriction,
-                    rank=sheaf_rank,
-                    steps=sheaf_steps,
-                    consensus_mix_init=dcsi_consensus_mix,
-                    conflict_mix_init=dcsi_conflict_mix,
-                    semantic_gamma_init=dcsi_semantic_gamma_init,
-                    conflict_gamma_init=dcsi_conflict_gamma_init,
-                )
-            )
-        self.cgsa_interaction = None
-        if transport_operator == "cgsa":
-            self.cgsa_interaction = ContextGatedSheafAlignment(
-                channels,
-                descriptor_channels,
-                attribute_dim=attribute_channels,
-                attention_d_k=attention_d_k,
-                topk=dcsi_edge_topk,
-                restriction=sheaf_restriction,
-                rank=sheaf_rank,
-                steps=sheaf_steps,
-                gamma_init=transport_gamma_init,
-                alpha_max=cgsa_alpha_max,
-                use_consensus_channel=cgsa_consensus_channel,
-                consensus_channel_gamma_init=dcsi_conflict_gamma_init,
-            )
-        self.mediator_kind = bridge_data.get(
-            "mediator_kind",
-            "center",
-        )
-
-        prior_ch_array = np.asarray(bridge_data["prior_ch"])
-        prior_cl_array = np.asarray(bridge_data["prior_cl"])
-        self.register_buffer(
-            "h_parent_index",
-            torch.as_tensor(
-                prior_ch_array.argmax(axis=1),
-                dtype=torch.long,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "l_parent_index",
-            torch.as_tensor(
-                prior_cl_array.argmax(axis=1),
-                dtype=torch.long,
-            ),
-            persistent=False,
-        )
-
-        for name in (
-            "prior_hc",
-            "prior_ch",
-            "prior_lc",
-            "prior_cl",
-        ):
-            self.register_buffer(
-                name,
-                torch.as_tensor(
-                    bridge_data[name],
-                    dtype=torch.float32,
-                ),
-                persistent=False,
-            )
-        if "attributes" in bridge_data:
-            self.register_buffer(
-                "cell_attributes",
-                torch.as_tensor(
-                    bridge_data["attributes"],
-                    dtype=torch.float32,
-                ),
-                persistent=False,
-            )
-        else:
-            self.register_buffer(
-                "cell_attributes",
-                None,
-                persistent=False,
-            )
-        if "cc_prior" in bridge_data:
-            self.register_buffer(
-                "cc_prior",
-                torch.as_tensor(
-                    bridge_data["cc_prior"],
-                    dtype=torch.float32,
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                "bias_cc",
-                None,
-                persistent=False,
-            )
-        else:
-            self.register_buffer(
-                "cc_prior",
-                None,
-                persistent=False,
-            )
-            self.register_buffer(
-                "bias_cc",
-                torch.as_tensor(
-                    bridge_data["bias_cc"],
-                    dtype=torch.float32,
-                ),
-                persistent=False,
-            )
-        _, bridge_projection_assignment = normalized_sparse_assignments(
-            bridge_data["assignment"]
-        )
-        self.register_buffer(
-            "bridge_projection_assignment",
-            bridge_projection_assignment,
-            persistent=False,
-        )
-        self.last_diagnostics = None
-        self.last_sheaf_energy_loss = None
-
-    @staticmethod
-    def _topk_softmax(logits, topk):
-        if topk <= 0 or topk >= logits.shape[1]:
-            return F.softmax(logits, dim=1)
-        values, indices = torch.topk(
-            logits,
-            k=min(topk, logits.shape[1]),
-            dim=1,
-        )
-        masked = torch.full_like(
-            logits,
-            torch.finfo(logits.dtype).min,
-        )
-        masked.scatter_(1, indices, values)
-        return F.softmax(masked, dim=1)
-
-    @staticmethod
-    def _row_entropy(attention):
-        return -torch.sum(
-            attention * torch.log(attention.clamp_min(1e-12)),
-            dim=1,
-        )
-
-    @staticmethod
-    def _row_normalize(matrix):
-        return matrix / matrix.sum(
-            dim=1,
-            keepdim=True,
-        ).clamp_min(1e-6)
-
-    def _project_private_graph_prior(self, left, adjacency, right):
-        projected = left @ adjacency.detach() @ right
-        projected = projected.clamp_min(0.0)
-        return self._row_normalize(projected)
-
-    def _spatial_prior(self):
-        if self.cc_prior is not None:
-            return self._row_normalize(self.cc_prior)
-        shifted = self.bias_cc - self.bias_cc.max(
-            dim=1,
-            keepdim=True,
-        ).values
-        return self._row_normalize(torch.exp(shifted))
-
-    def _build_c_graph(
-        self,
-        hsi_nodes,
-        lidar_nodes,
-        hsi_adjacency,
-        lidar_adjacency,
-    ):
-        h_value = self.h_value(hsi_nodes)
-        l_value = self.l_value(lidar_nodes)
-        h_context = self.prior_ch @ h_value
-        l_context = self.prior_cl @ l_value
-        node_value = torch.cat([h_value, l_value], dim=0)
-        node_to_c = torch.cat([self.prior_hc, self.prior_lc], dim=0)
-        c_degree = node_to_c.sum(dim=0).clamp_min(1e-6)
-        incidence_context = (
-            node_to_c.transpose(0, 1) @ node_value
-        ) / c_degree.unsqueeze(1)
-        cell_inputs = [
-            h_context,
-            l_context,
-            incidence_context,
-            torch.abs(h_context - l_context),
-            h_context * l_context,
-        ]
-        if self.cell_attributes is not None:
-            cell_inputs.append(self.cell_attributes)
-
-        bridge_nodes = self.bridge_norm(
-            self.cell_encoder(torch.cat(cell_inputs, dim=1))
-            + self.bridge_embedding
-        )
-        c_query = self.c_query(bridge_nodes)
-        c_key = self.c_key(bridge_nodes)
-
-        spatial_prior = self._spatial_prior()
-        hsi_prior = self._project_private_graph_prior(
-            self.prior_ch,
-            hsi_adjacency,
-            self.prior_hc,
-        )
-        lidar_prior = self._project_private_graph_prior(
-            self.prior_cl,
-            lidar_adjacency,
-            self.prior_lc,
-        )
-        logits = c_query @ c_key.transpose(0, 1) * self.scale
-        logits = (
-            logits
-            + self.spatial_prior_weight
-            * torch.log(spatial_prior.clamp_min(1e-6))
-            + self.hsi_prior_weight
-            * torch.log(hsi_prior.clamp_min(1e-6))
-            + self.lidar_prior_weight
-            * torch.log(lidar_prior.clamp_min(1e-6))
-        )
-        identity_support = torch.eye(
-            logits.shape[0],
-            dtype=torch.bool,
-            device=logits.device,
-        )
-        support_mask = (
-            (spatial_prior > 0.0)
-            | (hsi_prior > 0.0)
-            | (lidar_prior > 0.0)
-            | identity_support
-        )
-        masked_logits = logits.masked_fill(
-            ~support_mask,
-            torch.finfo(logits.dtype).min,
-        )
-        attention_cc = self._topk_softmax(masked_logits, self.topk)
-        supported_logits = logits.detach()[support_mask]
-        diagnostics = {
-            "c_gamma": float(self.c_gat_gamma.detach().item()),
-            "c_gat_gamma": float(self.c_gat_gamma.detach().item()),
-            "bridge_count": int(bridge_nodes.shape[0]),
-            "mediator_kind": self.mediator_kind,
-            "attention_cc_entropy": float(
-                self._row_entropy(attention_cc).detach().mean().item()
-            ),
-            "support_density": float(
-                support_mask.float().detach().mean().item()
-            ),
-            "spatial_prior_entropy": float(
-                self._row_entropy(spatial_prior).detach().mean().item()
-            ),
-            "hsi_projected_prior_entropy": float(
-                self._row_entropy(hsi_prior).detach().mean().item()
-            ),
-            "lidar_projected_prior_entropy": float(
-                self._row_entropy(lidar_prior).detach().mean().item()
-            ),
-            "qk_logit_mean": float(logits.detach().mean().item()),
-            "qk_logit_std": float(
-                logits.detach().std(unbiased=False).item()
-            ),
-            "supported_qk_logit_mean": float(
-                supported_logits.mean().item()
-            ),
-            "supported_qk_logit_std": float(
-                supported_logits.std(unbiased=False).item()
-            ),
-            "prior_weights": (
-                float(self.spatial_prior_weight),
-                float(self.hsi_prior_weight),
-                float(self.lidar_prior_weight),
-            ),
-            "initial_c_norm": float(
-                bridge_nodes.detach().norm(dim=1).mean().item()
-            ),
-        }
-        return {
-            "h_value": h_value,
-            "l_value": l_value,
-            "bridge_nodes": bridge_nodes,
-            "attention_cc": attention_cc,
-            "diagnostics": diagnostics,
-        }
-
-    def _build_sheaf_descriptor(self, hsi_nodes, lidar_nodes):
-        h_value = self.h_value(hsi_nodes)
-        l_value = self.l_value(lidar_nodes)
-        h_context = self.prior_ch @ h_value
-        l_context = self.prior_cl @ l_value
-        node_value = torch.cat([h_value, l_value], dim=0)
-        node_to_c = torch.cat([self.prior_hc, self.prior_lc], dim=0)
-        c_degree = node_to_c.sum(dim=0).clamp_min(1e-6)
-        incidence_context = (
-            node_to_c.transpose(0, 1) @ node_value
-        ) / c_degree.unsqueeze(1)
-        descriptor_parts = [
-            h_context,
-            l_context,
-            incidence_context,
-            torch.abs(h_context - l_context),
-            h_context * l_context,
-        ]
-        if self.cell_attributes is not None:
-            descriptor_parts.append(self.cell_attributes)
-        return torch.cat(descriptor_parts, dim=1)
-
-    def forward(self, hsi_nodes, lidar_nodes, hsi_adjacency, lidar_adjacency):
-        c_graph = self._build_c_graph(
-            hsi_nodes,
-            lidar_nodes,
-            hsi_adjacency,
-            lidar_adjacency,
-        )
-        bridge_nodes = c_graph["bridge_nodes"]
-        attention_cc = c_graph["attention_cc"]
-        c_gat_output = self.c_gat(bridge_nodes, attention_cc)
-        c_graph_features = self.c_graph_norm(
-            bridge_nodes + self.c_gat_gamma * c_gat_output
-        )
-        c_ffn_delta = self.c_ffn(c_graph_features)
-        updated_bridge = self.c_ffn_norm(
-            c_graph_features + c_ffn_delta
-        )
-        consensus_pixel_features = torch.sparse.mm(
-            self.bridge_projection_assignment,
-            updated_bridge,
-        )
-        consensus_pixel_features = self.graph_projection(
-            consensus_pixel_features
-        )
-        self.last_diagnostics = {
-            **c_graph["diagnostics"],
-            "transport_mode": "none",
-            "c_gat_output_norm": float(
-                c_gat_output.detach().norm(dim=1).mean().item()
-            ),
-            "c_ffn_delta_norm": float(
-                c_ffn_delta.detach().norm(dim=1).mean().item()
-            ),
-            "consensus_pixel_norm": float(
-                consensus_pixel_features.detach()
-                .norm(dim=1)
-                .mean()
-                .item()
-            ),
-        }
-        return consensus_pixel_features
-
-    def transport_nodes(
-        self,
-        hsi_nodes,
-        lidar_nodes,
-        hsi_adjacency,
-        lidar_adjacency,
-        round_index=1,
-    ):
-        if round_index == 1:
-            h_gamma = self.h_transport_gamma
-            l_gamma = self.l_transport_gamma
-        elif round_index == 2:
-            h_gamma = self.h_transport_gamma2
-            l_gamma = self.l_transport_gamma2
-        else:
-            raise ValueError("round_index must be 1 or 2.")
-        self.last_sheaf_energy_loss = None
-        if self.transport_operator == "sheaf":
-            if self.sheaf_diffusion is None:
-                raise ValueError("Sheaf diffusion module is not initialized.")
-            sheaf_descriptor = self._build_sheaf_descriptor(
-                hsi_nodes,
-                lidar_nodes,
-            )
-            (
-                updated_hsi,
-                updated_lidar,
-                energy,
-                sheaf_diagnostics,
-            ) = self.sheaf_diffusion(
-                hsi_nodes,
-                lidar_nodes,
-                self.h_parent_index,
-                self.l_parent_index,
-                sheaf_descriptor,
-            )
-            self.last_sheaf_energy_loss = (
-                energy.mean() / float(self.channels)
-            )
-            self.last_diagnostics = {
-                "transport_operator": "sheaf",
-                "transport_mode": "bidirectional",
-                "transport_stage": getattr(
-                    self,
-                    "active_transport_stage",
-                    "post-gat2",
-                ),
-                "transport_round": round_index,
-                "transport_fusion": "sheaf-diffusion",
-                "transport_message": "sheaf-restriction",
-                "h_transport_gamma": sheaf_diagnostics["sheaf_alpha_h"],
-                "l_transport_gamma": sheaf_diagnostics["sheaf_alpha_l"],
-                "bridge_count": int(self.prior_ch.shape[0]),
-                "mediator_kind": self.mediator_kind,
-                **sheaf_diagnostics,
-            }
-            return updated_hsi, updated_lidar
-
-        if self.transport_operator == "cgsa":
-            if self.cgsa_interaction is None:
-                raise ValueError("CGSA module is not initialized.")
-            sheaf_descriptor = self._build_sheaf_descriptor(
-                hsi_nodes,
-                lidar_nodes,
-            )
-            spatial_prior = self._spatial_prior()
-            hsi_prior = self._project_private_graph_prior(
-                self.prior_ch,
-                hsi_adjacency,
-                self.prior_hc,
-            )
-            lidar_prior = self._project_private_graph_prior(
-                self.prior_cl,
-                lidar_adjacency,
-                self.prior_lc,
-            )
-            (
-                updated_hsi,
-                updated_lidar,
-                energy,
-                cgsa_diagnostics,
-            ) = self.cgsa_interaction(
-                hsi_nodes,
-                lidar_nodes,
-                self.h_parent_index,
-                self.l_parent_index,
-                sheaf_descriptor,
-                self.cell_attributes,
-                spatial_prior,
-                hsi_prior,
-                lidar_prior,
-                spatial_prior_weight=self.spatial_prior_weight,
-                hsi_prior_weight=self.hsi_prior_weight,
-                lidar_prior_weight=self.lidar_prior_weight,
-            )
-            self.last_sheaf_energy_loss = (
-                energy.mean() / float(self.channels)
-            )
-            self.last_diagnostics = {
-                "transport_operator": "cgsa",
-                "transport_mode": "bidirectional",
-                "transport_stage": getattr(
-                    self,
-                    "active_transport_stage",
-                    "post-gat2",
-                ),
-                "transport_round": round_index,
-                "transport_fusion": "context-gated-sheaf-alignment",
-                "transport_message": "context-gated-conflict",
-                "bridge_count": int(self.prior_ch.shape[0]),
-                "mediator_kind": self.mediator_kind,
-                "prior_weights": (
-                    float(self.spatial_prior_weight),
-                    float(self.hsi_prior_weight),
-                    float(self.lidar_prior_weight),
-                ),
-                **cgsa_diagnostics,
-            }
-            return updated_hsi, updated_lidar
-
-        if self.transport_operator == "dcsi":
-            if self.dcsi_interaction is None:
-                raise ValueError("DCSI module is not initialized.")
-            sheaf_descriptor = self._build_sheaf_descriptor(
-                hsi_nodes,
-                lidar_nodes,
-            )
-            spatial_prior = self._spatial_prior()
-            hsi_prior = self._project_private_graph_prior(
-                self.prior_ch,
-                hsi_adjacency,
-                self.prior_hc,
-            )
-            lidar_prior = self._project_private_graph_prior(
-                self.prior_cl,
-                lidar_adjacency,
-                self.prior_lc,
-            )
-            (
-                updated_hsi,
-                updated_lidar,
-                energy,
-                dcsi_diagnostics,
-            ) = self.dcsi_interaction(
-                hsi_nodes,
-                lidar_nodes,
-                self.h_parent_index,
-                self.l_parent_index,
-                sheaf_descriptor,
-                self.cell_attributes,
-                spatial_prior,
-                hsi_prior,
-                lidar_prior,
-                spatial_prior_weight=self.spatial_prior_weight,
-                hsi_prior_weight=self.hsi_prior_weight,
-                lidar_prior_weight=self.lidar_prior_weight,
-            )
-            self.last_sheaf_energy_loss = (
-                energy.mean() / float(self.channels)
-            )
-            self.last_diagnostics = {
-                "transport_operator": "dcsi",
-                "transport_mode": "bidirectional",
-                "transport_stage": getattr(
-                    self,
-                    "active_transport_stage",
-                    "post-gat2",
-                ),
-                "transport_round": round_index,
-                "transport_fusion": "dual-channel-contextual-sheaf",
-                "transport_message": "edge-stalk-reasoning",
-                "bridge_count": int(self.prior_ch.shape[0]),
-                "mediator_kind": self.mediator_kind,
-                "prior_weights": (
-                    float(self.spatial_prior_weight),
-                    float(self.hsi_prior_weight),
-                    float(self.lidar_prior_weight),
-                ),
-                **dcsi_diagnostics,
-            }
-            return updated_hsi, updated_lidar
-
-        c_graph = self._build_c_graph(
-            hsi_nodes,
-            lidar_nodes,
-            hsi_adjacency,
-            lidar_adjacency,
-        )
-        h_value = c_graph["h_value"]
-        l_value = c_graph["l_value"]
-        attention_cc = c_graph["attention_cc"]
-        identity = torch.eye(
-            attention_cc.shape[0],
-            dtype=attention_cc.dtype,
-            device=attention_cc.device,
-        )
-        transport_kernel = (
-            (1.0 - self.transport_lambda) * identity
-            + self.transport_lambda * attention_cc
-        )
-
-        beta_l_to_h = self._row_normalize(
-            (self.prior_hc @ transport_kernel @ self.prior_cl)
-            .clamp_min(0.0)
-        )
-        beta_h_to_l = self._row_normalize(
-            (self.prior_lc @ transport_kernel @ self.prior_ch)
-            .clamp_min(0.0)
-        )
-        if self.transport_message == "fixed":
-            l_to_h_raw = beta_l_to_h @ l_value
-            h_to_l_raw = beta_h_to_l @ h_value
-            l_to_h_attention_entropy = None
-            h_to_l_attention_entropy = None
-        elif self.transport_message == "qk-prior":
-            l_to_h_logits = (
-                self.h_transport_query(hsi_nodes)
-                @ self.l_transport_key(lidar_nodes).transpose(0, 1)
-                * self.scale
-                + self.transport_prior_weight
-                * torch.log(beta_l_to_h.clamp_min(1e-6))
-            )
-            l_to_h_support = beta_l_to_h > 0.0
-            l_to_h_logits = l_to_h_logits.masked_fill(
-                ~l_to_h_support,
-                torch.finfo(l_to_h_logits.dtype).min,
-            )
-            l_to_h_attention = F.softmax(l_to_h_logits, dim=1)
-            l_to_h_raw = l_to_h_attention @ l_value
-            h_to_l_logits = (
-                self.l_transport_query(lidar_nodes)
-                @ self.h_transport_key(hsi_nodes).transpose(0, 1)
-                * self.scale
-                + self.transport_prior_weight
-                * torch.log(beta_h_to_l.clamp_min(1e-6))
-            )
-            h_to_l_support = beta_h_to_l > 0.0
-            h_to_l_logits = h_to_l_logits.masked_fill(
-                ~h_to_l_support,
-                torch.finfo(h_to_l_logits.dtype).min,
-            )
-            h_to_l_attention = F.softmax(h_to_l_logits, dim=1)
-            h_to_l_raw = h_to_l_attention @ h_value
-            l_to_h_attention_entropy = float(
-                self._row_entropy(l_to_h_attention)
-                .detach()
-                .mean()
-                .item()
-            )
-            h_to_l_attention_entropy = float(
-                self._row_entropy(h_to_l_attention)
-                .detach()
-                .mean()
-                .item()
-            )
-        else:
-            raise ValueError(
-                f"Unsupported transport message: {self.transport_message}"
-            )
-        l_to_h_message = self.l_to_h_transport(l_to_h_raw)
-        h_to_l_message = self.h_to_l_transport(h_to_l_raw)
-
-        h_intra = self.h_intra_proj(hsi_adjacency @ hsi_nodes)
-        l_intra = self.l_intra_proj(lidar_adjacency @ lidar_nodes)
-        if self.transport_fusion == "residual":
-            h_gate = torch.sigmoid(
-                self.l_to_h_gate(
-                    torch.cat(
-                        [
-                            hsi_nodes,
-                            l_to_h_message,
-                            torch.abs(hsi_nodes - l_to_h_message),
-                        ],
-                        dim=1,
-                    )
-                )
-            )
-            updated_hsi = (
-                hsi_nodes
-                + h_gamma * h_gate * l_to_h_message
-            )
-            l_gate = torch.sigmoid(
-                self.h_to_l_gate(
-                    torch.cat(
-                        [
-                            lidar_nodes,
-                            h_to_l_message,
-                            torch.abs(lidar_nodes - h_to_l_message),
-                        ],
-                        dim=1,
-                    )
-                )
-            )
-            updated_lidar = (
-                lidar_nodes
-                + l_gamma * l_gate * h_to_l_message
-            )
-            h_gate_mean = float(h_gate.detach().mean().item())
-            l_gate_mean = float(l_gate.detach().mean().item())
-            h_tri_gate_mean = None
-            l_tri_gate_mean = None
-            h_concat_delta_norm = None
-            l_concat_delta_norm = None
-            h_bilinear_product_norm = None
-            l_bilinear_product_norm = None
-        elif self.transport_fusion == "tri-gate":
-            h_tri_gate = F.softmax(
-                self.h_tri_gate(
-                    torch.cat(
-                        [
-                            hsi_nodes,
-                            h_intra,
-                            l_to_h_message,
-                            torch.abs(hsi_nodes - l_to_h_message),
-                        ],
-                        dim=1,
-                    )
-                ),
-                dim=1,
-            )
-            h_mix = (
-                h_tri_gate[:, 0:1] * hsi_nodes
-                + h_tri_gate[:, 1:2] * h_intra
-                + h_tri_gate[:, 2:3] * l_to_h_message
-            )
-            updated_hsi = (
-                hsi_nodes
-                + h_gamma * (h_mix - hsi_nodes)
-            )
-            l_tri_gate = F.softmax(
-                self.l_tri_gate(
-                    torch.cat(
-                        [
-                            lidar_nodes,
-                            l_intra,
-                            h_to_l_message,
-                            torch.abs(lidar_nodes - h_to_l_message),
-                        ],
-                        dim=1,
-                    )
-                ),
-                dim=1,
-            )
-            l_mix = (
-                l_tri_gate[:, 0:1] * lidar_nodes
-                + l_tri_gate[:, 1:2] * l_intra
-                + l_tri_gate[:, 2:3] * h_to_l_message
-            )
-            updated_lidar = (
-                lidar_nodes
-                + l_gamma * (l_mix - lidar_nodes)
-            )
-            h_gate_mean = None
-            l_gate_mean = None
-            h_tri_gate_mean = (
-                h_tri_gate.detach().mean(dim=0).cpu().tolist()
-            )
-            l_tri_gate_mean = (
-                l_tri_gate.detach().mean(dim=0).cpu().tolist()
-            )
-            h_concat_delta_norm = None
-            l_concat_delta_norm = None
-            h_bilinear_product_norm = None
-            l_bilinear_product_norm = None
-        elif self.transport_fusion == "concat":
-            h_concat_input = torch.cat(
-                [
-                    hsi_nodes,
-                    h_intra,
-                    l_to_h_message,
-                    torch.abs(hsi_nodes - l_to_h_message),
-                ],
-                dim=1,
-            )
-            h_fused = self.h_concat_fuse(h_concat_input)
-            updated_hsi = (
-                hsi_nodes
-                + h_gamma * (h_fused - hsi_nodes)
-            )
-            l_concat_input = torch.cat(
-                [
-                    lidar_nodes,
-                    l_intra,
-                    h_to_l_message,
-                    torch.abs(lidar_nodes - h_to_l_message),
-                ],
-                dim=1,
-            )
-            l_fused = self.l_concat_fuse(l_concat_input)
-            updated_lidar = (
-                lidar_nodes
-                + l_gamma * (l_fused - lidar_nodes)
-            )
-            h_gate_mean = None
-            l_gate_mean = None
-            h_tri_gate_mean = None
-            l_tri_gate_mean = None
-            h_concat_delta_norm = float(
-                (h_fused - hsi_nodes).detach().norm(dim=1).mean().item()
-            )
-            l_concat_delta_norm = float(
-                (l_fused - lidar_nodes)
-                .detach()
-                .norm(dim=1)
-                .mean()
-                .item()
-            )
-            h_bilinear_product_norm = None
-            l_bilinear_product_norm = None
-        elif self.transport_fusion == "bilinear":
-            h_product = self.h_bilinear_out(
-                self.h_bilinear_left(hsi_nodes)
-                * self.h_bilinear_right(l_to_h_message)
-            )
-            h_fused = self.h_bilinear_fuse(
-                torch.cat(
-                    [
-                        hsi_nodes,
-                        h_intra,
-                        l_to_h_message,
-                        torch.abs(hsi_nodes - l_to_h_message),
-                        h_product,
-                    ],
-                    dim=1,
-                )
-            )
-            updated_hsi = (
-                hsi_nodes
-                + h_gamma * (h_fused - hsi_nodes)
-            )
-            l_product = self.l_bilinear_out(
-                self.l_bilinear_left(lidar_nodes)
-                * self.l_bilinear_right(h_to_l_message)
-            )
-            l_fused = self.l_bilinear_fuse(
-                torch.cat(
-                    [
-                        lidar_nodes,
-                        l_intra,
-                        h_to_l_message,
-                        torch.abs(lidar_nodes - h_to_l_message),
-                        l_product,
-                    ],
-                    dim=1,
-                )
-            )
-            updated_lidar = (
-                lidar_nodes
-                + l_gamma * (l_fused - lidar_nodes)
-            )
-            h_gate_mean = None
-            l_gate_mean = None
-            h_tri_gate_mean = None
-            l_tri_gate_mean = None
-            h_concat_delta_norm = float(
-                (h_fused - hsi_nodes).detach().norm(dim=1).mean().item()
-            )
-            l_concat_delta_norm = float(
-                (l_fused - lidar_nodes)
-                .detach()
-                .norm(dim=1)
-                .mean()
-                .item()
-            )
-            h_bilinear_product_norm = float(
-                h_product.detach().norm(dim=1).mean().item()
-            )
-            l_bilinear_product_norm = float(
-                l_product.detach().norm(dim=1).mean().item()
-            )
-        else:
-            raise ValueError(
-                f"Unsupported transport fusion: {self.transport_fusion}"
-            )
-
-        self.last_diagnostics = {
-            **c_graph["diagnostics"],
-            "transport_operator": self.transport_operator,
-            "transport_mode": "bidirectional",
-            "transport_stage": getattr(
-                self,
-                "active_transport_stage",
-                "post-gat2",
-            ),
-            "transport_round": round_index,
-            "transport_fusion": self.transport_fusion,
-            "transport_message": self.transport_message,
-            "transport_prior_weight": float(self.transport_prior_weight),
-            "transport_lambda": float(self.transport_lambda),
-            "l_to_h_beta_density": float(
-                (beta_l_to_h > 0.0).float().detach().mean().item()
-            ),
-            "h_to_l_beta_density": float(
-                (beta_h_to_l > 0.0).float().detach().mean().item()
-            ),
-            "l_to_h_attention_entropy": l_to_h_attention_entropy,
-            "h_to_l_attention_entropy": h_to_l_attention_entropy,
-            "h_transport_gamma": float(
-                h_gamma.detach().item()
-            ),
-            "l_transport_gamma": float(
-                l_gamma.detach().item()
-            ),
-            "h_transport_gate_mean": h_gate_mean,
-            "l_transport_gate_mean": l_gate_mean,
-            "h_tri_gate_mean": h_tri_gate_mean,
-            "l_tri_gate_mean": l_tri_gate_mean,
-            "h_concat_delta_norm": h_concat_delta_norm,
-            "l_concat_delta_norm": l_concat_delta_norm,
-            "h_bilinear_product_norm": h_bilinear_product_norm,
-            "l_bilinear_product_norm": l_bilinear_product_norm,
-            "h_intra_message_norm": float(
-                h_intra.detach().norm(dim=1).mean().item()
-            ),
-            "l_intra_message_norm": float(
-                l_intra.detach().norm(dim=1).mean().item()
-            ),
-            "l_to_h_message_norm": float(
-                l_to_h_message.detach().norm(dim=1).mean().item()
-            ),
-            "h_to_l_message_norm": float(
-                h_to_l_message.detach().norm(dim=1).mean().item()
-            ),
-        }
-        return updated_hsi, updated_lidar
-
-    def diagnostics(self):
-        return self.last_diagnostics
 
 
 class SparseOverlapCrossModalRelation(nn.Module):
@@ -4018,12 +1780,14 @@ class SparseOverlapCrossModalRelation(nn.Module):
         prior_weight=1.0,
         gamma_init=0.1,
         second_gamma_init=0.0,
+        fragmentation_alpha=0.0,
     ):
         super().__init__()
         self.channels = channels
         self.message = message
         self.fusion = fusion
         self.prior_weight = prior_weight
+        self.fragmentation_alpha = float(fragmentation_alpha)
         self.scale = attention_d_k ** -0.5
         self.register_buffer(
             "h_index",
@@ -4056,9 +1820,45 @@ class SparseOverlapCrossModalRelation(nn.Module):
             torch.as_tensor(relation_data["overlap"], dtype=torch.float32),
             persistent=False,
         )
+        h_fragmentation = relation_data.get("h_fragmentation")
+        if h_fragmentation is None:
+            h_fragmentation = np.zeros(
+                int(relation_data["h_node_count"]),
+                dtype=np.float32,
+            )
+        l_fragmentation = relation_data.get("l_fragmentation")
+        if l_fragmentation is None:
+            l_fragmentation = np.zeros(
+                int(relation_data["l_node_count"]),
+                dtype=np.float32,
+            )
+        self.register_buffer(
+            "h_fragmentation",
+            torch.as_tensor(h_fragmentation, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_fragmentation",
+            torch.as_tensor(l_fragmentation, dtype=torch.float32),
+            persistent=False,
+        )
         self.h_node_count = int(relation_data["h_node_count"])
         self.l_node_count = int(relation_data["l_node_count"])
         self.edge_count = int(relation_data["edge_count"])
+        self.original_edge_count = int(
+            relation_data.get("original_edge_count", self.edge_count)
+        )
+        self.coverage_pruned_edges = int(
+            relation_data.get("coverage_pruned_edges", 0)
+        )
+        self.topk_pruned_edges = int(
+            relation_data.get("topk_pruned_edges", 0)
+        )
+        self.retained_edge_fraction = float(
+            relation_data.get("retained_edge_fraction", 1.0)
+        )
+        self.min_coverage = float(relation_data.get("min_coverage", 0.0))
+        self.iou_topk = int(relation_data.get("iou_topk", 0))
         self.density = float(relation_data["density"])
         self.edge_attribute_mode = relation_data.get(
             "edge_attribute_mode",
@@ -4329,6 +2129,7 @@ class SparseOverlapCrossModalRelation(nn.Module):
         conflict_path,
         consensus_gate,
         conflict_gate,
+        fragmentation_gate,
     ):
         product = bilinear_out(
             bilinear_left(nodes) * bilinear_right(message)
@@ -4395,10 +2196,12 @@ class SparseOverlapCrossModalRelation(nn.Module):
             )
             updated = (
                 nodes
-                + consensus_gamma
+                + fragmentation_gate
+                * consensus_gamma
                 * consensus_gate_value
                 * consensus_delta
-                + conflict_gamma
+                + fragmentation_gate
+                * conflict_gamma
                 * conflict_gate_value
                 * conflict_delta
             )
@@ -4423,7 +2226,7 @@ class SparseOverlapCrossModalRelation(nn.Module):
             return updated, gate, product, delta, path_stats
         else:
             raise ValueError(f"Unsupported sparse overlap fusion: {self.fusion}")
-        updated = nodes + gamma * gate * delta
+        updated = nodes + fragmentation_gate * gamma * gate * delta
         return updated, gate, product, delta, path_stats
 
     def forward(self, hsi_nodes, lidar_nodes, round_index=1):
@@ -4445,6 +2248,20 @@ class SparseOverlapCrossModalRelation(nn.Module):
             raise ValueError("round_index must be 1 or 2.")
 
         h_weights, l_weights = self._edge_weights(hsi_nodes, lidar_nodes)
+        if self.fragmentation_alpha > 0:
+            h_fragmentation_gate = torch.exp(
+                -self.fragmentation_alpha * self.h_fragmentation
+            ).unsqueeze(1)
+            l_fragmentation_gate = torch.exp(
+                -self.fragmentation_alpha * self.l_fragmentation
+            ).unsqueeze(1)
+        else:
+            h_fragmentation_gate = hsi_nodes.new_ones(
+                (self.h_node_count, 1)
+            )
+            l_fragmentation_gate = lidar_nodes.new_ones(
+                (self.l_node_count, 1)
+            )
         h_source = self.l_to_h_value(lidar_nodes)
         l_source = self.h_to_l_value(hsi_nodes)
 
@@ -4515,6 +2332,7 @@ class SparseOverlapCrossModalRelation(nn.Module):
             self.h_conflict_path,
             self.h_consensus_gate,
             self.h_conflict_gate,
+            h_fragmentation_gate,
         )
         (
             updated_lidar,
@@ -4541,6 +2359,7 @@ class SparseOverlapCrossModalRelation(nn.Module):
             self.l_conflict_path,
             self.l_consensus_gate,
             self.l_conflict_gate,
+            l_fragmentation_gate,
         )
 
         h_entropy = self._edge_entropy(
@@ -4571,6 +2390,25 @@ class SparseOverlapCrossModalRelation(nn.Module):
             "edge_bias_mean": edge_bias_mean,
             "edge_bias_std": edge_bias_std,
             "edge_count": int(self.edge_count),
+            "original_edge_count": int(self.original_edge_count),
+            "coverage_pruned_edges": int(self.coverage_pruned_edges),
+            "topk_pruned_edges": int(self.topk_pruned_edges),
+            "retained_edge_fraction": float(self.retained_edge_fraction),
+            "min_coverage": float(self.min_coverage),
+            "iou_topk": int(self.iou_topk),
+            "fragmentation_alpha": float(self.fragmentation_alpha),
+            "h_fragmentation_mean": float(
+                self.h_fragmentation.detach().mean().item()
+            ),
+            "l_fragmentation_mean": float(
+                self.l_fragmentation.detach().mean().item()
+            ),
+            "h_fragmentation_gate_mean": float(
+                h_fragmentation_gate.detach().mean().item()
+            ),
+            "l_fragmentation_gate_mean": float(
+                l_fragmentation_gate.detach().mean().item()
+            ),
             "edge_density": float(self.density),
             "h_transport_gamma": float(h_gamma.detach().item()),
             "l_transport_gamma": float(l_gamma.detach().item()),
@@ -4631,290 +2469,1753 @@ class SparseOverlapCrossModalRelation(nn.Module):
         return self.last_diagnostics
 
 
-def aggregate_cell_pixel_means(
-    pixel_features,
-    pixel_cell_index,
-    cell_count,
-):
-    """Average a pixel feature cube inside every intersection cell."""
-    flat_features = np.asarray(
-        pixel_features,
-        dtype=np.float32,
-    ).reshape(-1, pixel_features.shape[-1])
-    pixel_cell_index = np.asarray(
-        pixel_cell_index,
-        dtype=np.int64,
-    ).reshape(-1)
-    sums = np.zeros(
-        (cell_count, flat_features.shape[1]),
-        dtype=np.float32,
-    )
-    np.add.at(sums, pixel_cell_index, flat_features)
-    counts = np.bincount(
-        pixel_cell_index,
-        minlength=cell_count,
-    ).astype(np.float32)
-    return sums / np.maximum(counts[:, None], 1.0)
+class DualTransportArbitration(nn.Module):
+    """Geometry/semantic transport arbitration on sparse overlap edges.
 
+    The simple variant keeps semantic transport on the same sparse overlap
+    support as geometry. The full variant optionally augments that support
+    with nonlocal semantic top-k neighbors, applies Sinkhorn column limiting,
+    and exposes auxiliary regularization losses.
+    """
 
-def build_sparse_cell_boundary_strengths(
-    cell_segments,
-    hsi,
-    elevation,
-):
-    """Return average HSI spectral and LiDAR gradient boundary strengths."""
-    cell_count = int(cell_segments.max()) + 1
-    hsi = np.asarray(hsi, dtype=np.float32)
-    gradient_y, gradient_x = np.gradient(
-        np.asarray(elevation, dtype=np.float32)
-    )
-    gradient = np.sqrt(
-        gradient_x * gradient_x + gradient_y * gradient_y
-    )
-    key_parts = []
-    hsi_value_parts = []
-    lidar_value_parts = []
-    for (
-        first,
-        second,
-        first_spectrum,
-        second_spectrum,
-        first_gradient,
-        second_gradient,
-    ) in (
-        (
-            cell_segments[:, :-1],
-            cell_segments[:, 1:],
-            hsi[:, :-1, :],
-            hsi[:, 1:, :],
-            gradient[:, :-1],
-            gradient[:, 1:],
-        ),
-        (
-            cell_segments[:-1, :],
-            cell_segments[1:, :],
-            hsi[:-1, :, :],
-            hsi[1:, :, :],
-            gradient[:-1, :],
-            gradient[1:, :],
-        ),
+    def __init__(
+        self,
+        channels,
+        relation_data,
+        attention_d_k=64,
+        tau=0.1,
+        gamma_init=0.0,
+        variant="simple",
+        nonlocal_topk=10,
+        normalization="sinkhorn",
+        sinkhorn_iters=5,
     ):
-        boundary = first != second
-        if not np.any(boundary):
-            continue
-        left = first[boundary].astype(np.int64)
-        right = second[boundary].astype(np.int64)
-        lower = np.minimum(left, right)
-        upper = np.maximum(left, right)
-        key_parts.append(lower * cell_count + upper)
-        boundary_first_spectrum = first_spectrum[boundary]
-        boundary_second_spectrum = second_spectrum[boundary]
-        numerator = np.sum(
-            boundary_first_spectrum * boundary_second_spectrum,
-            axis=1,
+        super().__init__()
+        self.channels = int(channels)
+        self.variant = variant
+        self.tau = float(tau)
+        self.scale = attention_d_k ** -0.5
+        self.nonlocal_topk = int(nonlocal_topk)
+        self.normalization = normalization
+        self.sinkhorn_iters = int(sinkhorn_iters)
+        self.register_buffer(
+            "h_index",
+            torch.as_tensor(relation_data["h_index"], dtype=torch.long),
+            persistent=False,
         )
-        denominator = (
-            np.linalg.norm(boundary_first_spectrum, axis=1)
-            * np.linalg.norm(boundary_second_spectrum, axis=1)
+        self.register_buffer(
+            "l_index",
+            torch.as_tensor(relation_data["l_index"], dtype=torch.long),
+            persistent=False,
         )
-        hsi_value_parts.append(
-            np.arccos(
-                np.clip(
-                    numerator / np.maximum(denominator, 1e-8),
-                    -1.0,
-                    1.0,
+        self.h_node_count = int(relation_data["h_node_count"])
+        self.l_node_count = int(relation_data["l_node_count"])
+        self.edge_count = int(relation_data["edge_count"])
+        h_coverage = torch.as_tensor(
+            relation_data["h_coverage"],
+            dtype=torch.float32,
+        )
+        l_coverage = torch.as_tensor(
+            relation_data["l_coverage"],
+            dtype=torch.float32,
+        )
+        self.register_buffer(
+            "h_geo",
+            self._normalize_edge_weights(
+                h_coverage,
+                self.h_index,
+                self.h_node_count,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_geo",
+            self._normalize_edge_weights(
+                l_coverage,
+                self.l_index,
+                self.l_node_count,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "h_degree",
+            self._segment_sum(
+                torch.ones_like(h_coverage),
+                self.h_index,
+                self.h_node_count,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_degree",
+            self._segment_sum(
+                torch.ones_like(l_coverage),
+                self.l_index,
+                self.l_node_count,
+            ),
+            persistent=False,
+        )
+        h_geo_dense = torch.zeros(
+            (self.h_node_count, self.l_node_count),
+            dtype=torch.float32,
+        )
+        h_geo_dense[
+            torch.as_tensor(relation_data["h_index"], dtype=torch.long),
+            torch.as_tensor(relation_data["l_index"], dtype=torch.long),
+        ] = self.h_geo
+        self.register_buffer(
+            "h_geo_dense",
+            h_geo_dense,
+            persistent=False,
+        )
+        l_geo_dense = torch.zeros(
+            (self.l_node_count, self.h_node_count),
+            dtype=torch.float32,
+        )
+        l_geo_dense[
+            torch.as_tensor(relation_data["l_index"], dtype=torch.long),
+            torch.as_tensor(relation_data["h_index"], dtype=torch.long),
+        ] = self.l_geo
+        self.register_buffer(
+            "l_geo_dense",
+            l_geo_dense,
+            persistent=False,
+        )
+        self.register_buffer(
+            "h_support_dense",
+            h_geo_dense > 0,
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_support_dense",
+            l_geo_dense > 0,
+            persistent=False,
+        )
+
+        self.q_h = nn.Linear(channels, attention_d_k, bias=False)
+        self.k_l = nn.Linear(channels, attention_d_k, bias=False)
+        self.q_l = nn.Linear(channels, attention_d_k, bias=False)
+        self.k_h = nn.Linear(channels, attention_d_k, bias=False)
+        self.v_l2h = nn.Linear(channels, channels)
+        self.v_h2l = nn.Linear(channels, channels)
+        self.gate_scale_h = nn.Parameter(torch.ones(()))
+        self.gate_bias_h = nn.Parameter(torch.zeros(()))
+        self.gate_scale_l = nn.Parameter(torch.ones(()))
+        self.gate_bias_l = nn.Parameter(torch.zeros(()))
+        self.gate_mlp_h = nn.Sequential(
+            nn.Linear(3, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+        )
+        self.gate_mlp_l = nn.Sequential(
+            nn.Linear(3, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+        )
+        self.align_l_to_h = nn.Linear(channels, channels, bias=False)
+        self.align_h_to_l = nn.Linear(channels, channels, bias=False)
+        self.gamma_h = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.gamma_l = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.ln_h = nn.LayerNorm(channels)
+        self.ln_l = nn.LayerNorm(channels)
+        self.last_diagnostics = None
+        self.last_D_h = None
+        self.last_D_l = None
+        self.last_gate_h = None
+        self.last_gate_l = None
+        self.last_ctx_h = None
+        self.last_ctx_l = None
+        self.last_aux_losses = {}
+
+    @staticmethod
+    def _segment_sum(values, index, segment_count):
+        output = values.new_zeros(segment_count)
+        output.index_add_(0, index, values)
+        return output
+
+    @classmethod
+    def _normalize_edge_weights(cls, values, index, segment_count):
+        denom = cls._segment_sum(values, index, segment_count)
+        return values / denom[index].clamp_min(1e-12)
+
+    @staticmethod
+    def _segment_softmax(logits, index, segment_count):
+        if logits.numel() == 0:
+            return logits
+        if hasattr(logits, "scatter_reduce_"):
+            try:
+                max_values = torch.full(
+                    (segment_count,),
+                    torch.finfo(logits.dtype).min,
+                    dtype=logits.dtype,
+                    device=logits.device,
                 )
-            ).astype(np.float32)
+                max_values.scatter_reduce_(
+                    0,
+                    index,
+                    logits,
+                    reduce="amax",
+                    include_self=True,
+                )
+                exp_values = torch.exp(logits - max_values[index])
+                denom = torch.zeros(
+                    segment_count,
+                    dtype=logits.dtype,
+                    device=logits.device,
+                )
+                denom.index_add_(0, index, exp_values)
+                return exp_values / denom[index].clamp_min(1e-12)
+            except TypeError:
+                pass
+
+        weights = torch.zeros_like(logits)
+        for segment in torch.unique(index):
+            mask = index == segment
+            weights[mask] = F.softmax(logits[mask], dim=0)
+        return weights
+
+    @staticmethod
+    def _aggregate(edge_values, edge_weights, receiver_index, receiver_count):
+        output = edge_values.new_zeros((receiver_count, edge_values.shape[1]))
+        output.index_add_(
+            0,
+            receiver_index,
+            edge_values * edge_weights.unsqueeze(1),
         )
-        lidar_value_parts.append(
-            0.5
+        return output
+
+    @staticmethod
+    def _edge_entropy(edge_weights, receiver_index, receiver_count):
+        entropy_edges = -edge_weights * torch.log(edge_weights.clamp_min(1e-12))
+        entropy = edge_weights.new_zeros(receiver_count)
+        entropy.index_add_(0, receiver_index, entropy_edges)
+        return entropy
+
+    @staticmethod
+    def _mean_valid(values, valid):
+        if bool(valid.any()):
+            return float(values[valid].detach().mean().item())
+        return 0.0
+
+    @staticmethod
+    def _standardize(values, valid):
+        output = torch.zeros_like(values)
+        if bool(valid.any()):
+            selected = values[valid]
+            centered = selected - selected.mean()
+            scale = selected.std(unbiased=False).clamp_min(1e-8)
+            output[valid] = centered / scale
+        return output
+
+    @staticmethod
+    def _masked_row_softmax(logits, support):
+        masked_logits = logits.masked_fill(~support, -1e9)
+        weights = torch.softmax(masked_logits, dim=1)
+        weights = weights * support.to(weights.dtype)
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        return torch.nan_to_num(weights, nan=0.0)
+
+    def _masked_sinkhorn(self, logits, support):
+        log_weights = logits.masked_fill(~support, -1e9)
+        valid_rows = support.any(dim=1)
+        valid_cols = support.any(dim=0)
+        for _ in range(self.sinkhorn_iters):
+            row_norm = torch.logsumexp(log_weights, dim=1, keepdim=True)
+            log_weights = torch.where(
+                valid_rows[:, None],
+                log_weights - row_norm,
+                log_weights,
+            )
+            col_norm = torch.logsumexp(log_weights, dim=0, keepdim=True)
+            log_weights = torch.where(
+                valid_cols[None, :],
+                log_weights - col_norm,
+                log_weights,
+            )
+        row_norm = torch.logsumexp(log_weights, dim=1, keepdim=True)
+        log_weights = torch.where(
+            valid_rows[:, None],
+            log_weights - row_norm,
+            log_weights,
+        )
+        weights = log_weights.exp() * support.to(log_weights.dtype)
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        return torch.nan_to_num(weights, nan=0.0)
+
+    def _one_direction(
+        self,
+        query_nodes,
+        source_nodes,
+        receiver_index,
+        source_index,
+        geo_weights,
+        receiver_degree,
+        receiver_count,
+        q_proj,
+        k_proj,
+        v_proj,
+        gate_scale,
+        gate_bias,
+        layer_norm,
+    ):
+        logits = (
+            q_proj(query_nodes)[receiver_index]
+            * k_proj(source_nodes)[source_index]
+        ).sum(dim=1) * self.scale / self.tau
+        sem_weights = self._segment_softmax(
+            logits,
+            receiver_index,
+            receiver_count,
+        )
+
+        kl_edges = sem_weights * (
+            torch.log(sem_weights.clamp_min(1e-12))
+            - torch.log(geo_weights.clamp_min(1e-12))
+        )
+        conflict = self._segment_sum(
+            kl_edges,
+            receiver_index,
+            receiver_count,
+        )
+        valid = receiver_degree > 0
+        conflict_std = conflict.new_zeros(conflict.shape)
+        if bool(valid.any()):
+            valid_conflict = conflict[valid]
+            centered = valid_conflict - valid_conflict.mean()
+            scale = valid_conflict.std(unbiased=False).clamp_min(1e-8)
+            conflict_std[valid] = centered / scale
+        gate = torch.zeros(
+            (receiver_count, 1),
+            dtype=query_nodes.dtype,
+            device=query_nodes.device,
+        )
+        gate[valid] = torch.sigmoid(
+            gate_scale * conflict_std[valid] + gate_bias
+        ).unsqueeze(1)
+
+        source_values = v_proj(source_nodes)
+        edge_values = source_values[source_index]
+        geo_message = self._aggregate(
+            edge_values,
+            geo_weights,
+            receiver_index,
+            receiver_count,
+        )
+        sem_message = self._aggregate(
+            edge_values,
+            sem_weights,
+            receiver_index,
+            receiver_count,
+        )
+        ctx = (1.0 - gate) * geo_message + gate * sem_message
+        delta = layer_norm(ctx)
+        delta = delta.masked_fill(~valid.unsqueeze(1), 0.0)
+        entropy_geo = self._edge_entropy(
+            geo_weights,
+            receiver_index,
+            receiver_count,
+        )
+        entropy_sem = self._edge_entropy(
+            sem_weights,
+            receiver_index,
+            receiver_count,
+        )
+        stats = {
+            "conflict": conflict,
+            "gate": gate,
+            "geo_entropy": entropy_geo,
+            "sem_entropy": entropy_sem,
+            "delta": delta,
+            "ctx": ctx,
+        }
+        return delta, stats
+
+    def _one_direction_full(
+        self,
+        query_nodes,
+        source_nodes,
+        geo_dense,
+        support_geo,
+        q_proj,
+        k_proj,
+        v_proj,
+        gate_mlp,
+        layer_norm,
+    ):
+        eps = 1e-12
+        logits = q_proj(query_nodes) @ k_proj(source_nodes).t()
+        logits = logits * self.scale / self.tau
+        support = support_geo
+        if self.nonlocal_topk > 0 and source_nodes.shape[0] > 0:
+            k = min(self.nonlocal_topk, source_nodes.shape[0])
+            nonlocal_index = torch.topk(logits, k=k, dim=1).indices
+            nonlocal_support = torch.zeros_like(support_geo)
+            nonlocal_support.scatter_(1, nonlocal_index, True)
+            support = support_geo | nonlocal_support
+
+        if self.normalization == "sinkhorn":
+            sem_dense = self._masked_sinkhorn(logits, support)
+        else:
+            sem_dense = self._masked_row_softmax(logits, support)
+
+        valid = support_geo.any(dim=1)
+        escape = (sem_dense * (~support_geo).to(sem_dense.dtype)).sum(dim=1)
+        sem_in_geo = sem_dense * support_geo.to(sem_dense.dtype)
+        sem_in_geo = (
+            sem_in_geo
+            / sem_in_geo.sum(dim=1, keepdim=True).clamp_min(eps)
+        )
+        kl = (
+            sem_in_geo
             * (
-                first_gradient[boundary]
-                + second_gradient[boundary]
+                torch.log(sem_in_geo.clamp_min(eps))
+                - torch.log(geo_dense.clamp_min(eps))
+            )
+            * support_geo.to(sem_dense.dtype)
+        ).sum(dim=1)
+        sem_entropy = -(
+            sem_dense * torch.log(sem_dense.clamp_min(eps))
+        ).sum(dim=1)
+        geo_entropy = -(
+            geo_dense * torch.log(geo_dense.clamp_min(eps))
+        ).sum(dim=1)
+
+        gate_input = torch.stack(
+            [
+                self._standardize(kl, valid),
+                self._standardize(escape, valid),
+                self._standardize(sem_entropy, valid),
+            ],
+            dim=1,
+        )
+        gate = torch.zeros(
+            (query_nodes.shape[0], 1),
+            dtype=query_nodes.dtype,
+            device=query_nodes.device,
+        )
+        gate[valid] = torch.sigmoid(gate_mlp(gate_input[valid]))
+
+        source_values = v_proj(source_nodes)
+        geo_message = geo_dense @ source_values
+        sem_message = sem_dense @ source_values
+        ctx = (1.0 - gate) * geo_message + gate * sem_message
+        delta = layer_norm(ctx)
+        delta = delta.masked_fill(~valid.unsqueeze(1), 0.0)
+        stats = {
+            "conflict": kl,
+            "gate": gate,
+            "escape": escape,
+            "geo_entropy": geo_entropy,
+            "sem_entropy": sem_entropy,
+            "delta": delta,
+            "ctx": ctx,
+            "sem_dense": sem_dense,
+        }
+        return delta, stats
+
+    def _forward_simple(self, hsi_nodes, lidar_nodes):
+        delta_h, h_stats = self._one_direction(
+            hsi_nodes,
+            lidar_nodes,
+            self.h_index,
+            self.l_index,
+            self.h_geo,
+            self.h_degree,
+            self.h_node_count,
+            self.q_h,
+            self.k_l,
+            self.v_l2h,
+            self.gate_scale_h,
+            self.gate_bias_h,
+            self.ln_h,
+        )
+        delta_l, l_stats = self._one_direction(
+            lidar_nodes,
+            hsi_nodes,
+            self.l_index,
+            self.h_index,
+            self.l_geo,
+            self.l_degree,
+            self.l_node_count,
+            self.q_l,
+            self.k_h,
+            self.v_h2l,
+            self.gate_scale_l,
+            self.gate_bias_l,
+            self.ln_l,
+        )
+        return delta_h, delta_l, h_stats, l_stats
+
+    def _forward_full(self, hsi_nodes, lidar_nodes):
+        delta_h, h_stats = self._one_direction_full(
+            hsi_nodes,
+            lidar_nodes,
+            self.h_geo_dense,
+            self.h_support_dense,
+            self.q_h,
+            self.k_l,
+            self.v_l2h,
+            self.gate_mlp_h,
+            self.ln_h,
+        )
+        delta_l, l_stats = self._one_direction_full(
+            lidar_nodes,
+            hsi_nodes,
+            self.l_geo_dense,
+            self.l_support_dense,
+            self.q_l,
+            self.k_h,
+            self.v_h2l,
+            self.gate_mlp_l,
+            self.ln_l,
+        )
+        self.last_aux_losses = {}
+        if self.training:
+            h_valid = self.h_degree > 0
+            l_valid = self.l_degree > 0
+            h_gate = h_stats["gate"].squeeze(1)
+            l_gate = l_stats["gate"].squeeze(1)
+            sparse_terms = []
+            if bool(h_valid.any()):
+                sparse_terms.append(h_gate[h_valid].mean())
+            if bool(l_valid.any()):
+                sparse_terms.append(l_gate[l_valid].mean())
+            if sparse_terms:
+                self.last_aux_losses["sparse"] = torch.stack(sparse_terms).sum()
+
+            h_norm = F.normalize(hsi_nodes, dim=1)
+            l_as_h = F.normalize(self.align_l_to_h(lidar_nodes), dim=1)
+            h_cos = h_norm @ l_as_h.t()
+            h_weight = (1.0 - h_gate.detach()).unsqueeze(1) * self.h_geo_dense
+            h_align = ((1.0 - h_cos) * h_weight).sum() / (
+                h_weight.sum().clamp_min(1e-12)
+            )
+            l_norm = F.normalize(lidar_nodes, dim=1)
+            h_as_l = F.normalize(self.align_h_to_l(hsi_nodes), dim=1)
+            l_cos = l_norm @ h_as_l.t()
+            l_weight = (1.0 - l_gate.detach()).unsqueeze(1) * self.l_geo_dense
+            l_align = ((1.0 - l_cos) * l_weight).sum() / (
+                l_weight.sum().clamp_min(1e-12)
+            )
+            self.last_aux_losses["align"] = 0.5 * (h_align + l_align)
+
+            ent_terms = []
+            if bool(h_valid.any()):
+                ent_terms.append(h_stats["sem_entropy"][h_valid].mean())
+            if bool(l_valid.any()):
+                ent_terms.append(l_stats["sem_entropy"][l_valid].mean())
+            if ent_terms:
+                self.last_aux_losses["entropy"] = (
+                    torch.stack(ent_terms).mean()
+                )
+        return delta_h, delta_l, h_stats, l_stats
+
+    def forward(self, hsi_nodes, lidar_nodes):
+        self.last_aux_losses = {}
+        if self.variant == "full":
+            delta_h, delta_l, h_stats, l_stats = self._forward_full(
+                hsi_nodes,
+                lidar_nodes,
+            )
+        else:
+            delta_h, delta_l, h_stats, l_stats = self._forward_simple(
+                hsi_nodes,
+                lidar_nodes,
+            )
+        updated_hsi = hsi_nodes + self.gamma_h * delta_h
+        updated_lidar = lidar_nodes + self.gamma_l * delta_l
+        self.last_D_h = h_stats["conflict"].detach()
+        self.last_D_l = l_stats["conflict"].detach()
+        self.last_gate_h = h_stats["gate"].detach()
+        self.last_gate_l = l_stats["gate"].detach()
+        self.last_ctx_h = h_stats["ctx"]
+        self.last_ctx_l = l_stats["ctx"]
+
+        h_valid = self.h_degree > 0
+        l_valid = self.l_degree > 0
+
+        self.last_diagnostics = {
+            "mode": f"dual-transport-arbitration-{self.variant}",
+            "edge_count": int(self.edge_count),
+            "h_gamma": float(self.gamma_h.detach().item()),
+            "l_gamma": float(self.gamma_l.detach().item()),
+            "h_conflict_mean": self._mean_valid(h_stats["conflict"], h_valid),
+            "l_conflict_mean": self._mean_valid(l_stats["conflict"], l_valid),
+            "h_gate_mean": self._mean_valid(
+                h_stats["gate"].squeeze(1),
+                h_valid,
+            ),
+            "l_gate_mean": self._mean_valid(
+                l_stats["gate"].squeeze(1),
+                l_valid,
+            ),
+            "h_geo_entropy": self._mean_valid(h_stats["geo_entropy"], h_valid),
+            "l_geo_entropy": self._mean_valid(l_stats["geo_entropy"], l_valid),
+            "h_sem_entropy": self._mean_valid(h_stats["sem_entropy"], h_valid),
+            "l_sem_entropy": self._mean_valid(l_stats["sem_entropy"], l_valid),
+            "h_delta_norm": self._mean_valid(
+                h_stats["delta"].norm(dim=1),
+                h_valid,
+            ),
+            "l_delta_norm": self._mean_valid(
+                l_stats["delta"].norm(dim=1),
+                l_valid,
+            ),
+        }
+        if self.variant == "full":
+            self.last_diagnostics.update(
+                {
+                    "nonlocal_topk": int(self.nonlocal_topk),
+                    "normalization": self.normalization,
+                    "sinkhorn_iters": int(self.sinkhorn_iters),
+                    "h_escape_mean": self._mean_valid(
+                        h_stats["escape"],
+                        h_valid,
+                    ),
+                    "l_escape_mean": self._mean_valid(
+                        l_stats["escape"],
+                        l_valid,
+                    ),
+                }
+            )
+        return updated_hsi, updated_lidar
+
+    def diagnostics(self):
+        return self.last_diagnostics
+
+
+class ConflictAwareFiLM(nn.Module):
+    """Conflict-aware FiLM generated from DTA arbitrated context.
+
+    Only the first d_s channels are modulated as a shared subspace. The
+    remaining channels bypass the module as modality-private features.
+    """
+
+    def __init__(self, channels, d_s=64, gamma_init=0.0):
+        super().__init__()
+        self.channels = int(channels)
+        self.d_s = min(int(d_s), self.channels)
+        self.private_dim = self.channels - self.d_s
+
+        self.film_h = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, 2 * self.d_s),
+        )
+        self.film_l = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, 2 * self.d_s),
+        )
+        nn.init.zeros_(self.film_h[-1].weight)
+        nn.init.zeros_(self.film_h[-1].bias)
+        nn.init.zeros_(self.film_l[-1].weight)
+        nn.init.zeros_(self.film_l[-1].bias)
+
+        self.alpha_h = nn.Parameter(torch.ones(()))
+        self.alpha_l = nn.Parameter(torch.ones(()))
+        self.gamma_h = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.gamma_l = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.last_diagnostics = None
+
+    @staticmethod
+    def _shrink(conflict, alpha):
+        if conflict.numel() <= 1:
+            standardized = torch.zeros_like(conflict)
+        else:
+            standardized = (conflict - conflict.mean()) / conflict.std(
+                unbiased=False,
+            ).clamp_min(1e-8)
+        return torch.exp(
+            -alpha.clamp_min(0.0) * standardized.clamp_min(0.0)
+        ).unsqueeze(1)
+
+    def _one_side(self, nodes, ctx, conflict, film, alpha, gamma):
+        film_params = film(ctx)
+        gamma_raw = film_params[:, : self.d_s]
+        beta = film_params[:, self.d_s :]
+        shrink = self._shrink(conflict, alpha)
+        strength = gamma * shrink
+        shared = nodes[:, : self.d_s]
+        private = nodes[:, self.d_s :]
+        modulated_shared = (
+            (1.0 + strength * torch.tanh(gamma_raw)) * shared
+            + strength * beta
+        )
+        if self.private_dim > 0:
+            return torch.cat([modulated_shared, private], dim=1), shrink
+        return modulated_shared, shrink
+
+    def forward(self, hsi_nodes, lidar_nodes, ctx_h, ctx_l, D_h, D_l):
+        updated_hsi, shrink_h = self._one_side(
+            hsi_nodes,
+            ctx_h,
+            D_h,
+            self.film_h,
+            self.alpha_h,
+            self.gamma_h,
+        )
+        updated_lidar, shrink_l = self._one_side(
+            lidar_nodes,
+            ctx_l,
+            D_l,
+            self.film_l,
+            self.alpha_l,
+            self.gamma_l,
+        )
+        h_delta = updated_hsi[:, : self.d_s] - hsi_nodes[:, : self.d_s]
+        l_delta = updated_lidar[:, : self.d_s] - lidar_nodes[:, : self.d_s]
+        self.last_diagnostics = {
+            "mode": "conflict-aware-film",
+            "shared_dim": int(self.d_s),
+            "private_dim": int(self.private_dim),
+            "gamma_h": float(self.gamma_h.detach().item()),
+            "gamma_l": float(self.gamma_l.detach().item()),
+            "alpha_h": float(self.alpha_h.detach().item()),
+            "alpha_l": float(self.alpha_l.detach().item()),
+            "shrink_h_mean": float(shrink_h.detach().mean().item()),
+            "shrink_l_mean": float(shrink_l.detach().mean().item()),
+            "delta_h_norm": float(
+                h_delta.detach().norm(dim=1).mean().item()
+            ),
+            "delta_l_norm": float(
+                l_delta.detach().norm(dim=1).mean().item()
+            ),
+        }
+        return updated_hsi, updated_lidar
+
+    def diagnostics(self):
+        return self.last_diagnostics
+
+
+class AssignmentGraphInteraction(nn.Module):
+    """SEGMN-style assignment graph over nonzero HSI/LiDAR overlap pairs.
+
+    Assignment nodes are overlap pairs (h_i, l_j). The assignment graph uses
+    private graph topology after GAT2: pair e=(i,j) receives from f=(u,v)
+    according to A_H[i,u] * A_L[j,v]. The convolved pair features are pulled
+    back to HSI/LiDAR nodes with receiver-normalized overlap coverage.
+    """
+
+    def __init__(
+        self,
+        channels,
+        relation_data,
+        pair_assignment=None,
+        topk=8,
+        gamma_init=0.0,
+        output="writeback",
+    ):
+        super().__init__()
+        self.channels = int(channels)
+        self.topk = int(topk)
+        self.output = output
+        self.h_node_count = int(relation_data["h_node_count"])
+        self.l_node_count = int(relation_data["l_node_count"])
+        self.edge_count = int(relation_data["edge_count"])
+        self.register_buffer(
+            "h_index",
+            torch.as_tensor(relation_data["h_index"], dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_index",
+            torch.as_tensor(relation_data["l_index"], dtype=torch.long),
+            persistent=False,
+        )
+        h_coverage = torch.as_tensor(
+            relation_data["h_coverage"],
+            dtype=torch.float32,
+        )
+        l_coverage = torch.as_tensor(
+            relation_data["l_coverage"],
+            dtype=torch.float32,
+        )
+        self.register_buffer(
+            "h_coverage",
+            h_coverage,
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_coverage",
+            l_coverage,
+            persistent=False,
+        )
+        self.register_buffer(
+            "iou",
+            torch.as_tensor(relation_data["iou"], dtype=torch.float32),
+            persistent=False,
+        )
+        overlap = torch.as_tensor(relation_data["overlap"], dtype=torch.float32)
+        h_area = torch.as_tensor(
+            relation_data["h_area"],
+            dtype=torch.float32,
+        )
+        l_area = torch.as_tensor(
+            relation_data["l_area"],
+            dtype=torch.float32,
+        )
+        self.register_buffer(
+            "overlap_scale",
+            overlap / overlap.max().clamp_min(1.0),
+            persistent=False,
+        )
+        self.register_buffer(
+            "h_area_scale",
+            h_area[self.h_index] / h_area.max().clamp_min(1.0),
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_area_scale",
+            l_area[self.l_index] / l_area.max().clamp_min(1.0),
+            persistent=False,
+        )
+        self.register_buffer(
+            "h_geo",
+            self._normalize_edge_weights(
+                h_coverage,
+                self.h_index,
+                self.h_node_count,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_geo",
+            self._normalize_edge_weights(
+                l_coverage,
+                self.l_index,
+                self.l_node_count,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "h_degree",
+            self._segment_sum(
+                torch.ones_like(h_coverage),
+                self.h_index,
+                self.h_node_count,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_degree",
+            self._segment_sum(
+                torch.ones_like(l_coverage),
+                self.l_index,
+                self.l_node_count,
+            ),
+            persistent=False,
+        )
+        if pair_assignment is not None:
+            _, pair_projection_assignment = normalized_sparse_assignments(
+                pair_assignment
+            )
+            self.register_buffer(
+                "pair_projection_assignment",
+                pair_projection_assignment,
+                persistent=False,
+            )
+        else:
+            self.pair_projection_assignment = None
+
+        self.pair_encoder = nn.Sequential(
+            nn.Linear(4 * channels + 7, channels),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
+        self.pair_value = nn.Linear(channels, channels, bias=False)
+        self.pair_gamma = nn.Parameter(torch.ones(()))
+        self.pair_norm = nn.LayerNorm(channels)
+        self.pair_ffn = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
+        self.pair_ffn_norm = nn.LayerNorm(channels)
+        self.match_head = nn.Linear(channels, 1)
+        self.h_pair_to_node = nn.Linear(channels, channels)
+        self.l_pair_to_node = nn.Linear(channels, channels)
+        self.h_gate = nn.Sequential(
+            nn.Linear(4 * channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
+        self.l_gate = nn.Sequential(
+            nn.Linear(4 * channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
+        self.h_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.l_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.graph_projection = nn.Linear(channels, channels)
+        self.last_diagnostics = None
+        self.last_pair_context = None
+
+    @staticmethod
+    def _segment_sum(values, index, segment_count):
+        output = values.new_zeros(segment_count)
+        output.index_add_(0, index, values)
+        return output
+
+    @classmethod
+    def _normalize_edge_weights(cls, values, index, segment_count):
+        denom = cls._segment_sum(values, index, segment_count)
+        return values / denom[index].clamp_min(1e-12)
+
+    @staticmethod
+    def _aggregate(edge_values, edge_weights, receiver_index, receiver_count):
+        output = edge_values.new_zeros((receiver_count, edge_values.shape[1]))
+        output.index_add_(
+            0,
+            receiver_index,
+            edge_values * edge_weights.unsqueeze(1),
+        )
+        return output
+
+    def _assignment_adjacency(self, hsi_adjacency, lidar_adjacency):
+        hsi_adjacency = hsi_adjacency.detach()
+        lidar_adjacency = lidar_adjacency.detach()
+        h_prior = hsi_adjacency.index_select(
+            0,
+            self.h_index,
+        ).index_select(1, self.h_index)
+        l_prior = lidar_adjacency.index_select(
+            0,
+            self.l_index,
+        ).index_select(1, self.l_index)
+        prior = h_prior * l_prior
+        pair_count = prior.shape[0]
+        diagonal = torch.eye(
+            pair_count,
+            dtype=torch.bool,
+            device=prior.device,
+        )
+        support = prior > 0
+        support = support | diagonal
+        prior = prior.masked_fill(~support, 0.0)
+        diagonal_values = prior.diagonal().clamp_min(1.0)
+        prior = (
+            prior * (~diagonal).to(prior.dtype)
+            + torch.diag(diagonal_values)
+        )
+        logits = torch.log(prior.clamp_min(1e-12))
+        if self.topk > 0 and pair_count > self.topk:
+            k = min(self.topk, pair_count)
+            masked_logits = logits.masked_fill(
+                ~support,
+                torch.finfo(logits.dtype).min,
+            )
+            _, top_indices = torch.topk(masked_logits, k=k, dim=1)
+            top_support = torch.zeros_like(support)
+            top_support.scatter_(1, top_indices, True)
+            support = support & top_support
+            logits = logits.masked_fill(
+                ~support,
+                torch.finfo(logits.dtype).min,
+            )
+        else:
+            logits = logits.masked_fill(
+                ~support,
+                torch.finfo(logits.dtype).min,
+            )
+        adjacency = torch.softmax(logits, dim=1)
+        adjacency = adjacency * support.to(adjacency.dtype)
+        adjacency = adjacency / adjacency.sum(dim=1, keepdim=True).clamp_min(
+            1e-12
+        )
+        return torch.nan_to_num(adjacency, nan=0.0), support
+
+    def forward(
+        self,
+        hsi_nodes,
+        lidar_nodes,
+        hsi_adjacency,
+        lidar_adjacency,
+    ):
+        h_pair = hsi_nodes.index_select(0, self.h_index)
+        l_pair = lidar_nodes.index_select(0, self.l_index)
+        pair_similarity = F.cosine_similarity(
+            h_pair,
+            l_pair,
+            dim=1,
+        ).unsqueeze(1)
+        edge_attributes = torch.stack(
+            [
+                self.overlap_scale,
+                self.h_coverage,
+                self.l_coverage,
+                self.iou,
+                self.h_area_scale,
+                self.l_area_scale,
+            ],
+            dim=1,
+        )
+        pair_nodes = self.pair_encoder(
+            torch.cat(
+                [
+                    h_pair,
+                    l_pair,
+                    torch.abs(h_pair - l_pair),
+                    h_pair * l_pair,
+                    edge_attributes,
+                    pair_similarity,
+                ],
+                dim=1,
             )
         )
-    if not key_parts:
-        return (
-            np.empty(0, dtype=np.int64),
-            np.empty(0, dtype=np.float32),
-            np.empty(0, dtype=np.float32),
+        assignment_adjacency, assignment_support = self._assignment_adjacency(
+            hsi_adjacency,
+            lidar_adjacency,
         )
-    keys = np.concatenate(key_parts)
-    hsi_values = np.concatenate(hsi_value_parts).astype(np.float32)
-    lidar_values = np.concatenate(lidar_value_parts).astype(
-        np.float32
-    )
-    unique_keys, inverse = np.unique(keys, return_inverse=True)
-    hsi_boundary_sum = np.zeros(unique_keys.size, dtype=np.float32)
-    lidar_boundary_sum = np.zeros(unique_keys.size, dtype=np.float32)
-    boundary_count = np.zeros(unique_keys.size, dtype=np.float32)
-    np.add.at(hsi_boundary_sum, inverse, hsi_values)
-    np.add.at(lidar_boundary_sum, inverse, lidar_values)
-    np.add.at(boundary_count, inverse, 1.0)
-    boundary_count = np.maximum(boundary_count, 1.0)
-    return (
-        unique_keys,
-        hsi_boundary_sum / boundary_count,
-        lidar_boundary_sum / boundary_count,
-    )
-
-
-def build_multimodal_weighted_cell_rag(
-    cell_data,
-    hsi,
-    lidar,
-    height,
-    width,
-    sam_weight=1.0,
-    height_weight=1.0,
-    boundary_weight=1.0,
-    conflict_weight=0.0,
-):
-    """Weight cell RAG by spectrum, height, boundary, and conflict."""
-    cell_count = cell_data["cell_count"]
-    pixel_cell_index = cell_data["pixel_cell_index"]
-    cell_segments = pixel_cell_index.reshape(height, width)
-    hsi_cell_mean = aggregate_cell_pixel_means(
-        hsi,
-        pixel_cell_index,
-        cell_count,
-    )
-    lidar_cell_mean = aggregate_cell_pixel_means(
-        lidar[:, :, None],
-        pixel_cell_index,
-        cell_count,
-    )[:, 0]
-
-    binary_rag = cell_data["cell_rag_adjacency"].tocoo()
-    rows = binary_rag.row.astype(np.int64)
-    columns = binary_rag.col.astype(np.int64)
-    nonself = rows != columns
-    edge_rows = rows[nonself]
-    edge_columns = columns[nonself]
-
-    numerator = np.sum(
-        hsi_cell_mean[edge_rows] * hsi_cell_mean[edge_columns],
-        axis=1,
-    )
-    denominator = (
-        np.linalg.norm(hsi_cell_mean[edge_rows], axis=1)
-        * np.linalg.norm(hsi_cell_mean[edge_columns], axis=1)
-    )
-    spectral_angle = np.arccos(
-        np.clip(
-            numerator / np.maximum(denominator, 1e-8),
-            -1.0,
-            1.0,
+        pair_message = assignment_adjacency @ self.pair_value(pair_nodes)
+        pair_context = self.pair_norm(
+            pair_nodes + self.pair_gamma * pair_message
         )
-    ).astype(np.float32)
-    height_difference = np.abs(
-        lidar_cell_mean[edge_rows]
-        - lidar_cell_mean[edge_columns]
-    ).astype(np.float32)
+        pair_context = self.pair_ffn_norm(
+            pair_context + self.pair_ffn(pair_context)
+        )
+        self.last_pair_context = pair_context
+        pair_match = torch.sigmoid(self.match_head(pair_context))
+        h_pair_message = self.h_pair_to_node(pair_context) * pair_match
+        l_pair_message = self.l_pair_to_node(pair_context) * pair_match
+        h_message = self._aggregate(
+            h_pair_message,
+            self.h_geo,
+            self.h_index,
+            self.h_node_count,
+        )
+        l_message = self._aggregate(
+            l_pair_message,
+            self.l_geo,
+            self.l_index,
+            self.l_node_count,
+        )
+        h_valid = self.h_degree > 0
+        l_valid = self.l_degree > 0
+        h_gate = torch.sigmoid(
+            self.h_gate(
+                torch.cat(
+                    [
+                        hsi_nodes,
+                        h_message,
+                        torch.abs(hsi_nodes - h_message),
+                        hsi_nodes * h_message,
+                    ],
+                    dim=1,
+                )
+            )
+        ) * h_valid.to(hsi_nodes.dtype).unsqueeze(1)
+        l_gate = torch.sigmoid(
+            self.l_gate(
+                torch.cat(
+                    [
+                        lidar_nodes,
+                        l_message,
+                        torch.abs(lidar_nodes - l_message),
+                        lidar_nodes * l_message,
+                    ],
+                    dim=1,
+                )
+            )
+        ) * l_valid.to(lidar_nodes.dtype).unsqueeze(1)
+        if self.output in ("writeback", "both"):
+            updated_hsi = hsi_nodes + self.h_gamma * h_gate * (
+                h_message - hsi_nodes
+            )
+            updated_lidar = lidar_nodes + self.l_gamma * l_gate * (
+                l_message - lidar_nodes
+            )
+        else:
+            updated_hsi = hsi_nodes
+            updated_lidar = lidar_nodes
+        assignment_entropy = -(
+            assignment_adjacency
+            * torch.log(assignment_adjacency.clamp_min(1e-12))
+        ).sum(dim=1)
 
-    (
-        boundary_keys,
-        hsi_boundary_values,
-        lidar_boundary_values,
-    ) = (
-        build_sparse_cell_boundary_strengths(
-            cell_segments,
-            hsi,
-            lidar,
+        def mean_valid(values, valid=None):
+            if valid is None:
+                return float(values.detach().mean().item())
+            if bool(valid.any()):
+                return float(values[valid].detach().mean().item())
+            return 0.0
+
+        self.last_diagnostics = {
+            "mode": "assignment-graph-post-gat2",
+            "output": self.output,
+            "assignment_node_count": int(self.edge_count),
+            "assignment_topk": int(self.topk),
+            "assignment_density": float(
+                assignment_support.detach().float().mean().item()
+            ),
+            "assignment_entropy_mean": mean_valid(assignment_entropy),
+            "pair_match_mean": mean_valid(pair_match.squeeze(1)),
+            "pair_similarity_mean": mean_valid(pair_similarity.squeeze(1)),
+            "pair_message_norm": mean_valid(pair_message.norm(dim=1)),
+            "h_gamma": float(self.h_gamma.detach().item()),
+            "l_gamma": float(self.l_gamma.detach().item()),
+            "pair_gamma": float(self.pair_gamma.detach().item()),
+            "h_gate_mean": mean_valid(h_gate.mean(dim=1), h_valid),
+            "l_gate_mean": mean_valid(l_gate.mean(dim=1), l_valid),
+            "h_message_norm": mean_valid(h_message.norm(dim=1), h_valid),
+            "l_message_norm": mean_valid(l_message.norm(dim=1), l_valid),
+        }
+        return updated_hsi, updated_lidar
+
+    def project_pair_nodes(self):
+        if self.pair_projection_assignment is None:
+            raise RuntimeError(
+                "Assignment graph third branch requires pair assignment."
+            )
+        if self.last_pair_context is None:
+            raise RuntimeError(
+                "Assignment graph pair context is not available before "
+                "forward()."
+            )
+        pixel_pair_features = torch.sparse.mm(
+            self.pair_projection_assignment,
+            self.last_pair_context,
         )
-    )
-    lower = np.minimum(edge_rows, edge_columns)
-    upper = np.maximum(edge_rows, edge_columns)
-    edge_keys = lower * cell_count + upper
-    boundary_positions = np.searchsorted(
-        boundary_keys,
-        edge_keys,
-    )
-    if (
-        boundary_keys.size == 0
-        or np.any(boundary_positions >= boundary_keys.size)
-        or not np.array_equal(
-            boundary_keys[boundary_positions],
-            edge_keys,
-        )
+        return self.graph_projection(pixel_pair_features)
+
+    def diagnostics(self):
+        return self.last_diagnostics
+
+
+class BCQConsensusQuotientInteraction(nn.Module):
+    """Shared-anchor membership consistency over sparse overlap support."""
+
+    def __init__(
+        self,
+        channels,
+        relation_data,
+        real_class_count,
+        anchor_ratio=4,
+        anchor_topk=8,
+        anchor_dk=32,
+        conflict_alpha=2.0,
+        gamma_init=0.0,
     ):
-        raise RuntimeError(
-            "Cell RAG edge does not match a shared pixel boundary."
+        super().__init__()
+        if real_class_count <= 0:
+            raise ValueError("BCQ requires a positive real class count.")
+        anchor_count = int(anchor_ratio) * int(real_class_count)
+        if anchor_count <= 0:
+            raise ValueError("BCQ anchor count must be positive.")
+        self.channels = int(channels)
+        self.real_class_count = int(real_class_count)
+        self.anchor_ratio = int(anchor_ratio)
+        self.anchor_count = int(anchor_count)
+        self.anchor_topk = int(anchor_topk)
+        self.conflict_alpha = float(conflict_alpha)
+        self.scale = float(anchor_dk) ** -0.5
+        self.register_buffer(
+            "h_index",
+            torch.as_tensor(relation_data["h_index"], dtype=torch.long),
+            persistent=False,
         )
-    hsi_boundary_strength = hsi_boundary_values[
-        boundary_positions
-    ].astype(np.float32)
-    lidar_boundary_strength = lidar_boundary_values[
-        boundary_positions
-    ].astype(np.float32)
-
-    def scaled(values):
-        positive = values[values > 0]
-        bandwidth = (
-            float(np.median(positive))
-            if positive.size
-            else 1.0
+        self.register_buffer(
+            "l_index",
+            torch.as_tensor(relation_data["l_index"], dtype=torch.long),
+            persistent=False,
         )
-        return values / max(bandwidth, 1e-6)
+        self.register_buffer(
+            "h_coverage",
+            torch.as_tensor(
+                relation_data["h_coverage"],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_coverage",
+            torch.as_tensor(
+                relation_data["l_coverage"],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.h_node_count = int(relation_data["h_node_count"])
+        self.l_node_count = int(relation_data["l_node_count"])
+        self.edge_count = int(relation_data["edge_count"])
+        self.original_edge_count = int(
+            relation_data.get("original_edge_count", self.edge_count)
+        )
+        self.retained_edge_fraction = float(
+            relation_data.get("retained_edge_fraction", 1.0)
+        )
 
-    scaled_hsi_boundary = scaled(hsi_boundary_strength)
-    scaled_lidar_boundary = scaled(lidar_boundary_strength)
-    boundary_conflict = np.abs(
-        scaled_hsi_boundary - scaled_lidar_boundary
-    )
-    edge_weights = np.exp(
-        -sam_weight * scaled(spectral_angle)
-        -height_weight * scaled(height_difference)
-        -boundary_weight * scaled_lidar_boundary
-        -conflict_weight * boundary_conflict
-    ).astype(np.float32)
-    values = np.ones(rows.size, dtype=np.float32)
-    values[nonself] = edge_weights
-    weighted_rag = coo_matrix(
-        (values, (rows, columns)),
-        shape=(cell_count, cell_count),
-        dtype=np.float32,
-    ).tocsr()
-    cell_data["cell_weighted_adjacency"] = (
-        symmetrically_normalize_sparse_adjacency(weighted_rag)
-    )
-    if edge_weights.size:
-        cell_data["cell_weight_stats"] = {
-            "minimum": float(edge_weights.min()),
-            "mean": float(edge_weights.mean()),
-            "maximum": float(edge_weights.max()),
+        self.anchors = nn.Parameter(torch.empty(self.anchor_count, channels))
+        nn.init.xavier_uniform_(self.anchors)
+        self.h_node_key = nn.Linear(channels, anchor_dk, bias=False)
+        self.l_node_key = nn.Linear(channels, anchor_dk, bias=False)
+        self.h_anchor_key = nn.Linear(channels, anchor_dk, bias=False)
+        self.l_anchor_key = nn.Linear(channels, anchor_dk, bias=False)
+        self.h_anchor_value = nn.Linear(channels, channels, bias=False)
+        self.l_anchor_value = nn.Linear(channels, channels, bias=False)
+        self.h_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.l_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.last_diagnostics = None
+        self.last_h_jsd = None
+        self.last_l_jsd = None
+        self.last_h_anchor_usage = None
+        self.last_l_anchor_usage = None
+
+    @staticmethod
+    def _topk_softmax(logits, topk):
+        if topk <= 0 or topk >= logits.shape[1]:
+            return F.softmax(logits, dim=1)
+        values, indices = torch.topk(logits, k=topk, dim=1)
+        sparse_logits = torch.full_like(
+            logits,
+            torch.finfo(logits.dtype).min,
+        )
+        sparse_logits.scatter_(1, indices, values)
+        return F.softmax(sparse_logits, dim=1)
+
+    @staticmethod
+    def _normalized_entropy(distribution):
+        entropy = -torch.sum(
+            distribution
+            * torch.log(distribution.clamp_min(1e-12)),
+            dim=1,
+        )
+        denominator = np.log(max(distribution.shape[1], 2))
+        return entropy / denominator
+
+    @staticmethod
+    def _anchor_usage_entropy(usage):
+        entropy = -torch.sum(
+            usage * torch.log(usage.clamp_min(1e-12)),
+            dim=0,
+        )
+        denominator = np.log(max(usage.numel(), 2))
+        return entropy / denominator
+
+    @staticmethod
+    def _jsd(left, right):
+        mixture = 0.5 * (left + right)
+        kl_left = torch.sum(
+            left
+            * (
+                torch.log(left.clamp_min(1e-12))
+                - torch.log(mixture.clamp_min(1e-12))
+            ),
+            dim=1,
+        )
+        kl_right = torch.sum(
+            right
+            * (
+                torch.log(right.clamp_min(1e-12))
+                - torch.log(mixture.clamp_min(1e-12))
+            ),
+            dim=1,
+        )
+        return 0.5 * (kl_left + kl_right)
+
+    def _memberships(self, hsi_nodes, lidar_nodes):
+        h_logits = (
+            self.h_node_key(hsi_nodes)
+            @ self.h_anchor_key(self.anchors).transpose(0, 1)
+        ) * self.scale
+        l_logits = (
+            self.l_node_key(lidar_nodes)
+            @ self.l_anchor_key(self.anchors).transpose(0, 1)
+        ) * self.scale
+        topk = min(self.anchor_topk, self.anchor_count)
+        return (
+            self._topk_softmax(h_logits, topk),
+            self._topk_softmax(l_logits, topk),
+        )
+
+    @staticmethod
+    def _coverage_transport(
+        source_membership,
+        receiver_index,
+        source_index,
+        coverage,
+        receiver_count,
+        fallback_membership,
+    ):
+        denom = coverage.new_zeros(receiver_count)
+        denom.index_add_(0, receiver_index, coverage)
+        weights = coverage / denom.index_select(
+            0,
+            receiver_index,
+        ).clamp_min(1e-8)
+        transported = source_membership.new_zeros(
+            (receiver_count, source_membership.shape[1])
+        )
+        transported.index_add_(
+            0,
+            receiver_index,
+            source_membership.index_select(0, source_index)
+            * weights.unsqueeze(1),
+        )
+        missing = denom <= 1e-8
+        if bool(missing.any()):
+            transported[missing] = fallback_membership[missing]
+        return transported
+
+    def forward(self, hsi_nodes, lidar_nodes):
+        h_membership, l_membership = self._memberships(
+            hsi_nodes,
+            lidar_nodes,
+        )
+        h_expected = self._coverage_transport(
+            l_membership,
+            self.h_index,
+            self.l_index,
+            self.h_coverage,
+            self.h_node_count,
+            h_membership,
+        )
+        l_expected = self._coverage_transport(
+            h_membership,
+            self.l_index,
+            self.h_index,
+            self.l_coverage,
+            self.l_node_count,
+            l_membership,
+        )
+        h_jsd = self._jsd(h_membership, h_expected)
+        l_jsd = self._jsd(l_membership, l_expected)
+        h_gate = torch.exp(-self.conflict_alpha * h_jsd).unsqueeze(1)
+        l_gate = torch.exp(-self.conflict_alpha * l_jsd).unsqueeze(1)
+        h_anchor_features = self.h_anchor_value(self.anchors)
+        l_anchor_features = self.l_anchor_value(self.anchors)
+        h_target = h_membership @ h_anchor_features
+        l_target = l_membership @ l_anchor_features
+        updated_hsi = (
+            hsi_nodes
+            + self.h_gamma * h_gate * (h_target - hsi_nodes)
+        )
+        updated_lidar = (
+            lidar_nodes
+            + self.l_gamma * l_gate * (l_target - lidar_nodes)
+        )
+        h_entropy = self._normalized_entropy(h_membership)
+        l_entropy = self._normalized_entropy(l_membership)
+        h_anchor_usage = h_membership.detach().mean(dim=0)
+        l_anchor_usage = l_membership.detach().mean(dim=0)
+        self.last_h_jsd = h_jsd.detach()
+        self.last_l_jsd = l_jsd.detach()
+        self.last_h_anchor_usage = h_anchor_usage
+        self.last_l_anchor_usage = l_anchor_usage
+        self.last_diagnostics = {
+            "mode": "bcq",
+            "interaction": "post-gat2",
+            "anchor_count": int(self.anchor_count),
+            "anchor_ratio": int(self.anchor_ratio),
+            "anchor_topk": int(self.anchor_topk),
+            "conflict_alpha": float(self.conflict_alpha),
+            "edge_count": int(self.edge_count),
+            "original_edge_count": int(self.original_edge_count),
+            "retained_edge_fraction": float(self.retained_edge_fraction),
+            "h_gamma": float(self.h_gamma.detach().item()),
+            "l_gamma": float(self.l_gamma.detach().item()),
+            "h_jsd_mean": float(h_jsd.detach().mean().item()),
+            "l_jsd_mean": float(l_jsd.detach().mean().item()),
+            "h_jsd_max": float(h_jsd.detach().max().item()),
+            "l_jsd_max": float(l_jsd.detach().max().item()),
+            "h_gate_mean": float(h_gate.detach().mean().item()),
+            "l_gate_mean": float(l_gate.detach().mean().item()),
+            "h_entropy_mean": float(h_entropy.detach().mean().item()),
+            "l_entropy_mean": float(l_entropy.detach().mean().item()),
+            "h_anchor_usage_entropy": float(
+                self._anchor_usage_entropy(h_anchor_usage).item()
+            ),
+            "l_anchor_usage_entropy": float(
+                self._anchor_usage_entropy(l_anchor_usage).item()
+            ),
+            "h_anchor_usage_max": float(h_anchor_usage.max().item()),
+            "l_anchor_usage_max": float(l_anchor_usage.max().item()),
+            "h_target_delta_norm": float(
+                (h_target - hsi_nodes).detach().norm(dim=1).mean().item()
+            ),
+            "l_target_delta_norm": float(
+                (l_target - lidar_nodes)
+                .detach()
+                .norm(dim=1)
+                .mean()
+                .item()
+            ),
         }
-    else:
-        cell_data["cell_weight_stats"] = {
-            "minimum": 1.0,
-            "mean": 1.0,
-            "maximum": 1.0,
+        return updated_hsi, updated_lidar
+
+    def diagnostics(self):
+        return self.last_diagnostics
+
+
+class ConsensusTokenFusion(nn.Module):
+    """Class-grouped consensus tokens with auxiliary supervision."""
+
+    def __init__(
+        self,
+        channels,
+        relation_data,
+        real_class_count,
+        tokens_per_class=4,
+        num_heads=4,
+        token_topk=0,
+        tau=1.0,
+        fusion_gate_init=0.0,
+        eps=1e-8,
+    ):
+        super().__init__()
+        if real_class_count <= 0:
+            raise ValueError(
+                "Consensus token fusion requires a positive class count."
+            )
+        token_count = int(tokens_per_class) * int(real_class_count)
+        if token_count <= 0:
+            raise ValueError("Consensus token count must be positive.")
+        self.channels = int(channels)
+        self.real_class_count = int(real_class_count)
+        self.tokens_per_class = int(tokens_per_class)
+        self.token_count = int(token_count)
+        self.token_topk = int(token_topk)
+        self.tau = float(tau)
+        self.eps = float(eps)
+        self.register_buffer(
+            "h_index",
+            torch.as_tensor(relation_data["h_index"], dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_index",
+            torch.as_tensor(relation_data["l_index"], dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "h_coverage",
+            torch.as_tensor(
+                relation_data["h_coverage"],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_coverage",
+            torch.as_tensor(
+                relation_data["l_coverage"],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.h_node_count = int(relation_data["h_node_count"])
+        self.l_node_count = int(relation_data["l_node_count"])
+        self.edge_count = int(relation_data["edge_count"])
+        self.original_edge_count = int(
+            relation_data.get("original_edge_count", self.edge_count)
+        )
+        self.retained_edge_fraction = float(
+            relation_data.get("retained_edge_fraction", 1.0)
+        )
+
+        self.tokens = nn.Parameter(
+            torch.randn(self.token_count, channels) * 0.02
+        )
+        self.h_attn = nn.MultiheadAttention(
+            channels,
+            num_heads,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.l_attn = nn.MultiheadAttention(
+            channels,
+            num_heads,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.view_logit = nn.Parameter(torch.zeros(2))
+        self.token_norm = nn.LayerNorm(channels)
+        self.token_ffn = nn.Sequential(
+            nn.Linear(channels, channels * 2),
+            nn.GELU(),
+            nn.Linear(channels * 2, channels),
+        )
+        self.ffn_norm = nn.LayerNorm(channels)
+        self.h_node_q = nn.Linear(channels, channels, bias=False)
+        self.l_node_q = nn.Linear(channels, channels, bias=False)
+        self.h_token_k = nn.Linear(channels, channels, bias=False)
+        self.l_token_k = nn.Linear(channels, channels, bias=False)
+        self.fusion_gate = nn.Parameter(
+            torch.tensor(float(fusion_gate_init))
+        )
+        self.last_outputs = None
+        self.last_diagnostics = None
+
+    @staticmethod
+    def _topk_softmax(logits, topk):
+        if topk <= 0 or topk >= logits.shape[1]:
+            return F.softmax(logits, dim=1)
+        values, indices = torch.topk(logits, k=topk, dim=1)
+        sparse_logits = torch.full_like(
+            logits,
+            torch.finfo(logits.dtype).min,
+        )
+        sparse_logits.scatter_(1, indices, values)
+        return F.softmax(sparse_logits, dim=1)
+
+    @staticmethod
+    def _entropy(distribution):
+        return -torch.sum(
+            distribution
+            * torch.log(distribution.clamp_min(1e-12)),
+            dim=1,
+        )
+
+    @staticmethod
+    def _kl(left, right):
+        return torch.sum(
+            left
+            * (
+                torch.log(left.clamp_min(1e-12))
+                - torch.log(right.clamp_min(1e-12))
+            ),
+            dim=1,
+        )
+
+    def _update_tokens(self, hsi_nodes, lidar_nodes):
+        tokens = self.tokens.unsqueeze(0)
+        h_out, _ = self.h_attn(
+            tokens,
+            hsi_nodes.unsqueeze(0),
+            hsi_nodes.unsqueeze(0),
+            need_weights=False,
+        )
+        l_out, _ = self.l_attn(
+            tokens,
+            lidar_nodes.unsqueeze(0),
+            lidar_nodes.unsqueeze(0),
+            need_weights=False,
+        )
+        view_weights = F.softmax(self.view_logit, dim=0)
+        tokens = self.token_norm(
+            tokens
+            + view_weights[0] * h_out
+            + view_weights[1] * l_out
+        )
+        tokens = self.ffn_norm(tokens + self.token_ffn(tokens))
+        return tokens.squeeze(0), view_weights
+
+    def _membership(self, nodes, node_q, token_k, tokens):
+        q = node_q(nodes)
+        k = token_k(tokens)
+        logits = q @ k.transpose(0, 1)
+        logits = logits / ((q.shape[-1] ** 0.5) * self.tau)
+        return self._topk_softmax(logits, self.token_topk)
+
+    @staticmethod
+    def _coverage_transport(
+        source_membership,
+        receiver_index,
+        source_index,
+        coverage,
+        receiver_count,
+        fallback_membership,
+    ):
+        mass = coverage.new_zeros(receiver_count)
+        mass.index_add_(0, receiver_index, coverage)
+        weights = coverage / mass.index_select(
+            0,
+            receiver_index,
+        ).clamp_min(1e-8)
+        transported = source_membership.new_zeros(
+            (receiver_count, source_membership.shape[1])
+        )
+        transported.index_add_(
+            0,
+            receiver_index,
+            source_membership.index_select(0, source_index)
+            * weights.unsqueeze(1),
+        )
+        missing = mass <= 1e-8
+        if bool(missing.any()):
+            transported[missing] = fallback_membership[missing]
+        return transported, mass
+
+    def _agreement_loss(self, h_membership, l_membership):
+        h_expected, h_mass = self._coverage_transport(
+            l_membership,
+            self.h_index,
+            self.l_index,
+            self.h_coverage,
+            self.h_node_count,
+            h_membership,
+        )
+        l_expected, l_mass = self._coverage_transport(
+            h_membership,
+            self.l_index,
+            self.h_index,
+            self.l_coverage,
+            self.l_node_count,
+            l_membership,
+        )
+        h_mix = 0.5 * (h_membership + h_expected)
+        l_mix = 0.5 * (l_membership + l_expected)
+        h_jsd = 0.5 * (
+            self._kl(h_membership, h_mix)
+            + self._kl(h_expected, h_mix)
+        )
+        l_jsd = 0.5 * (
+            self._kl(l_membership, l_mix)
+            + self._kl(l_expected, l_mix)
+        )
+        h_weight = h_mass / h_mass.sum().clamp_min(1e-8)
+        l_weight = l_mass / l_mass.sum().clamp_min(1e-8)
+        loss = 0.5 * (
+            (h_weight * h_jsd).sum()
+            + (l_weight * l_jsd).sum()
+        )
+        return loss, h_jsd, l_jsd
+
+    def _usage_loss(self, h_membership, l_membership):
+        usage = 0.5 * (
+            h_membership.mean(dim=0)
+            + l_membership.mean(dim=0)
+        )
+        entropy = -torch.sum(
+            usage * torch.log(usage.clamp_min(self.eps)),
+            dim=0,
+        )
+        return (
+            torch.log(
+                torch.tensor(
+                    float(self.token_count),
+                    device=usage.device,
+                    dtype=usage.dtype,
+                )
+            )
+            - entropy
+        )
+
+    def forward(self, hsi_nodes, lidar_nodes):
+        tokens, view_weights = self._update_tokens(hsi_nodes, lidar_nodes)
+        h_membership = self._membership(
+            hsi_nodes,
+            self.h_node_q,
+            self.h_token_k,
+            tokens,
+        )
+        l_membership = self._membership(
+            lidar_nodes,
+            self.l_node_q,
+            self.l_token_k,
+            tokens,
+        )
+        h_probability = h_membership.view(
+            -1,
+            self.real_class_count,
+            self.tokens_per_class,
+        ).sum(dim=2)
+        l_probability = l_membership.view(
+            -1,
+            self.real_class_count,
+            self.tokens_per_class,
+        ).sum(dim=2)
+        agreement_loss, h_jsd, l_jsd = self._agreement_loss(
+            h_membership,
+            l_membership,
+        )
+        usage_loss = self._usage_loss(h_membership, l_membership)
+        h_entropy = self._entropy(h_membership) / np.log(
+            max(self.token_count, 2)
+        )
+        l_entropy = self._entropy(l_membership) / np.log(
+            max(self.token_count, 2)
+        )
+        usage = 0.5 * (
+            h_membership.detach().mean(dim=0)
+            + l_membership.detach().mean(dim=0)
+        )
+        self.last_outputs = {
+            "S_h": h_membership,
+            "S_l": l_membership,
+            "p_h": h_probability,
+            "p_l": l_probability,
+            "tokens": tokens,
+            "view_weights": view_weights,
+            "agreement_loss": agreement_loss,
+            "usage_loss": usage_loss,
+            "h_jsd": h_jsd,
+            "l_jsd": l_jsd,
         }
-    cell_data["cell_boundary_conflict_stats"] = {
-        "minimum": (
-            float(boundary_conflict.min())
-            if boundary_conflict.size
-            else 0.0
-        ),
-        "mean": (
-            float(boundary_conflict.mean())
-            if boundary_conflict.size
-            else 0.0
-        ),
-        "maximum": (
-            float(boundary_conflict.max())
-            if boundary_conflict.size
-            else 0.0
-        ),
-    }
+        self.last_diagnostics = {
+            "mode": "consensus-token",
+            "interaction": "post-gat2",
+            "token_count": int(self.token_count),
+            "tokens_per_class": int(self.tokens_per_class),
+            "token_topk": int(self.token_topk),
+            "edge_count": int(self.edge_count),
+            "original_edge_count": int(self.original_edge_count),
+            "retained_edge_fraction": float(self.retained_edge_fraction),
+            "fusion_gate": float(self.fusion_gate.detach().item()),
+            "view_weights": view_weights.detach().cpu().tolist(),
+            "h_entropy_mean": float(h_entropy.detach().mean().item()),
+            "l_entropy_mean": float(l_entropy.detach().mean().item()),
+            "h_jsd_mean": float(h_jsd.detach().mean().item()),
+            "l_jsd_mean": float(l_jsd.detach().mean().item()),
+            "h_jsd_max": float(h_jsd.detach().max().item()),
+            "l_jsd_max": float(l_jsd.detach().max().item()),
+            "usage_entropy": float(
+                (
+                    -torch.sum(
+                        usage * torch.log(usage.clamp_min(1e-12))
+                    )
+                    / np.log(max(self.token_count, 2))
+                ).item()
+            ),
+            "usage_max": float(usage.max().item()),
+        }
+        return self.last_outputs
 
+    def project_probabilities(self, h_projection, l_projection, outputs):
+        h_pixel_probability = torch.sparse.mm(
+            h_projection,
+            outputs["p_h"],
+        )
+        l_pixel_probability = torch.sparse.mm(
+            l_projection,
+            outputs["p_l"],
+        )
+        return (
+            h_pixel_probability.clamp_min(self.eps),
+            l_pixel_probability.clamp_min(self.eps),
+        )
 
+    def fuse_logits(
+        self,
+        main_logits,
+        h_pixel_probability,
+        l_pixel_probability,
+        view_weights,
+    ):
+        fused_probability = (
+            view_weights[0] * h_pixel_probability
+            + view_weights[1] * l_pixel_probability
+        ).clamp_min(self.eps)
+        output = main_logits.clone()
+        output[:, : self.real_class_count] = (
+            output[:, : self.real_class_count]
+            + self.fusion_gate * torch.log(fused_probability)
+        )
+        return output
 
+    def consensus_ce(self, pixel_probability, pixel_index, labels):
+        return F.nll_loss(
+            torch.log(
+                pixel_probability.index_select(0, pixel_index).clamp_min(
+                    self.eps
+                )
+            ),
+            labels,
+        )
 
-
-
-
-
+    def diagnostics(self):
+        return self.last_diagnostics
 
 
 class RAGLowHighModulation(nn.Module):
@@ -5120,15 +4421,6 @@ class ModalityGSDGGraphEncoder(nn.Module):
         lidar_modulation="none",
         rag_adjacency=None,
         geometry_descriptors=None,
-        use_cross_conditioned_builder=False,
-        topology_rewiring=False,
-        topology_advocacy_k=0,
-        topology_veto_init=0.0,
-        topology_advocacy_init=0.0,
-        topology_impurity_init=0.0,
-        topology_impurity_mode="target",
-        topology_freeze_advocacy=False,
-        topology_advocacy_candidate_mask=None,
     ):
         super().__init__()
         pooling_assignment, projection_assignment = (
@@ -5181,21 +4473,7 @@ class ModalityGSDGGraphEncoder(nn.Module):
             "topk": dynamic_topk,
             "tau": dynamic_tau,
         }
-        if topology_rewiring:
-            self.graph_builder = CellEvidenceRewiringDynamicGraphBuilder(
-                hidden_dim,
-                assignment.shape[1],
-                candidate_mask=candidate_mask,
-                advocacy_k=topology_advocacy_k,
-                veto_init=topology_veto_init,
-                advocacy_init=topology_advocacy_init,
-                impurity_init=topology_impurity_init,
-                impurity_mode=topology_impurity_mode,
-                freeze_advocacy=topology_freeze_advocacy,
-                advocacy_candidate_mask=topology_advocacy_candidate_mask,
-                **graph_builder_options,
-            )
-        elif candidate_mask is None:
+        if candidate_mask is None:
             self.graph_builder = DynamicGraphBuilder(
                 hidden_dim,
                 assignment.shape[1],
@@ -5208,17 +4486,6 @@ class ModalityGSDGGraphEncoder(nn.Module):
                 candidate_mask=candidate_mask,
                 **graph_builder_options,
             )
-        self.cross_conditioned_graph_builder = (
-            CrossConditionedDynamicGraphBuilder(
-                hidden_dim,
-                assignment.shape[1],
-                cross_channels=hidden_dim,
-                candidate_mask=candidate_mask,
-                **graph_builder_options,
-            )
-            if use_cross_conditioned_builder
-            else None
-        )
         self.gat1 = MultiHeadGAT(
             hidden_dim,
             head_channels=30,
@@ -5261,35 +4528,11 @@ class ModalityGSDGGraphEncoder(nn.Module):
         node_features = self.frequency_modulation(node_features)
         return self.structure_modulation(node_features)
 
-    def apply_gat1(
-        self,
-        node_features,
-        topology_context=None,
-        topology_fragmentation=None,
-        topology_uncertainty=None,
-    ):
-        if topology_context is None:
-            adjacency = self.graph_builder(
-                node_features,
-                self.spatial_prior,
-            )
-        else:
-            if not getattr(
-                self.graph_builder,
-                "uses_topology_rewiring",
-                False,
-            ):
-                raise ValueError(
-                    "Topology context requires a topology-rewiring "
-                    "graph builder."
-                )
-            adjacency = self.graph_builder(
-                node_features,
-                self.spatial_prior,
-                topology_context,
-                fragmentation=topology_fragmentation,
-                audit_uncertainty=topology_uncertainty,
-            )
+    def apply_gat1(self, node_features):
+        adjacency = self.graph_builder(
+            node_features,
+            self.spatial_prior,
+        )
         first_graph_features = self.gat1(node_features, adjacency)
         return first_graph_features, adjacency
 
@@ -5298,17 +4541,11 @@ class ModalityGSDGGraphEncoder(nn.Module):
         first_graph_features,
         adjacency=None,
         rebuild_graph=False,
-        cross_context=None,
-        topology_gate=None,
-        topology_mask=None,
     ):
         graph_features = self.apply_gat2_nodes(
             first_graph_features,
             adjacency=adjacency,
             rebuild_graph=rebuild_graph,
-            cross_context=cross_context,
-            topology_gate=topology_gate,
-            topology_mask=topology_mask,
         )
         return self.project_nodes(graph_features)
 
@@ -5317,24 +4554,9 @@ class ModalityGSDGGraphEncoder(nn.Module):
         first_graph_features,
         adjacency=None,
         rebuild_graph=False,
-        cross_context=None,
-        topology_gate=None,
-        topology_mask=None,
         return_intra=False,
     ):
-        if cross_context is not None:
-            if self.cross_conditioned_graph_builder is None:
-                raise ValueError(
-                    "Cross-conditioned graph builder is not enabled."
-                )
-            adjacency = self.cross_conditioned_graph_builder(
-                first_graph_features,
-                self.spatial_prior,
-                cross_context,
-                topology_gate=topology_gate,
-                topology_mask=topology_mask,
-            )
-        elif rebuild_graph:
+        if rebuild_graph:
             adjacency = self.graph_builder(
                 first_graph_features,
                 self.spatial_prior,
@@ -5386,34 +4608,22 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         dynamic_d_k=16,
         dynamic_topk=8,
         dynamic_tau=1.0,
-        post_gat_consensus_graph="none",
-        consensus_graph_weight=0.1,
-        consensus_graph_fusion="residual-c",
-        consensus_graph_residual_init=0.0,
-        consensus_graph_transport="none",
-        consensus_graph_transport_stage="post-gat2",
-        consensus_graph_transport_fusion="residual",
-        consensus_graph_transport_message="fixed",
-        consensus_graph_transport_operator="transport",
-        consensus_graph_transport_prior_weight=1.0,
-        consensus_graph_transport_lambda=0.5,
-        consensus_graph_transport_gamma_init=0.0,
-        consensus_graph_transport_second_gamma_init=0.0,
-        sheaf_restriction="diag",
-        sheaf_rank=4,
-        sheaf_steps=1,
-        sheaf_energy_weight=0.0,
-        dcsi_edge_topk=8,
-        dcsi_consensus_mix=0.1,
-        dcsi_conflict_mix=0.1,
-        dcsi_semantic_gamma_init=0.1,
-        dcsi_conflict_gamma_init=0.05,
-        cgsa_alpha_max=2.0,
-        cgsa_consensus_channel=False,
-        consensus_graph_spatial_prior_weight=1.0,
-        consensus_graph_hsi_prior_weight=0.5,
-        consensus_graph_lidar_prior_weight=0.5,
-        bridge_data=None,
+        dual_transport_arbitration="none",
+        dta_d_k=64,
+        dta_tau=0.1,
+        dta_gamma_init=0.0,
+        dta_variant="simple",
+        dta_nonlocal_topk=10,
+        dta_normalization="sinkhorn",
+        dta_sinkhorn_iters=5,
+        dta_film=False,
+        dta_film_d_s=64,
+        dta_film_gamma_init=0.0,
+        assignment_graph="none",
+        assignment_graph_topk=8,
+        assignment_graph_gamma_init=0.0,
+        assignment_graph_output="writeback",
+        assignment_graph_weight=0.1,
         cross_overlap_relation="none",
         cross_overlap_stage="inter-gat",
         cross_overlap_message="qk-prior",
@@ -5421,25 +4631,29 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         cross_overlap_prior_weight=1.0,
         cross_overlap_gamma_init=0.1,
         cross_overlap_second_gamma_init=0.0,
+        cross_overlap_fragmentation_alpha=0.0,
         cross_overlap_data=None,
-        bridge_attention_d_k=32,
-        bridge_attention_topk=8,
-        bridge_gamma_init=0.0,
-        cell_data=None,
+        overlap_distill_enabled=False,
+        evidence_fusion="none",
+        bcq_interaction="none",
+        bcq_class_count=None,
+        bcq_anchor_ratio=4,
+        bcq_anchor_topk=8,
+        bcq_anchor_dk=32,
+        bcq_conflict_alpha=2.0,
+        bcq_gamma_init=0.0,
+        consensus_token_fusion="none",
+        consensus_token_class_count=None,
+        consensus_token_ratio=4,
+        consensus_token_heads=4,
+        consensus_token_topk=0,
+        consensus_token_tau=1.0,
+        consensus_token_fusion_gate_init=0.0,
         fdsm_scope="none",
         lidar_modulation="none",
         cnn_branch="original",
         cnn_layout="joint",
         cnn_share_weights=False,
-        topology_rewiring="none",
-        topology_advocacy_k=0,
-        topology_audit_side="both",
-        topology_evidence="learned",
-        topology_impurity_mode="target",
-        topology_freeze_advocacy=False,
-        topology_veto_init=0.0,
-        topology_advocacy_init=0.0,
-        topology_impurity_init=0.0,
         lidar_rag_adjacency=None,
         lidar_geometry_descriptors=None,
     ):
@@ -5448,41 +4662,26 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.width = width
         self.graph_modality_lambda = graph_modality_lambda
         self.fusion_lambda = fusion_lambda
-        self.post_gat_consensus_graph = post_gat_consensus_graph
-        self.consensus_graph_weight = consensus_graph_weight
-        self.consensus_graph_fusion = consensus_graph_fusion
-        self.consensus_graph_transport = consensus_graph_transport
-        self.consensus_graph_transport_stage = (
-            consensus_graph_transport_stage
-        )
         self.cross_overlap_relation = cross_overlap_relation
         self.cross_overlap_stage = cross_overlap_stage
-        self.sheaf_energy_weight = sheaf_energy_weight
-        self.last_consensus_graph_gate_diagnostics = None
+        self.dual_transport_arbitration = dual_transport_arbitration
+        self.assignment_graph = assignment_graph
+        self.assignment_graph_output = assignment_graph_output
+        self.assignment_graph_weight = float(assignment_graph_weight)
+        self.evidence_fusion = evidence_fusion
+        self.bcq_interaction = bcq_interaction
+        self.consensus_token_fusion = consensus_token_fusion
+        self.last_dta_diagnostics = None
+        self.last_dta_film_diagnostics = None
+        self.last_assignment_graph_diagnostics = None
         self.last_cross_overlap_diagnostics = None
+        self.last_bcq_diagnostics = None
+        self.last_consensus_token_diagnostics = None
+        self.last_consensus_token_outputs = None
+        self.last_evidence_diagnostics = None
         self.cnn_branch_mode = cnn_branch
         self.cnn_layout = cnn_layout
         self.cnn_share_weights = cnn_share_weights
-        self.topology_rewiring = topology_rewiring
-        self.topology_audit_side = topology_audit_side
-        self.topology_evidence = topology_evidence
-        self.last_topology_rewiring_diagnostics = None
-        topology_rewiring_enabled = topology_rewiring != "none"
-        hsi_topology_rewiring = topology_rewiring_enabled and (
-            topology_audit_side in ("both", "hsi")
-        )
-        lidar_topology_rewiring = topology_rewiring_enabled and (
-            topology_audit_side in ("both", "lidar")
-        )
-        lidar_advocacy_candidate_mask = lidar_rag_adjacency
-        if (
-            topology_rewiring_enabled
-            and cell_data is not None
-            and "topology_lidar_advocacy_adjacency" in cell_data
-        ):
-            lidar_advocacy_candidate_mask = cell_data[
-                "topology_lidar_advocacy_adjacency"
-            ]
 
         self.hsi_graph = ModalityGSDGGraphEncoder(
             in_channels=hsi_channels,
@@ -5493,13 +4692,6 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             dynamic_topk=dynamic_topk,
             dynamic_tau=dynamic_tau,
             use_fdsm=fdsm_scope == "hsi",
-            topology_rewiring=hsi_topology_rewiring,
-            topology_advocacy_k=topology_advocacy_k,
-            topology_veto_init=topology_veto_init,
-            topology_advocacy_init=topology_advocacy_init,
-            topology_impurity_init=topology_impurity_init,
-            topology_impurity_mode=topology_impurity_mode,
-            topology_freeze_advocacy=topology_freeze_advocacy,
         )
         self.lidar_graph = ModalityGSDGGraphEncoder(
             in_channels=1,
@@ -5514,137 +4706,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             lidar_modulation=lidar_modulation,
             rag_adjacency=lidar_rag_adjacency,
             geometry_descriptors=lidar_geometry_descriptors,
-            topology_rewiring=lidar_topology_rewiring,
-            topology_advocacy_k=topology_advocacy_k,
-            topology_veto_init=topology_veto_init,
-            topology_advocacy_init=topology_advocacy_init,
-            topology_impurity_init=topology_impurity_init,
-            topology_impurity_mode=topology_impurity_mode,
-            topology_freeze_advocacy=topology_freeze_advocacy,
-            topology_advocacy_candidate_mask=lidar_advocacy_candidate_mask,
         )
-
-        if topology_rewiring_enabled:
-            if cell_data is None:
-                raise ValueError(
-                    "cell-veto-advocacy topology rewiring requires "
-                    "common-refinement cell data."
-                )
-            self.register_buffer(
-                "rewiring_hsi_parent",
-                torch.as_tensor(
-                    cell_data["hsi_parent"],
-                    dtype=torch.long,
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                "rewiring_lidar_parent",
-                torch.as_tensor(
-                    cell_data["lidar_parent"],
-                    dtype=torch.long,
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                "rewiring_hsi_coverage",
-                torch.as_tensor(
-                    cell_data["hsi_coverage"],
-                    dtype=torch.float32,
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                "rewiring_lidar_coverage",
-                torch.as_tensor(
-                    cell_data["lidar_coverage"],
-                    dtype=torch.float32,
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                "rewiring_hsi_fragmentation",
-                torch.as_tensor(
-                    normalized_cell_fragmentation(
-                        cell_data,
-                        hsi_assignment.shape[1],
-                        "hsi_parent",
-                        "hsi_coverage",
-                    ),
-                    dtype=torch.float32,
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                "rewiring_lidar_fragmentation",
-                torch.as_tensor(
-                    normalized_cell_fragmentation(
-                        cell_data,
-                        lidar_assignment.shape[1],
-                        "lidar_parent",
-                        "lidar_coverage",
-                    ),
-                    dtype=torch.float32,
-                ),
-                persistent=False,
-            )
-            if topology_evidence == "physical":
-                physical_evidence = cell_data.get(
-                    "topology_physical_evidence"
-                )
-                if physical_evidence is None:
-                    raise ValueError(
-                        "--topology-evidence physical requires "
-                        "precomputed physical evidence in cell_data."
-                    )
-                self.register_buffer(
-                    "rewiring_hsi_physical_context",
-                    torch.as_tensor(
-                        physical_evidence["hsi_context"],
-                        dtype=torch.float32,
-                    ),
-                    persistent=False,
-                )
-                self.register_buffer(
-                    "rewiring_hsi_physical_uncertainty",
-                    torch.as_tensor(
-                        physical_evidence["hsi_uncertainty"],
-                        dtype=torch.float32,
-                    ),
-                    persistent=False,
-                )
-                self.register_buffer(
-                    "rewiring_lidar_physical_context",
-                    torch.as_tensor(
-                        physical_evidence["lidar_context"],
-                        dtype=torch.float32,
-                    ),
-                    persistent=False,
-                )
-                self.register_buffer(
-                    "rewiring_lidar_physical_uncertainty",
-                    torch.as_tensor(
-                        physical_evidence["lidar_uncertainty"],
-                        dtype=torch.float32,
-                    ),
-                    persistent=False,
-                )
-            else:
-                self.rewiring_hsi_physical_context = None
-                self.rewiring_hsi_physical_uncertainty = None
-                self.rewiring_lidar_physical_context = None
-                self.rewiring_lidar_physical_uncertainty = None
-        else:
-            self.rewiring_hsi_parent = None
-            self.rewiring_lidar_parent = None
-            self.rewiring_hsi_coverage = None
-            self.rewiring_lidar_coverage = None
-            self.rewiring_hsi_fragmentation = None
-            self.rewiring_lidar_fragmentation = None
-            self.rewiring_hsi_physical_context = None
-            self.rewiring_hsi_physical_uncertainty = None
-            self.rewiring_lidar_physical_context = None
-            self.rewiring_lidar_physical_uncertainty = None
 
         def make_cnn_branch():
             if cnn_branch == "original":
@@ -5710,100 +4772,100 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         else:
             raise ValueError("cnn_layout must be 'joint' or 'separate'.")
         self.classifier = nn.Linear(hidden_dim, class_count)
-
-        if post_gat_consensus_graph != "none":
-            if bridge_data is None:
-                raise ValueError(
-                    "mediator data is required for mediator "
-                    "consensus graph."
-                )
-            self.consensus_graph_branch = (
-                PostGATMediatedConsensusGraph(
-                    hidden_dim,
-                    bridge_data,
-                    attention_d_k=bridge_attention_d_k,
-                    topk=bridge_attention_topk,
-                    gamma_init=bridge_gamma_init,
-                    transport_lambda=consensus_graph_transport_lambda,
-                    transport_fusion=consensus_graph_transport_fusion,
-                    transport_message=consensus_graph_transport_message,
-                    transport_operator=(
-                        consensus_graph_transport_operator
-                    ),
-                    transport_prior_weight=(
-                        consensus_graph_transport_prior_weight
-                    ),
-                    transport_gamma_init=(
-                        consensus_graph_transport_gamma_init
-                    ),
-                    transport_second_gamma_init=(
-                        consensus_graph_transport_second_gamma_init
-                    ),
-                    sheaf_restriction=sheaf_restriction,
-                    sheaf_rank=sheaf_rank,
-                    sheaf_steps=sheaf_steps,
-                    dcsi_edge_topk=dcsi_edge_topk,
-                    dcsi_consensus_mix=dcsi_consensus_mix,
-                    dcsi_conflict_mix=dcsi_conflict_mix,
-                    dcsi_semantic_gamma_init=(
-                        dcsi_semantic_gamma_init
-                    ),
-                    dcsi_conflict_gamma_init=(
-                        dcsi_conflict_gamma_init
-                    ),
-                    cgsa_alpha_max=cgsa_alpha_max,
-                    cgsa_consensus_channel=cgsa_consensus_channel,
-                    spatial_prior_weight=(
-                        consensus_graph_spatial_prior_weight
-                    ),
-                    hsi_prior_weight=consensus_graph_hsi_prior_weight,
-                    lidar_prior_weight=(
-                        consensus_graph_lidar_prior_weight
-                    ),
-                )
-            )
-            if consensus_graph_fusion == "c-guided-gate":
-                gate_output = nn.Linear(hidden_dim, 3)
-                nn.init.zeros_(gate_output.weight)
-                initial_weights = torch.tensor(
-                    [
-                        graph_modality_lambda
-                        * (1.0 - consensus_graph_weight),
-                        (1.0 - graph_modality_lambda)
-                        * (1.0 - consensus_graph_weight),
-                        consensus_graph_weight,
-                    ],
-                    dtype=torch.float32,
-                ).clamp_min(1e-6)
-                with torch.no_grad():
-                    gate_output.bias.copy_(torch.log(initial_weights))
-                self.consensus_graph_gate = nn.Sequential(
-                    nn.Linear(6 * hidden_dim, hidden_dim),
-                    nn.LeakyReLU(),
-                    gate_output,
-                )
-            else:
-                self.consensus_graph_gate = None
-            if consensus_graph_fusion == "residual-c":
-                self.consensus_graph_residual_gamma = nn.Parameter(
-                    torch.tensor(float(consensus_graph_residual_init))
-                )
-                residual_gate_output = nn.Linear(hidden_dim, 1)
-                nn.init.zeros_(residual_gate_output.weight)
-                nn.init.constant_(residual_gate_output.bias, -3.0)
-                self.consensus_graph_residual_gate = nn.Sequential(
-                    nn.Linear(3 * hidden_dim, hidden_dim),
-                    nn.LeakyReLU(),
-                    residual_gate_output,
-                )
-            else:
-                self.consensus_graph_residual_gamma = None
-                self.consensus_graph_residual_gate = None
+        self.overlap_distill_enabled = overlap_distill_enabled
+        if evidence_fusion == "dirichlet":
+            self.hsi_evidence_head = nn.Linear(hidden_dim, class_count)
+            self.lidar_evidence_head = nn.Linear(hidden_dim, class_count)
         else:
-            self.consensus_graph_branch = None
-            self.consensus_graph_gate = None
-            self.consensus_graph_residual_gamma = None
-            self.consensus_graph_residual_gate = None
+            self.hsi_evidence_head = None
+            self.lidar_evidence_head = None
+        self.last_hsi_final_nodes = None
+        self.last_lidar_final_nodes = None
+        self.last_hsi_node_logits = None
+        self.last_lidar_node_logits = None
+        self.last_hsi_node_probabilities = None
+        self.last_lidar_node_probabilities = None
+        self.last_fused_alpha = None
+
+        if evidence_fusion == "dirichlet" and cross_overlap_data is not None:
+            self.register_buffer(
+                "evidence_h_index",
+                torch.as_tensor(
+                    cross_overlap_data["h_index"],
+                    dtype=torch.long,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "evidence_l_index",
+                torch.as_tensor(
+                    cross_overlap_data["l_index"],
+                    dtype=torch.long,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "evidence_iou",
+                torch.as_tensor(
+                    cross_overlap_data["iou"],
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+        else:
+            self.evidence_h_index = None
+            self.evidence_l_index = None
+            self.evidence_iou = None
+
+        if dual_transport_arbitration != "none":
+            if cross_overlap_data is None:
+                cross_overlap_data = build_sparse_overlap_relation_data(
+                    hsi_assignment,
+                    lidar_assignment,
+                )
+            self.dta_branch = DualTransportArbitration(
+                hidden_dim,
+                cross_overlap_data,
+                attention_d_k=dta_d_k,
+                tau=dta_tau,
+                gamma_init=dta_gamma_init,
+                variant=dta_variant,
+                nonlocal_topk=dta_nonlocal_topk,
+                normalization=dta_normalization,
+                sinkhorn_iters=dta_sinkhorn_iters,
+            )
+        else:
+            self.dta_branch = None
+        if self.dta_branch is not None and dta_film:
+            self.dta_film_branch = ConflictAwareFiLM(
+                hidden_dim,
+                d_s=dta_film_d_s,
+                gamma_init=dta_film_gamma_init,
+            )
+        else:
+            self.dta_film_branch = None
+
+        if assignment_graph != "none":
+            if cross_overlap_data is None:
+                cross_overlap_data = build_sparse_overlap_relation_data(
+                    hsi_assignment,
+                    lidar_assignment,
+                )
+            pair_assignment = build_overlap_pair_assignment(
+                hsi_assignment,
+                lidar_assignment,
+                cross_overlap_data,
+            )
+            self.assignment_graph_branch = AssignmentGraphInteraction(
+                hidden_dim,
+                cross_overlap_data,
+                pair_assignment=pair_assignment,
+                topk=assignment_graph_topk,
+                gamma_init=assignment_graph_gamma_init,
+                output=assignment_graph_output,
+            )
+        else:
+            self.assignment_graph_branch = None
 
         if cross_overlap_relation == "sparse":
             if cross_overlap_data is None:
@@ -5814,124 +4876,222 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             self.cross_overlap_branch = SparseOverlapCrossModalRelation(
                 hidden_dim,
                 cross_overlap_data,
-                attention_d_k=bridge_attention_d_k,
+                attention_d_k=dynamic_d_k,
                 message=cross_overlap_message,
                 fusion=cross_overlap_fusion,
                 prior_weight=cross_overlap_prior_weight,
                 gamma_init=cross_overlap_gamma_init,
                 second_gamma_init=cross_overlap_second_gamma_init,
+                fragmentation_alpha=cross_overlap_fragmentation_alpha,
             )
         else:
             self.cross_overlap_branch = None
 
-    def _has_topology_rewiring(self):
-        return self.topology_rewiring != "none"
+        if bcq_interaction != "none":
+            if cross_overlap_data is None:
+                cross_overlap_data = build_sparse_overlap_relation_data(
+                    hsi_assignment,
+                    lidar_assignment,
+                )
+            bcq_rng_state = torch.get_rng_state()
+            self.bcq_branch = BCQConsensusQuotientInteraction(
+                hidden_dim,
+                cross_overlap_data,
+                real_class_count=(
+                    int(bcq_class_count)
+                    if bcq_class_count is not None
+                    else int(class_count)
+                ),
+                anchor_ratio=bcq_anchor_ratio,
+                anchor_topk=bcq_anchor_topk,
+                anchor_dk=bcq_anchor_dk,
+                conflict_alpha=bcq_conflict_alpha,
+                gamma_init=bcq_gamma_init,
+            )
+            torch.set_rng_state(bcq_rng_state)
+        else:
+            self.bcq_branch = None
 
-    def _cross_topology_contexts(self, hsi_nodes, lidar_nodes):
-        if self.topology_evidence == "physical":
-            return (
-                self.rewiring_hsi_physical_context,
-                self.rewiring_lidar_physical_context,
-                self.rewiring_hsi_fragmentation,
-                self.rewiring_lidar_fragmentation,
-                self.rewiring_hsi_physical_uncertainty,
-                self.rewiring_lidar_physical_uncertainty,
+        if consensus_token_fusion != "none":
+            if cross_overlap_data is None:
+                cross_overlap_data = build_sparse_overlap_relation_data(
+                    hsi_assignment,
+                    lidar_assignment,
+                )
+            token_rng_state = torch.get_rng_state()
+            self.consensus_token_branch = ConsensusTokenFusion(
+                hidden_dim,
+                cross_overlap_data,
+                real_class_count=(
+                    int(consensus_token_class_count)
+                    if consensus_token_class_count is not None
+                    else int(class_count)
+                ),
+                tokens_per_class=consensus_token_ratio,
+                num_heads=consensus_token_heads,
+                token_topk=consensus_token_topk,
+                tau=consensus_token_tau,
+                fusion_gate_init=consensus_token_fusion_gate_init,
             )
-        hsi_context = hsi_nodes.new_zeros(hsi_nodes.shape)
-        hsi_context.index_add_(
-            0,
-            self.rewiring_hsi_parent,
-            self.rewiring_hsi_coverage.unsqueeze(1)
-            * lidar_nodes.index_select(
-                0,
-                self.rewiring_lidar_parent,
-            ),
-        )
-        lidar_context = lidar_nodes.new_zeros(lidar_nodes.shape)
-        lidar_context.index_add_(
-            0,
-            self.rewiring_lidar_parent,
-            self.rewiring_lidar_coverage.unsqueeze(1)
-            * hsi_nodes.index_select(
-                0,
-                self.rewiring_hsi_parent,
-            ),
-        )
-        return (
-            hsi_context,
-            lidar_context,
-            self.rewiring_hsi_fragmentation,
-            self.rewiring_lidar_fragmentation,
-            None,
-            None,
-        )
+            torch.set_rng_state(token_rng_state)
+        else:
+            self.consensus_token_branch = None
 
-    def _apply_private_gat1(self, hsi_nodes, lidar_nodes):
-        if not self._has_topology_rewiring():
-            hsi_features, hsi_adjacency = self.hsi_graph.apply_gat1(
-                hsi_nodes
-            )
-            lidar_features, lidar_adjacency = self.lidar_graph.apply_gat1(
-                lidar_nodes
-            )
-            return (
-                hsi_features,
-                lidar_features,
-                hsi_adjacency,
-                lidar_adjacency,
-            )
-
-        (
-            hsi_context,
-            lidar_context,
-            hsi_fragmentation,
-            lidar_fragmentation,
-            hsi_uncertainty,
-            lidar_uncertainty,
-        ) = self._cross_topology_contexts(hsi_nodes, lidar_nodes)
-        if self.topology_audit_side in ("both", "hsi"):
-            hsi_features, hsi_adjacency = self.hsi_graph.apply_gat1(
+    def _cache_branch_node_logits(self, hsi_nodes, lidar_nodes):
+        should_cache = (
+            self.overlap_distill_enabled
+            or self.evidence_fusion == "dirichlet"
+        )
+        if not should_cache:
+            self.last_hsi_final_nodes = None
+            self.last_lidar_final_nodes = None
+            self.last_hsi_node_logits = None
+            self.last_lidar_node_logits = None
+            self.last_hsi_node_probabilities = None
+            self.last_lidar_node_probabilities = None
+            return
+        self.last_hsi_final_nodes = hsi_nodes
+        self.last_lidar_final_nodes = lidar_nodes
+        if self.evidence_fusion == "dirichlet":
+            h_alpha = self._node_evidence_alpha(
+                self.hsi_evidence_head,
                 hsi_nodes,
-                topology_context=hsi_context,
-                topology_fragmentation=hsi_fragmentation,
-                topology_uncertainty=hsi_uncertainty,
             )
-        else:
-            hsi_features, hsi_adjacency = self.hsi_graph.apply_gat1(
-                hsi_nodes
-            )
-        if self.topology_audit_side in ("both", "lidar"):
-            lidar_features, lidar_adjacency = self.lidar_graph.apply_gat1(
+            l_alpha = self._node_evidence_alpha(
+                self.lidar_evidence_head,
                 lidar_nodes,
-                topology_context=lidar_context,
-                topology_fragmentation=lidar_fragmentation,
-                topology_uncertainty=lidar_uncertainty,
             )
+            self.last_hsi_node_probabilities = (
+                h_alpha / h_alpha.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            )
+            self.last_lidar_node_probabilities = (
+                l_alpha / l_alpha.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            )
+            self.last_hsi_node_logits = None
+            self.last_lidar_node_logits = None
         else:
-            lidar_features, lidar_adjacency = self.lidar_graph.apply_gat1(
-                lidar_nodes
-            )
-        self.last_topology_rewiring_diagnostics = {
-            "mode": self.topology_rewiring,
-            "evidence": self.topology_evidence,
-            "side": self.topology_audit_side,
-            "hsi": getattr(
-                self.hsi_graph.graph_builder,
-                "last_diagnostics",
-                None,
+            self.last_hsi_node_probabilities = None
+            self.last_lidar_node_probabilities = None
+            self.last_hsi_node_logits = self.classifier(hsi_nodes)
+            self.last_lidar_node_logits = self.classifier(lidar_nodes)
+
+    @staticmethod
+    def _node_evidence_alpha(head, nodes):
+        return F.softplus(head(nodes)) + 1.0
+
+    def _project_branch_alpha_to_pixels(self, hsi_alpha, lidar_alpha):
+        hsi_pixel_alpha = torch.sparse.mm(
+            self.hsi_graph.projection_assignment,
+            hsi_alpha,
+        )
+        lidar_pixel_alpha = torch.sparse.mm(
+            self.lidar_graph.projection_assignment,
+            lidar_alpha,
+        )
+        return hsi_pixel_alpha, lidar_pixel_alpha
+
+    def _overlap_evidence_conflict_diagnostics(
+        self,
+        hsi_node_alpha,
+        lidar_node_alpha,
+    ):
+        if self.evidence_h_index is None or self.evidence_iou is None:
+            return {}
+        h_evidence = (hsi_node_alpha - 1.0).clamp_min(0.0)
+        l_evidence = (lidar_node_alpha - 1.0).clamp_min(0.0)
+        h_strength = hsi_node_alpha.sum(dim=1, keepdim=True)
+        l_strength = lidar_node_alpha.sum(dim=1, keepdim=True)
+        h_belief = h_evidence / h_strength.clamp_min(1e-8)
+        l_belief = l_evidence / l_strength.clamp_min(1e-8)
+        edge_h_belief = h_belief.index_select(0, self.evidence_h_index)
+        edge_l_belief = l_belief.index_select(0, self.evidence_l_index)
+        agreement = (edge_h_belief * edge_l_belief).sum(
+            dim=1,
+            keepdim=False,
+        )
+        conflict = (
+            edge_h_belief.sum(dim=1)
+            * edge_l_belief.sum(dim=1)
+            - agreement
+        ).clamp_min(0.0)
+        weight = self.evidence_iou
+        weighted_conflict = (
+            (weight * conflict).sum() / weight.sum().clamp_min(1e-8)
+        )
+        return {
+            "overlap_conflict_mean": float(
+                conflict.detach().mean().item()
             ),
-            "lidar": getattr(
-                self.lidar_graph.graph_builder,
-                "last_diagnostics",
-                None,
+            "overlap_conflict_iou_weighted": float(
+                weighted_conflict.detach().item()
             ),
         }
+
+    def _forward_evidence_fusion_from_cached_nodes(self):
+        if (
+            self.last_hsi_final_nodes is None
+            or self.last_lidar_final_nodes is None
+        ):
+            raise RuntimeError(
+                "Evidence fusion requires cached separate HSI/LiDAR "
+                "graph nodes."
+            )
+        hsi_node_alpha = self._node_evidence_alpha(
+            self.hsi_evidence_head,
+            self.last_hsi_final_nodes,
+        )
+        lidar_node_alpha = self._node_evidence_alpha(
+            self.lidar_evidence_head,
+            self.last_lidar_final_nodes,
+        )
+        self.last_hsi_node_probabilities = (
+            hsi_node_alpha
+            / hsi_node_alpha.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        )
+        self.last_lidar_node_probabilities = (
+            lidar_node_alpha
+            / lidar_node_alpha.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        )
+        hsi_pixel_alpha, lidar_pixel_alpha = (
+            self._project_branch_alpha_to_pixels(
+                hsi_node_alpha,
+                lidar_node_alpha,
+            )
+        )
+        fused_alpha, diagnostics = dempster_combine_dirichlet(
+            hsi_pixel_alpha,
+            lidar_pixel_alpha,
+        )
+        diagnostics = {
+            **diagnostics,
+            **self._overlap_evidence_conflict_diagnostics(
+                hsi_node_alpha,
+                lidar_node_alpha,
+            ),
+        }
+        self.last_fused_alpha = fused_alpha
+        self.last_evidence_diagnostics = diagnostics
+        fused_probability = (
+            fused_alpha / fused_alpha.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        )
+        return torch.log(fused_probability.clamp_min(1e-12))
+
+
+
+    def _apply_private_gat1(self, hsi_nodes, lidar_nodes):
+        hsi_features, hsi_adjacency = self.hsi_graph.apply_gat1(
+            hsi_nodes
+        )
+        lidar_features, lidar_adjacency = self.lidar_graph.apply_gat1(
+            lidar_nodes
+        )
         return (
             hsi_features,
             lidar_features,
             hsi_adjacency,
             lidar_adjacency,
         )
+
 
     def _encode_private_graph_nodes(self, hsi, lidar):
         hsi_nodes = self.hsi_graph.encode_nodes(hsi)
@@ -5950,113 +5110,36 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             lidar_features,
             adjacency=lidar_adjacency,
         )
+        if self.dta_branch is not None:
+            hsi_final_nodes, lidar_final_nodes = self.dta_branch(
+                hsi_final_nodes,
+                lidar_final_nodes,
+            )
+            self.last_dta_diagnostics = self.dta_branch.diagnostics()
+            if self.dta_film_branch is not None:
+                hsi_final_nodes, lidar_final_nodes = self.dta_film_branch(
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                    self.dta_branch.last_ctx_h,
+                    self.dta_branch.last_ctx_l,
+                    self.dta_branch.last_D_h,
+                    self.dta_branch.last_D_l,
+                )
+                self.last_dta_film_diagnostics = (
+                    self.dta_film_branch.diagnostics()
+                )
+        if self.assignment_graph_branch is not None:
+            hsi_final_nodes, lidar_final_nodes = self.assignment_graph_branch(
+                hsi_final_nodes,
+                lidar_final_nodes,
+                hsi_adjacency,
+                lidar_adjacency,
+            )
+            self.last_assignment_graph_diagnostics = (
+                self.assignment_graph_branch.diagnostics()
+            )
         return hsi_final_nodes, lidar_final_nodes
 
-    def _forward_mediator_transport(self, hsi, lidar):
-        self.consensus_graph_branch.active_transport_stage = (
-            self.consensus_graph_transport_stage
-        )
-        hsi_nodes = self.hsi_graph.encode_nodes(hsi)
-        lidar_nodes = self.lidar_graph.encode_nodes(lidar)
-        (
-            hsi_features,
-            lidar_features,
-            hsi_adjacency,
-            lidar_adjacency,
-        ) = self._apply_private_gat1(
-            hsi_nodes,
-            lidar_nodes,
-        )
-        if self.consensus_graph_transport_stage == "post-gat2":
-            hsi_final_nodes = self.hsi_graph.apply_gat2_nodes(
-                hsi_features,
-                adjacency=hsi_adjacency,
-            )
-            lidar_final_nodes = self.lidar_graph.apply_gat2_nodes(
-                lidar_features,
-                adjacency=lidar_adjacency,
-            )
-            (
-                hsi_final_nodes,
-                lidar_final_nodes,
-            ) = self.consensus_graph_branch.transport_nodes(
-                hsi_final_nodes,
-                lidar_final_nodes,
-                hsi_adjacency,
-                lidar_adjacency,
-                round_index=1,
-            )
-        elif self.consensus_graph_transport_stage == "inter-gat":
-            (
-                hsi_features,
-                lidar_features,
-            ) = self.consensus_graph_branch.transport_nodes(
-                hsi_features,
-                lidar_features,
-                hsi_adjacency,
-                lidar_adjacency,
-                round_index=1,
-            )
-            hsi_final_nodes = self.hsi_graph.apply_gat2_nodes(
-                hsi_features,
-                adjacency=hsi_adjacency,
-            )
-            lidar_final_nodes = self.lidar_graph.apply_gat2_nodes(
-                lidar_features,
-                adjacency=lidar_adjacency,
-            )
-        elif self.consensus_graph_transport_stage == "alternating":
-            (
-                hsi_features,
-                lidar_features,
-            ) = self.consensus_graph_branch.transport_nodes(
-                hsi_features,
-                lidar_features,
-                hsi_adjacency,
-                lidar_adjacency,
-                round_index=1,
-            )
-            hsi_final_nodes = self.hsi_graph.apply_gat2_nodes(
-                hsi_features,
-                adjacency=hsi_adjacency,
-            )
-            lidar_final_nodes = self.lidar_graph.apply_gat2_nodes(
-                lidar_features,
-                adjacency=lidar_adjacency,
-            )
-            (
-                hsi_final_nodes,
-                lidar_final_nodes,
-            ) = self.consensus_graph_branch.transport_nodes(
-                hsi_final_nodes,
-                lidar_final_nodes,
-                hsi_adjacency,
-                lidar_adjacency,
-                round_index=2,
-            )
-        else:
-            raise ValueError(
-                "Unsupported consensus graph transport stage: "
-                f"{self.consensus_graph_transport_stage}"
-            )
-        hsi_graph_features = self.hsi_graph.project_nodes(
-            hsi_final_nodes
-        )
-        lidar_graph_features = self.lidar_graph.project_nodes(
-            lidar_final_nodes
-        )
-        self.last_consensus_graph_gate_diagnostics = {
-            "fusion_mode": "transport-private-fusion",
-            "private_weights": [
-                self.graph_modality_lambda,
-                1.0 - self.graph_modality_lambda,
-            ],
-        }
-        return (
-            self.graph_modality_lambda * hsi_graph_features
-            + (1.0 - self.graph_modality_lambda)
-            * lidar_graph_features
-        )
 
     def _forward_cross_overlap_relation(self, hsi, lidar):
         hsi_nodes = self.hsi_graph.encode_nodes(hsi)
@@ -6134,6 +5217,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 "Unsupported sparse overlap stage: "
                 f"{self.cross_overlap_stage}"
             )
+        self._cache_branch_node_logits(hsi_final_nodes, lidar_final_nodes)
         hsi_graph_features = self.hsi_graph.project_nodes(hsi_final_nodes)
         lidar_graph_features = self.lidar_graph.project_nodes(
             lidar_final_nodes
@@ -6142,6 +5226,78 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             "stage": self.cross_overlap_stage,
             **(self.cross_overlap_branch.diagnostics() or {}),
         }
+        return (
+            self.graph_modality_lambda * hsi_graph_features
+            + (1.0 - self.graph_modality_lambda)
+            * lidar_graph_features
+        )
+
+    def _forward_bcq_interaction(self, hsi, lidar):
+        if self.bcq_interaction != "post-gat2":
+            raise ValueError(
+                f"Unsupported BCQ interaction slot: {self.bcq_interaction}"
+            )
+        (
+            hsi_final_nodes,
+            lidar_final_nodes,
+        ) = self._encode_private_graph_nodes(
+            hsi,
+            lidar,
+        )
+        hsi_final_nodes, lidar_final_nodes = self.bcq_branch(
+            hsi_final_nodes,
+            lidar_final_nodes,
+        )
+        self._cache_branch_node_logits(hsi_final_nodes, lidar_final_nodes)
+        hsi_graph_features = self.hsi_graph.project_nodes(hsi_final_nodes)
+        lidar_graph_features = self.lidar_graph.project_nodes(
+            lidar_final_nodes
+        )
+        self.last_bcq_diagnostics = self.bcq_branch.diagnostics()
+        return (
+            self.graph_modality_lambda * hsi_graph_features
+            + (1.0 - self.graph_modality_lambda)
+            * lidar_graph_features
+        )
+
+    def _forward_consensus_token_fusion(self, hsi, lidar):
+        if self.consensus_token_fusion != "post-gat2":
+            raise ValueError(
+                "Unsupported consensus token fusion slot: "
+                f"{self.consensus_token_fusion}"
+            )
+        (
+            hsi_final_nodes,
+            lidar_final_nodes,
+        ) = self._encode_private_graph_nodes(
+            hsi,
+            lidar,
+        )
+        self._cache_branch_node_logits(hsi_final_nodes, lidar_final_nodes)
+        hsi_graph_features = self.hsi_graph.project_nodes(hsi_final_nodes)
+        lidar_graph_features = self.lidar_graph.project_nodes(
+            lidar_final_nodes
+        )
+        token_outputs = self.consensus_token_branch(
+            hsi_final_nodes,
+            lidar_final_nodes,
+        )
+        h_pixel_probability, l_pixel_probability = (
+            self.consensus_token_branch.project_probabilities(
+                self.hsi_graph.projection_assignment,
+                self.lidar_graph.projection_assignment,
+                token_outputs,
+            )
+        )
+        token_outputs = {
+            **token_outputs,
+            "p_h_pix": h_pixel_probability,
+            "p_l_pix": l_pixel_probability,
+        }
+        self.last_consensus_token_outputs = token_outputs
+        self.last_consensus_token_diagnostics = (
+            self.consensus_token_branch.diagnostics()
+        )
         return (
             self.graph_modality_lambda * hsi_graph_features
             + (1.0 - self.graph_modality_lambda)
@@ -6198,16 +5354,42 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         )
 
     def forward(self, hsi, lidar, joint_input):
-        self.last_consensus_graph_gate_diagnostics = None
+        self.last_dta_diagnostics = None
+        self.last_dta_film_diagnostics = None
+        self.last_assignment_graph_diagnostics = None
         self.last_cross_overlap_diagnostics = None
-        if self.cross_overlap_branch is not None:
+        self.last_bcq_diagnostics = None
+        self.last_consensus_token_diagnostics = None
+        self.last_consensus_token_outputs = None
+        self.last_evidence_diagnostics = None
+        self.last_hsi_final_nodes = None
+        self.last_lidar_final_nodes = None
+        self.last_hsi_node_logits = None
+        self.last_lidar_node_logits = None
+        self.last_hsi_node_probabilities = None
+        self.last_lidar_node_probabilities = None
+        self.last_fused_alpha = None
+        if self.consensus_token_branch is not None:
+            graph_features = self._forward_consensus_token_fusion(hsi, lidar)
+        elif self.bcq_branch is not None:
+            graph_features = self._forward_bcq_interaction(hsi, lidar)
+        elif self.cross_overlap_branch is not None:
             graph_features = self._forward_cross_overlap_relation(hsi, lidar)
-        elif self.consensus_graph_branch is None:
-            if self._has_topology_rewiring():
+        else:
+            if (
+                self.dta_branch is not None
+                or self.assignment_graph_branch is not None
+                or self.overlap_distill_enabled
+                or self.evidence_fusion == "dirichlet"
+            ):
                 (
                     hsi_final_nodes,
                     lidar_final_nodes,
                 ) = self._encode_private_graph_nodes(hsi, lidar)
+                self._cache_branch_node_logits(
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                )
                 hsi_graph_features = self.hsi_graph.project_nodes(
                     hsi_final_nodes
                 )
@@ -6222,163 +5404,21 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 + (1.0 - self.graph_modality_lambda)
                 * lidar_graph_features
             )
-        elif self.consensus_graph_transport == "bidirectional":
-            graph_features = self._forward_mediator_transport(hsi, lidar)
-        else:
-            (
-                hsi_final_nodes,
-                lidar_final_nodes,
-            ) = self._encode_private_graph_nodes(hsi, lidar)
-            hsi_adjacency = self.hsi_graph.last_gat2_adjacency
-            lidar_adjacency = self.lidar_graph.last_gat2_adjacency
-            if hsi_adjacency is None or lidar_adjacency is None:
-                raise RuntimeError(
-                    "Mediator consensus graph requires both private "
-                    "GAT2 adjacencies."
+            if (
+                self.assignment_graph_branch is not None
+                and self.assignment_graph_output in ("third-branch", "both")
+            ):
+                assignment_graph_features = (
+                    self.assignment_graph_branch.project_pair_nodes()
                 )
-            if self.consensus_graph_transport != "none":
-                raise ValueError(
-                    f"Unsupported consensus graph transport: "
-                    f"{self.consensus_graph_transport}"
+                graph_features = (
+                    (1.0 - self.assignment_graph_weight) * graph_features
+                    + self.assignment_graph_weight
+                    * assignment_graph_features
                 )
-            if self.consensus_graph_transport == "none":
-                hsi_graph_features = self.hsi_graph.project_nodes(
-                    hsi_final_nodes
-                )
-                lidar_graph_features = self.lidar_graph.project_nodes(
-                    lidar_final_nodes
-                )
-                consensus_graph_features = self.consensus_graph_branch(
-                    hsi_final_nodes,
-                    lidar_final_nodes,
-                    hsi_adjacency,
-                    lidar_adjacency,
-                )
-                private_graph_features = (
-                    self.graph_modality_lambda * hsi_graph_features
-                    + (1.0 - self.graph_modality_lambda)
-                    * lidar_graph_features
-                )
-                if self.consensus_graph_fusion == "c-guided-gate":
-                    gate_input = torch.cat(
-                        [
-                            hsi_graph_features,
-                            lidar_graph_features,
-                            consensus_graph_features,
-                            torch.abs(
-                                hsi_graph_features
-                                - consensus_graph_features
-                            ),
-                            torch.abs(
-                                lidar_graph_features
-                                - consensus_graph_features
-                            ),
-                            torch.abs(
-                                hsi_graph_features
-                                - lidar_graph_features
-                            ),
-                        ],
-                        dim=1,
-                    )
-                    gate = F.softmax(
-                        self.consensus_graph_gate(gate_input),
-                        dim=1,
-                    )
-                    graph_features = (
-                        gate[:, 0:1] * hsi_graph_features
-                        + gate[:, 1:2] * lidar_graph_features
-                        + gate[:, 2:3] * consensus_graph_features
-                    )
-                    gate_entropy = -torch.sum(
-                        gate * torch.log(gate.clamp_min(1e-12)),
-                        dim=1,
-                    )
-                    self.last_consensus_graph_gate_diagnostics = {
-                        "fusion_mode": self.consensus_graph_fusion,
-                        "gate_mean": (
-                            gate.detach().mean(dim=0).cpu().tolist()
-                        ),
-                        "gate_entropy": float(
-                            gate_entropy.detach().mean().item()
-                        ),
-                        "gate_min": (
-                            gate.detach().min(dim=0).values.cpu().tolist()
-                        ),
-                        "gate_max": (
-                            gate.detach().max(dim=0).values.cpu().tolist()
-                        ),
-                    }
-                elif self.consensus_graph_fusion == "fixed":
-                    consensus_weight = self.consensus_graph_weight
-                    private_weight = 1.0 - consensus_weight
-                    graph_features = (
-                        private_weight
-                        * self.graph_modality_lambda
-                        * hsi_graph_features
-                        + private_weight
-                        * (1.0 - self.graph_modality_lambda)
-                        * lidar_graph_features
-                        + consensus_weight * consensus_graph_features
-                    )
-                    self.last_consensus_graph_gate_diagnostics = {
-                        "fusion_mode": self.consensus_graph_fusion,
-                        "fixed_weights": [
-                            private_weight * self.graph_modality_lambda,
-                            private_weight
-                            * (1.0 - self.graph_modality_lambda),
-                            consensus_weight,
-                        ],
-                    }
-                elif self.consensus_graph_fusion == "residual-c":
-                    residual_gamma = self.consensus_graph_residual_gamma
-                    residual_input = torch.cat(
-                        [
-                            private_graph_features,
-                            consensus_graph_features,
-                            torch.abs(
-                                consensus_graph_features
-                                - private_graph_features
-                            ),
-                        ],
-                        dim=1,
-                    )
-                    residual_gate = torch.sigmoid(
-                        self.consensus_graph_residual_gate(residual_input)
-                    )
-                    graph_features = (
-                        private_graph_features
-                        + residual_gamma
-                        * residual_gate
-                        * (
-                            consensus_graph_features
-                            - private_graph_features
-                        )
-                    )
-                    self.last_consensus_graph_gate_diagnostics = {
-                        "fusion_mode": self.consensus_graph_fusion,
-                        "residual_gamma": float(
-                            residual_gamma.detach().item()
-                        ),
-                        "residual_gate_mean": float(
-                            residual_gate.detach().mean().item()
-                        ),
-                        "residual_gate_min": float(
-                            residual_gate.detach().min().item()
-                        ),
-                        "residual_gate_max": float(
-                            residual_gate.detach().max().item()
-                        ),
-                        "baseline_weights": [
-                            self.graph_modality_lambda,
-                            1.0 - self.graph_modality_lambda,
-                            0.0,
-                        ],
-                    }
-                else:
-                    raise ValueError(
-                        f"Unsupported consensus graph fusion: "
-                        f"{self.consensus_graph_fusion}"
-                    )
+
+        if self.evidence_fusion == "dirichlet":
+            return self._forward_evidence_fusion_from_cached_nodes()
 
         cnn_features = self._forward_cnn_features(
             hsi,
@@ -6389,7 +5429,21 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             self.fusion_lambda * graph_features
             + (1.0 - self.fusion_lambda) * cnn_features
         )
-        return self.classifier(fused_features)
+        main_logits = self.classifier(fused_features)
+        if self.consensus_token_branch is not None:
+            token_outputs = self.last_consensus_token_outputs
+            if token_outputs is None:
+                raise RuntimeError(
+                    "Consensus token fusion requires cached token outputs."
+                )
+            return self.consensus_token_branch.fuse_logits(
+                main_logits,
+                token_outputs["p_h_pix"],
+                token_outputs["p_l_pix"],
+                token_outputs["view_weights"],
+            )
+        return main_logits
+
 
 
 def prepare_data(args, config):
@@ -6457,56 +5511,6 @@ def prepare_data(args, config):
         hsi.shape[1],
         args.spatial_prior_k,
     )
-    cell_data = None
-    needs_intersection_cells = (
-        args.post_gat_consensus_graph == "intersection-mediator"
-        or args.topology_rewiring != "none"
-    )
-    if needs_intersection_cells:
-        cell_data = build_common_refinement_cells(
-            hsi_assignment,
-            lidar_assignment,
-            hsi.shape[0],
-            hsi.shape[1],
-        )
-        if (
-            args.topology_rewiring != "none"
-            and args.topology_advocacy_k > 0
-        ):
-            if (
-                lidar_rag_adjacency is not None
-                and args.topology_advocacy_rag_hops
-                == args.lidar_rag_hops
-            ):
-                topology_lidar_advocacy_adjacency = lidar_rag_adjacency
-            else:
-                (
-                    topology_lidar_advocacy_adjacency,
-                    _,
-                ) = build_lidar_rag_modulation_structure(
-                    lidar_assignment_parts,
-                    lidar,
-                    args.topology_advocacy_rag_hops,
-                )
-            cell_data["topology_lidar_advocacy_adjacency"] = (
-                topology_lidar_advocacy_adjacency
-            )
-        if (
-            args.consensus_graph_cell_edge
-            == "spectral-height-boundary"
-        ):
-            build_multimodal_weighted_cell_rag(
-                cell_data,
-                hsi,
-                lidar,
-                hsi.shape[0],
-                hsi.shape[1],
-                sam_weight=args.cell_sam_weight,
-                height_weight=args.cell_height_weight,
-                boundary_weight=args.cell_boundary_weight,
-                conflict_weight=args.cell_conflict_weight,
-            )
-
     height, width, bands = hsi.shape
     component_count = min(args.pca_components, bands)
     reduced_hsi = PCA(
@@ -6523,35 +5527,29 @@ def prepare_data(args, config):
         axis=2,
     ).astype(np.float32)
     lidar_features = lidar[:, :, np.newaxis].astype(np.float32)
-    if (
-        cell_data is not None
-        and args.topology_rewiring != "none"
-        and args.topology_evidence == "physical"
-    ):
-        cell_data["topology_physical_evidence"] = (
-            build_topology_physical_evidence(
-                cell_data,
-                reduced_hsi,
-                lidar,
-            )
-        )
+    cell_data = None
+    bridge_data = None
     cross_overlap_data = None
-    if args.cross_overlap_relation == "sparse":
+    needs_cross_overlap_data = (
+        args.dual_transport_arbitration != "none"
+        or args.assignment_graph != "none"
+        or args.cross_overlap_relation == "sparse"
+        or args.overlap_distill_weight > 0
+        or args.evidence_fusion == "dirichlet"
+        or args.bcq_interaction != "none"
+        or args.consensus_token_fusion != "none"
+    )
+    if needs_cross_overlap_data:
         cross_overlap_data = build_sparse_overlap_relation_data(
             hsi_assignment,
             lidar_assignment,
             hsi_features=hsi,
             lidar_image=lidar,
             edge_attrs=args.cross_overlap_edge_attrs,
+            min_coverage=args.cross_overlap_min_coverage,
+            iou_topk=args.cross_overlap_iou_topk,
         )
-    bridge_data = None
-    if args.post_gat_consensus_graph == "intersection-mediator":
-        bridge_data = build_intersection_mediator_data(
-            cell_data,
-            hsi_assignment.shape[1],
-            lidar_assignment.shape[1],
-            edge_mode=args.consensus_graph_cell_edge,
-        )
+
     return (
         reduced_hsi,
         lidar_features,
@@ -6650,59 +5648,22 @@ def train_one_run(
             ),
             lidar_modulation=args.lidar_modulation,
             graph_modality_lambda=args.graph_modality_lambda,
-            post_gat_consensus_graph=(
-                args.post_gat_consensus_graph
-            ),
-            consensus_graph_weight=args.consensus_graph_weight,
-            consensus_graph_fusion=args.consensus_graph_fusion,
-            consensus_graph_residual_init=(
-                args.consensus_graph_residual_init
-            ),
-            consensus_graph_transport=args.consensus_graph_transport,
-            consensus_graph_transport_stage=(
-                args.consensus_graph_transport_stage
-            ),
-            consensus_graph_transport_fusion=(
-                args.consensus_graph_transport_fusion
-            ),
-            consensus_graph_transport_message=(
-                args.consensus_graph_transport_message
-            ),
-            consensus_graph_transport_operator=(
-                args.consensus_graph_transport_operator
-            ),
-            consensus_graph_transport_prior_weight=(
-                args.consensus_graph_transport_prior_weight
-            ),
-            consensus_graph_transport_lambda=(
-                args.consensus_graph_transport_lambda
-            ),
-            consensus_graph_transport_gamma_init=(
-                args.consensus_graph_transport_gamma_init
-            ),
-            consensus_graph_transport_second_gamma_init=(
-                args.consensus_graph_transport_second_gamma_init
-            ),
-            sheaf_restriction=args.sheaf_restriction,
-            sheaf_rank=args.sheaf_rank,
-            sheaf_steps=args.sheaf_steps,
-            sheaf_energy_weight=args.sheaf_energy_weight,
-            dcsi_edge_topk=args.dcsi_edge_topk,
-            dcsi_consensus_mix=args.dcsi_consensus_mix,
-            dcsi_conflict_mix=args.dcsi_conflict_mix,
-            dcsi_semantic_gamma_init=args.dcsi_semantic_gamma_init,
-            dcsi_conflict_gamma_init=args.dcsi_conflict_gamma_init,
-            cgsa_alpha_max=args.cgsa_alpha_max,
-            cgsa_consensus_channel=args.cgsa_consensus_channel,
-            consensus_graph_spatial_prior_weight=(
-                args.consensus_graph_spatial_prior_weight
-            ),
-            consensus_graph_hsi_prior_weight=(
-                args.consensus_graph_hsi_prior_weight
-            ),
-            consensus_graph_lidar_prior_weight=(
-                args.consensus_graph_lidar_prior_weight
-            ),
+            dual_transport_arbitration=args.dual_transport_arbitration,
+            dta_d_k=args.dta_dk,
+            dta_tau=args.dta_tau,
+            dta_gamma_init=args.dta_gamma_init,
+            dta_variant=args.dta_variant,
+            dta_nonlocal_topk=args.dta_nonlocal_topk,
+            dta_normalization=args.dta_normalization,
+            dta_sinkhorn_iters=args.dta_sinkhorn_iters,
+            dta_film=args.dta_film,
+            dta_film_d_s=args.dta_film_ds,
+            dta_film_gamma_init=args.dta_film_gamma_init,
+            assignment_graph=args.assignment_graph,
+            assignment_graph_topk=args.assignment_graph_topk,
+            assignment_graph_gamma_init=args.assignment_graph_gamma_init,
+            assignment_graph_output=args.assignment_graph_output,
+            assignment_graph_weight=args.assignment_graph_weight,
             cross_overlap_relation=args.cross_overlap_relation,
             cross_overlap_stage=args.cross_overlap_stage,
             cross_overlap_message=args.cross_overlap_message,
@@ -6712,25 +5673,32 @@ def train_one_run(
             cross_overlap_second_gamma_init=(
                 args.cross_overlap_second_gamma_init
             ),
+            cross_overlap_fragmentation_alpha=(
+                args.cross_overlap_fragmentation_alpha
+            ),
             cross_overlap_data=cross_overlap_data,
-            bridge_attention_d_k=args.bridge_attention_dk,
-            bridge_attention_topk=args.bridge_attention_topk,
-            bridge_gamma_init=args.consensus_graph_c_gamma_init,
-            bridge_data=bridge_data,
-            cell_data=cell_data,
+            overlap_distill_enabled=args.overlap_distill_weight > 0,
+            evidence_fusion=args.evidence_fusion,
+            bcq_interaction=args.bcq_interaction,
+            bcq_class_count=class_count,
+            bcq_anchor_ratio=args.bcq_anchor_ratio,
+            bcq_anchor_topk=args.bcq_anchor_topk,
+            bcq_anchor_dk=args.bcq_anchor_dk,
+            bcq_conflict_alpha=args.bcq_conflict_alpha,
+            bcq_gamma_init=args.bcq_gamma_init,
+            consensus_token_fusion=args.consensus_token_fusion,
+            consensus_token_class_count=class_count,
+            consensus_token_ratio=args.consensus_token_ratio,
+            consensus_token_heads=args.consensus_token_heads,
+            consensus_token_topk=args.consensus_token_topk,
+            consensus_token_tau=args.consensus_token_tau,
+            consensus_token_fusion_gate_init=(
+                args.consensus_token_fusion_gate_init
+            ),
             fdsm_scope=args.fdsm_scope,
             cnn_branch=args.cnn_branch,
             cnn_layout=args.cnn_layout,
             cnn_share_weights=args.cnn_share_weights,
-            topology_rewiring=args.topology_rewiring,
-            topology_advocacy_k=args.topology_advocacy_k,
-            topology_audit_side=args.topology_audit_side,
-            topology_evidence=args.topology_evidence,
-            topology_impurity_mode=args.topology_impurity_mode,
-            topology_freeze_advocacy=args.topology_freeze_advocacy,
-            topology_veto_init=args.topology_veto_init,
-            topology_advocacy_init=args.topology_advocacy_init,
-            topology_impurity_init=args.topology_impurity_init,
             **common_options,
         ).to(device)
 
@@ -6753,11 +5721,22 @@ def train_one_run(
         weight_decay=args.weight_decay,
     )
     criterion = nn.CrossEntropyLoss()
+    overlap_distill_tensors = None
+    if args.overlap_distill_weight > 0:
+        overlap_distill_tensors = build_overlap_distill_tensors(
+            cross_overlap_data,
+            device,
+        )
     best_loss = float("inf")
     best_state = None
-    consensus_graph_diagnostics = []
-    topology_rewiring_diagnostics = []
+    dta_diagnostics = []
+    dta_film_diagnostics = []
+    assignment_graph_diagnostics = []
     cross_overlap_diagnostics = []
+    bcq_diagnostics = []
+    consensus_token_diagnostics = []
+    overlap_distill_diagnostics = []
+    evidence_fusion_diagnostics = []
     start_time = time.perf_counter()
 
     for epoch in range(1, args.epochs + 1):
@@ -6765,26 +5744,201 @@ def train_one_run(
         optimizer.zero_grad()
         logits = forward_model()
         real_class_logits = logits[:, :class_count]
-        classification_loss = criterion(
-            logits.index_select(0, train_index),
-            train_labels,
-        )
+        evidence_record = None
+        if args.evidence_fusion == "dirichlet":
+            fused_alpha = getattr(model, "last_fused_alpha", None)
+            if fused_alpha is None:
+                raise RuntimeError(
+                    "EDL requires fused Dirichlet alpha from the model."
+                )
+            classification_loss, edl_record = edl_classification_loss(
+                fused_alpha.index_select(0, train_index),
+                train_labels,
+                classifier_output_dim,
+                epoch,
+                args.epochs,
+                kl_weight=args.edl_kl_weight,
+                anneal_ratio=args.edl_anneal_ratio,
+            )
+            evidence_record = {
+                "epoch": epoch,
+                "fusion": args.evidence_fusion,
+                "kl_weight": float(args.edl_kl_weight),
+                "anneal_ratio": float(args.edl_anneal_ratio),
+                **edl_record,
+                **(getattr(model, "last_evidence_diagnostics", None) or {}),
+            }
+        else:
+            classification_loss = criterion(
+                logits.index_select(0, train_index),
+                train_labels,
+            )
         loss = classification_loss
-        consensus_graph_module = getattr(
-            model,
-            "consensus_graph_branch",
-            None,
-        )
-        sheaf_energy_loss = None
-        if consensus_graph_module is not None:
-            sheaf_energy = getattr(
-                consensus_graph_module,
-                "last_sheaf_energy_loss",
+        dta_aux_record = None
+        if (
+            args.dual_transport_arbitration != "none"
+            and args.dta_variant == "full"
+        ):
+            dta_branch = getattr(model, "dta_branch", None)
+            dta_aux_losses = getattr(dta_branch, "last_aux_losses", {}) or {}
+            if dta_aux_losses:
+                dta_sparse_loss = dta_aux_losses.get(
+                    "sparse",
+                    loss.new_tensor(0.0),
+                )
+                dta_align_loss = dta_aux_losses.get(
+                    "align",
+                    loss.new_tensor(0.0),
+                )
+                dta_entropy_loss = dta_aux_losses.get(
+                    "entropy",
+                    loss.new_tensor(0.0),
+                )
+                weighted_dta_aux_loss = (
+                    args.dta_aux_sparse_weight * dta_sparse_loss
+                    + args.dta_aux_align_weight * dta_align_loss
+                    + args.dta_aux_entropy_weight * dta_entropy_loss
+                )
+                loss = loss + weighted_dta_aux_loss
+                dta_aux_record = {
+                    "aux_sparse_weight": float(args.dta_aux_sparse_weight),
+                    "aux_align_weight": float(args.dta_aux_align_weight),
+                    "aux_entropy_weight": float(args.dta_aux_entropy_weight),
+                    "aux_weighted_loss": float(
+                        weighted_dta_aux_loss.detach().item()
+                    ),
+                    "aux_sparse_loss": float(
+                        dta_sparse_loss.detach().item()
+                    ),
+                    "aux_align_loss": float(dta_align_loss.detach().item()),
+                    "aux_entropy_loss": float(
+                        dta_entropy_loss.detach().item()
+                    ),
+                }
+        consensus_token_record = None
+        if args.consensus_token_fusion != "none":
+            token_branch = getattr(model, "consensus_token_branch", None)
+            token_outputs = getattr(
+                model,
+                "last_consensus_token_outputs",
                 None,
             )
-            if sheaf_energy is not None and args.sheaf_energy_weight > 0:
-                sheaf_energy_loss = args.sheaf_energy_weight * sheaf_energy
-                loss = loss + sheaf_energy_loss
+            if token_branch is None or token_outputs is None:
+                raise RuntimeError(
+                    "Consensus token fusion requires cached token outputs."
+                )
+            h_token_ce = token_branch.consensus_ce(
+                token_outputs["p_h_pix"],
+                train_index,
+                train_labels,
+            )
+            l_token_ce = token_branch.consensus_ce(
+                token_outputs["p_l_pix"],
+                train_index,
+                train_labels,
+            )
+            token_ce_loss = 0.5 * (h_token_ce + l_token_ce)
+            token_agreement_loss = token_outputs["agreement_loss"]
+            token_usage_loss = token_outputs["usage_loss"]
+            weighted_token_loss = (
+                args.consensus_token_ce_weight * token_ce_loss
+                + args.consensus_token_agreement_weight
+                * token_agreement_loss
+                + args.consensus_token_usage_weight * token_usage_loss
+            )
+            loss = loss + weighted_token_loss
+            consensus_token_record = {
+                "epoch": epoch,
+                "fusion": args.consensus_token_fusion,
+                "ce_weight": float(args.consensus_token_ce_weight),
+                "agreement_weight": float(
+                    args.consensus_token_agreement_weight
+                ),
+                "usage_weight": float(args.consensus_token_usage_weight),
+                "weighted_loss": float(
+                    weighted_token_loss.detach().item()
+                ),
+                "token_ce": float(token_ce_loss.detach().item()),
+                "h_token_ce": float(h_token_ce.detach().item()),
+                "l_token_ce": float(l_token_ce.detach().item()),
+                "agreement_loss": float(
+                    token_agreement_loss.detach().item()
+                ),
+                "usage_loss": float(token_usage_loss.detach().item()),
+                **(
+                    getattr(model, "last_consensus_token_diagnostics", None)
+                    or {}
+                ),
+            }
+        overlap_distill_record = None
+        if args.overlap_distill_weight > 0:
+            inputs_are_probabilities = args.evidence_fusion == "dirichlet"
+            if inputs_are_probabilities:
+                hsi_node_scores = getattr(
+                    model,
+                    "last_hsi_node_probabilities",
+                    None,
+                )
+                lidar_node_scores = getattr(
+                    model,
+                    "last_lidar_node_probabilities",
+                    None,
+                )
+            else:
+                hsi_node_scores = getattr(model, "last_hsi_node_logits", None)
+                lidar_node_scores = getattr(
+                    model,
+                    "last_lidar_node_logits",
+                    None,
+                )
+            if hsi_node_scores is None or lidar_node_scores is None:
+                raise RuntimeError(
+                    "Overlap distillation requires separate HSI/LiDAR "
+                    "node predictions. Use --graph-layout separate."
+                )
+            distill_loss, distill_record = (
+                confidence_weighted_overlap_distill_loss(
+                    hsi_node_scores,
+                    lidar_node_scores,
+                    overlap_distill_tensors,
+                    class_count,
+                    temperature=args.overlap_distill_temperature,
+                    iou_threshold=args.overlap_distill_iou_threshold,
+                    margin=args.overlap_distill_margin,
+                    confidence_mode=args.overlap_distill_confidence,
+                    inputs_are_probabilities=inputs_are_probabilities,
+                )
+            )
+            distill_ramp = overlap_distill_ramp(
+                epoch,
+                args.epochs,
+                args.overlap_distill_warmup_ratio,
+            )
+            weighted_distill_loss = (
+                args.overlap_distill_weight
+                * distill_ramp
+                * distill_loss
+            )
+            loss = loss + weighted_distill_loss
+            overlap_distill_record = {
+                "epoch": epoch,
+                "weight": float(args.overlap_distill_weight),
+                "temperature": float(args.overlap_distill_temperature),
+                "iou_threshold": float(args.overlap_distill_iou_threshold),
+                "margin": float(args.overlap_distill_margin),
+                "warmup_ratio": float(args.overlap_distill_warmup_ratio),
+                "ramp": float(distill_ramp),
+                "confidence": args.overlap_distill_confidence,
+                "input": (
+                    "expected-probability"
+                    if inputs_are_probabilities
+                    else "logits"
+                ),
+                "weighted_loss": float(
+                    weighted_distill_loss.detach().item()
+                ),
+                **distill_record,
+            }
         loss.backward()
         optimizer.step()
         if loss.item() < best_loss:
@@ -6794,47 +5948,37 @@ def train_one_run(
                 for key, value in model.state_dict().items()
             }
         if epoch == 1 or epoch % args.log_interval == 0:
-            consensus_graph_record = None
-            consensus_graph_module = getattr(
-                model,
-                "consensus_graph_branch",
-                None,
-            )
-            if consensus_graph_module is not None:
-                consensus_graph_record = (
-                    consensus_graph_module.diagnostics()
-                )
-                if consensus_graph_record is not None:
-                    gate_record = getattr(
-                        model,
-                        "last_consensus_graph_gate_diagnostics",
-                        None,
-                    )
-                    if gate_record is not None:
-                        consensus_graph_record = {
-                            **consensus_graph_record,
-                            **gate_record,
-                        }
-                    consensus_graph_record = {
-                        "epoch": epoch,
-                        **consensus_graph_record,
-                    }
-                    consensus_graph_diagnostics.append(
-                        consensus_graph_record
-                    )
-            topology_rewiring_record = getattr(
-                model,
-                "last_topology_rewiring_diagnostics",
-                None,
-            )
-            if topology_rewiring_record is not None:
-                topology_rewiring_record = {
+            dta_record = getattr(model, "last_dta_diagnostics", None)
+            if dta_record is not None:
+                dta_record = {
                     "epoch": epoch,
-                    **topology_rewiring_record,
+                    **dta_record,
                 }
-                topology_rewiring_diagnostics.append(
-                    topology_rewiring_record
-                )
+                if dta_aux_record is not None:
+                    dta_record.update(dta_aux_record)
+                dta_diagnostics.append(dta_record)
+            dta_film_record = getattr(
+                model,
+                "last_dta_film_diagnostics",
+                None,
+            )
+            if dta_film_record is not None:
+                dta_film_record = {
+                    "epoch": epoch,
+                    **dta_film_record,
+                }
+                dta_film_diagnostics.append(dta_film_record)
+            assignment_graph_record = getattr(
+                model,
+                "last_assignment_graph_diagnostics",
+                None,
+            )
+            if assignment_graph_record is not None:
+                assignment_graph_record = {
+                    "epoch": epoch,
+                    **assignment_graph_record,
+                }
+                assignment_graph_diagnostics.append(assignment_graph_record)
             cross_overlap_record = getattr(
                 model,
                 "last_cross_overlap_diagnostics",
@@ -6846,6 +5990,21 @@ def train_one_run(
                     **cross_overlap_record,
                 }
                 cross_overlap_diagnostics.append(cross_overlap_record)
+            bcq_record = getattr(model, "last_bcq_diagnostics", None)
+            if bcq_record is not None:
+                bcq_record = {
+                    "epoch": epoch,
+                    **bcq_record,
+                }
+                bcq_diagnostics.append(bcq_record)
+            if consensus_token_record is not None:
+                consensus_token_diagnostics.append(consensus_token_record)
+            if overlap_distill_record is not None:
+                overlap_distill_diagnostics.append(
+                    overlap_distill_record
+                )
+            if evidence_record is not None:
+                evidence_fusion_diagnostics.append(evidence_record)
             train_predictions = (
                 real_class_logits.index_select(
                     0,
@@ -6862,26 +6021,100 @@ def train_one_run(
                 f"cls={classification_loss.item():.6f} | "
                 f"train_OA={train_oa:.4f}"
             )
-            if topology_rewiring_record is not None:
-
-                def topology_side_text(record):
-                    if record is None:
-                        return "off"
-                    return (
-                        f"a={record['alpha']:.3f},"
-                        f"b={record['beta']:.3f},"
-                        f"i={record['impurity']:.3f},"
-                        f"T={record['source_temperature_mean']:.3f},"
-                        f"sup={record['support_density']:.3f},"
-                        f"adv={record['advocacy_density']:.3f}"
-                    )
-
+            if overlap_distill_record is not None:
                 print(
-                    "  Topology audit: "
-                    f"side={topology_rewiring_record['side']}, "
-                    f"evidence={topology_rewiring_record['evidence']}, "
-                    f"H[{topology_side_text(topology_rewiring_record['hsi'])}] "
-                    f"L[{topology_side_text(topology_rewiring_record['lidar'])}]"
+                    "  Overlap distill: "
+                    f"w={overlap_distill_record['weight']:.3g}, "
+                    f"input={overlap_distill_record['input']}, "
+                    f"ramp={overlap_distill_record['ramp']:.3f}, "
+                    f"loss={overlap_distill_record['weighted_loss']:.6f}, "
+                    f"edges={overlap_distill_record['selected_edges']}, "
+                    "H->L/L->H="
+                    f"{overlap_distill_record['h_to_l_edges']}/"
+                    f"{overlap_distill_record['l_to_h_edges']}, "
+                    "conf="
+                    f"{overlap_distill_record['mean_conf_h']:.3f}/"
+                    f"{overlap_distill_record['mean_conf_l']:.3f}, "
+                    f"IoU={overlap_distill_record['mean_iou']:.3f}"
+                )
+            if evidence_record is not None:
+                print(
+                    "  Evidence fusion: "
+                    f"EDL-ce={evidence_record['edl_ce']:.4f}, "
+                    f"EDL-kl={evidence_record['edl_kl']:.4f}, "
+                    f"anneal={evidence_record['edl_anneal']:.3f}, "
+                    "uncert="
+                    f"{evidence_record['h_uncertainty_mean']:.3f}/"
+                    f"{evidence_record['l_uncertainty_mean']:.3f}/"
+                    f"{evidence_record['fused_uncertainty_mean']:.3f}, "
+                    "conflict="
+                    f"{evidence_record['dempster_conflict_mean']:.3f}"
+                )
+            if dta_record is not None:
+                print(
+                    "  DTA: "
+                    f"{dta_record['mode']}, "
+                    f"edges={dta_record['edge_count']}, "
+                    "gamma="
+                    f"{dta_record['h_gamma']:.4f}/"
+                    f"{dta_record['l_gamma']:.4f}, "
+                    "D="
+                    f"{dta_record['h_conflict_mean']:.4f}/"
+                    f"{dta_record['l_conflict_mean']:.4f}, "
+                    "gate="
+                    f"{dta_record['h_gate_mean']:.4f}/"
+                    f"{dta_record['l_gate_mean']:.4f}, "
+                    "entropy geo/sem="
+                    f"{dta_record['h_geo_entropy']:.3f}/"
+                    f"{dta_record['h_sem_entropy']:.3f};"
+                    f"{dta_record['l_geo_entropy']:.3f}/"
+                    f"{dta_record['l_sem_entropy']:.3f}"
+                )
+                if "aux_weighted_loss" in dta_record:
+                    print(
+                        "  DTA full aux: "
+                        f"loss={dta_record['aux_weighted_loss']:.6f}, "
+                        f"sparse={dta_record['aux_sparse_loss']:.4f}, "
+                        f"align={dta_record['aux_align_loss']:.4f}, "
+                        f"ent={dta_record['aux_entropy_loss']:.4f}, "
+                        "escape="
+                        f"{dta_record['h_escape_mean']:.3f}/"
+                        f"{dta_record['l_escape_mean']:.3f}"
+                    )
+            if dta_film_record is not None:
+                print(
+                    "  DTA-FiLM: "
+                    f"ds={dta_film_record['shared_dim']}, "
+                    "gamma="
+                    f"{dta_film_record['gamma_h']:.4f}/"
+                    f"{dta_film_record['gamma_l']:.4f}, "
+                    "alpha="
+                    f"{dta_film_record['alpha_h']:.3f}/"
+                    f"{dta_film_record['alpha_l']:.3f}, "
+                    "shrink="
+                    f"{dta_film_record['shrink_h_mean']:.3f}/"
+                    f"{dta_film_record['shrink_l_mean']:.3f}, "
+                    "delta="
+                    f"{dta_film_record['delta_h_norm']:.4f}/"
+                    f"{dta_film_record['delta_l_norm']:.4f}"
+                )
+            if assignment_graph_record is not None:
+                print(
+                    "  Assignment graph: "
+                    f"out={assignment_graph_record['output']}, "
+                    f"nodes={assignment_graph_record['assignment_node_count']}, "
+                    f"topk={assignment_graph_record['assignment_topk']}, "
+                    "gamma="
+                    f"{assignment_graph_record['h_gamma']:.4f}/"
+                    f"{assignment_graph_record['l_gamma']:.4f}, "
+                    f"pair-gamma={assignment_graph_record['pair_gamma']:.3f}, "
+                    "gate="
+                    f"{assignment_graph_record['h_gate_mean']:.3f}/"
+                    f"{assignment_graph_record['l_gate_mean']:.3f}, "
+                    f"match={assignment_graph_record['pair_match_mean']:.3f}, "
+                    "adj="
+                    f"dens{assignment_graph_record['assignment_density']:.4f}/"
+                    f"ent{assignment_graph_record['assignment_entropy_mean']:.3f}"
                 )
             if cross_overlap_record is not None:
                 if (
@@ -6909,6 +6142,14 @@ def train_one_run(
                         f"{cross_overlap_record['h_gate_mean']:.3f}/"
                         f"{cross_overlap_record['l_gate_mean']:.3f}"
                     )
+                sparse_suffix = (
+                    sparse_suffix
+                    + ", frag="
+                    f"a{cross_overlap_record.get('fragmentation_alpha', 0.0):.2g},"
+                    "g"
+                    f"{cross_overlap_record.get('h_fragmentation_gate_mean', 1.0):.3f}/"
+                    f"{cross_overlap_record.get('l_fragmentation_gate_mean', 1.0):.3f}"
+                )
                 print(
                     "  Sparse overlap: "
                     f"stage={cross_overlap_record['stage']}, "
@@ -6917,182 +6158,51 @@ def train_one_run(
                     f"fusion={cross_overlap_record['transport_fusion']}, "
                     f"edge-attrs={cross_overlap_record['edge_attribute_mode']}, "
                     f"edge-bias={cross_overlap_record.get('edge_bias_mean', 0.0) or 0.0:.3f}, "
-                    f"edges={cross_overlap_record['edge_count']}, "
+                    f"edges={cross_overlap_record['edge_count']}/"
+                    f"{cross_overlap_record.get('original_edge_count', cross_overlap_record['edge_count'])}"
+                    f"({cross_overlap_record.get('retained_edge_fraction', 1.0):.2f}), "
                     f"{sparse_suffix}"
+                    )
+            if bcq_record is not None:
+                print(
+                    "  BCQ: "
+                    f"slot={bcq_record['interaction']}, "
+                    f"K={bcq_record['anchor_count']}, "
+                    f"topk={bcq_record['anchor_topk']}, "
+                    "gamma="
+                    f"{bcq_record['h_gamma']:.4f}/"
+                    f"{bcq_record['l_gamma']:.4f}, "
+                    "jsd="
+                    f"{bcq_record['h_jsd_mean']:.4f}/"
+                    f"{bcq_record['l_jsd_mean']:.4f}, "
+                    "gate="
+                    f"{bcq_record['h_gate_mean']:.4f}/"
+                    f"{bcq_record['l_gate_mean']:.4f}, "
+                    "entropy="
+                    f"{bcq_record['h_entropy_mean']:.4f}/"
+                    f"{bcq_record['l_entropy_mean']:.4f}, "
+                    "usage-ent="
+                    f"{bcq_record['h_anchor_usage_entropy']:.4f}/"
+                    f"{bcq_record['l_anchor_usage_entropy']:.4f}"
                 )
-            if consensus_graph_record is not None:
-                if (
-                    consensus_graph_record.get("transport_operator")
-                    == "cgsa"
-                ):
-                    print(
-                        "  C-CGSA: "
-                        f"stage={consensus_graph_record.get('transport_stage', 'post-gat2')}, "
-                        f"round={consensus_graph_record.get('transport_round', 1)}, "
-                        f"restriction={consensus_graph_record['cgsa_restriction']}, "
-                        f"rank={consensus_graph_record['cgsa_rank']}, "
-                        f"steps={consensus_graph_record['cgsa_steps']}, "
-                        f"edge_topk={consensus_graph_record['cgsa_edge_topk']}, "
-                        "alpha="
-                        f"{consensus_graph_record['cgsa_alpha_mean']:.3f}"
-                        "±"
-                        f"{consensus_graph_record['cgsa_alpha_std']:.3f}, "
-                        "gamma="
-                        f"{consensus_graph_record['cgsa_gamma_h']:.3f}/"
-                        f"{consensus_graph_record['cgsa_gamma_l']:.3f}, "
-                        "entropy="
-                        f"{consensus_graph_record['cgsa_attention_entropy']:.3f}, "
-                        "conflict="
-                        f"{consensus_graph_record['cgsa_conflict_norm']:.3f}, "
-                        "energy="
-                        f"{consensus_graph_record['sheaf_energy_mean']:.4f}"
-                    )
-                elif (
-                    consensus_graph_record.get("transport_operator")
-                    == "dcsi"
-                ):
-                    print(
-                        "  C-DCSI: "
-                        f"stage={consensus_graph_record.get('transport_stage', 'post-gat2')}, "
-                        f"round={consensus_graph_record.get('transport_round', 1)}, "
-                        f"restriction={consensus_graph_record['dcsi_restriction']}, "
-                        f"rank={consensus_graph_record['dcsi_rank']}, "
-                        f"blocks={consensus_graph_record['dcsi_steps']}, "
-                        f"edge_topk={consensus_graph_record['dcsi_edge_topk']}, "
-                        "mu="
-                        f"{consensus_graph_record['dcsi_consensus_mix']:.3f}/"
-                        f"{consensus_graph_record['dcsi_conflict_mix']:.3f}, "
-                        "gamma="
-                        f"{consensus_graph_record['dcsi_semantic_gamma']:.3f}/"
-                        f"{consensus_graph_record['dcsi_conflict_gamma']:.3f}, "
-                        "gate="
-                        f"{consensus_graph_record['dcsi_h_gate_mean']:.3f}/"
-                        f"{consensus_graph_record['dcsi_l_gate_mean']:.3f}, "
-                        "entropy="
-                        f"{consensus_graph_record['dcsi_attention_entropy']:.3f}, "
-                        "energy="
-                        f"{consensus_graph_record['sheaf_energy_mean']:.4f}"
-                    )
-                elif (
-                    consensus_graph_record.get("transport_operator")
-                    == "sheaf"
-                ):
-                    print(
-                        "  C-sheaf: "
-                        f"stage={consensus_graph_record.get('transport_stage', 'post-gat2')}, "
-                        f"round={consensus_graph_record.get('transport_round', 1)}, "
-                        f"restriction={consensus_graph_record['sheaf_restriction']}, "
-                        f"rank={consensus_graph_record['sheaf_rank']}, "
-                        f"steps={consensus_graph_record['sheaf_steps']}, "
-                        "alpha="
-                        f"{consensus_graph_record['sheaf_alpha_h']:.4f}/"
-                        f"{consensus_graph_record['sheaf_alpha_l']:.4f}, "
-                        "energy="
-                        f"{consensus_graph_record['sheaf_energy_mean']:.4f}"
-                    )
-                else:
-                    fusion_mode = consensus_graph_record.get(
-                        "fusion_mode",
-                        "unknown",
-                    )
-                    fusion_suffix = ""
-                    transport_mode = consensus_graph_record.get(
-                        "transport_mode",
-                        "none",
-                    )
-                    if transport_mode == "bidirectional":
-                        fusion_mode = "bidirectional-transport"
-                        transport_fusion = consensus_graph_record.get(
-                            "transport_fusion",
-                            "residual",
-                        )
-                        transport_message = consensus_graph_record.get(
-                            "transport_message",
-                            "fixed",
-                        )
-                        if transport_fusion == "tri-gate":
-                            h_tri = np.asarray(
-                                consensus_graph_record[
-                                    "h_tri_gate_mean"
-                                ]
-                            )
-                            l_tri = np.asarray(
-                                consensus_graph_record[
-                                    "l_tri_gate_mean"
-                                ]
-                            )
-                            gate_text = (
-                                f"tri={h_tri.round(2).tolist()}/"
-                                f"{l_tri.round(2).tolist()}"
-                            )
-                        elif transport_fusion == "concat":
-                            gate_text = (
-                                "concat_delta="
-                                f"{consensus_graph_record['h_concat_delta_norm']:.4f}/"
-                                f"{consensus_graph_record['l_concat_delta_norm']:.4f}"
-                            )
-                        elif transport_fusion == "bilinear":
-                            gate_text = (
-                                "bilinear_delta="
-                                f"{consensus_graph_record['h_concat_delta_norm']:.4f}/"
-                                f"{consensus_graph_record['l_concat_delta_norm']:.4f}"
-                                ", product="
-                                f"{consensus_graph_record['h_bilinear_product_norm']:.4f}/"
-                                f"{consensus_graph_record['l_bilinear_product_norm']:.4f}"
-                            )
-                        else:
-                            gate_text = (
-                                "gates="
-                                f"{consensus_graph_record['h_transport_gate_mean']:.4f}/"
-                                f"{consensus_graph_record['l_transport_gate_mean']:.4f}"
-                            )
-                        fusion_suffix = (
-                            ", stage="
-                            f"{consensus_graph_record.get('transport_stage', 'post-gat2')}"
-                            ", round="
-                            f"{consensus_graph_record.get('transport_round', 1)}"
-                            ", lambda="
-                            f"{consensus_graph_record['transport_lambda']:.2f}"
-                            ", mode="
-                            f"{transport_fusion}"
-                            ", msg="
-                            f"{transport_message}"
-                            ", h_gamma="
-                            f"{consensus_graph_record['h_transport_gamma']:.4f}"
-                            ", l_gamma="
-                            f"{consensus_graph_record['l_transport_gamma']:.4f}"
-                            ", "
-                            f"{gate_text}"
-                        )
-                    elif "residual_gamma" in consensus_graph_record:
-                        fusion_suffix = (
-                            ", residual="
-                            f"{consensus_graph_record['residual_gamma']:.4f}"
-                            ", gate="
-                            f"{consensus_graph_record.get('residual_gate_mean', 0.0):.4f}"
-                        )
-                    elif "fixed_weights" in consensus_graph_record:
-                        fixed_weights = np.asarray(
-                            consensus_graph_record["fixed_weights"]
-                        )
-                        fusion_suffix = (
-                            ", weights="
-                            f"{fixed_weights.round(2).tolist()}"
-                        )
-                    elif "gate_mean" in consensus_graph_record:
-                        gate_mean = np.asarray(
-                            consensus_graph_record["gate_mean"]
-                        )
-                        fusion_suffix = (
-                            ", gate="
-                            f"{gate_mean.round(2).tolist()}"
-                        )
-                    print(
-                        "  C-mediator: "
-                        f"gamma={consensus_graph_record['c_gamma']:.4f}, "
-                        f"entropy={consensus_graph_record['attention_cc_entropy']:.4f}, "
-                        f"fusion={fusion_mode}{fusion_suffix}"
-                    )
+            if consensus_token_record is not None:
+                view_weights = np.asarray(
+                    consensus_token_record["view_weights"]
+                )
+                print(
+                    "  Consensus token: "
+                    f"K={consensus_token_record['token_count']}, "
+                    f"gate={consensus_token_record['fusion_gate']:.4f}, "
+                    f"view={view_weights.round(2).tolist()}, "
+                    f"loss={consensus_token_record['weighted_loss']:.4f}, "
+                    f"ce={consensus_token_record['token_ce']:.4f}, "
+                    f"agree={consensus_token_record['agreement_loss']:.4f}, "
+                    f"usage={consensus_token_record['usage_loss']:.4f}, "
+                    "jsd="
+                    f"{consensus_token_record['h_jsd_mean']:.4f}/"
+                    f"{consensus_token_record['l_jsd_mean']:.4f}, "
+                    f"usage-ent={consensus_token_record['usage_entropy']:.4f}"
+                )
     training_time = time.perf_counter() - start_time
     model.load_state_dict(best_state)
     model.eval()
@@ -7110,6 +6220,33 @@ def train_one_run(
         truth,
         predictions,
     )
+    bcq_final_node_diagnostics = None
+    bcq_module = getattr(model, "bcq_branch", None)
+    if bcq_module is not None:
+        h_jsd = getattr(bcq_module, "last_h_jsd", None)
+        l_jsd = getattr(bcq_module, "last_l_jsd", None)
+        h_anchor_usage = getattr(bcq_module, "last_h_anchor_usage", None)
+        l_anchor_usage = getattr(bcq_module, "last_l_anchor_usage", None)
+        if h_jsd is not None and l_jsd is not None:
+            bcq_final_node_diagnostics = {
+                "node_order": (
+                    "superpixel node indices in hsi_assignment and "
+                    "lidar_assignment"
+                ),
+                "h_jsd": h_jsd.detach().cpu().tolist(),
+                "l_jsd": l_jsd.detach().cpu().tolist(),
+                "h_anchor_usage": (
+                    h_anchor_usage.detach().cpu().tolist()
+                    if h_anchor_usage is not None
+                    else None
+                ),
+                "l_anchor_usage": (
+                    l_anchor_usage.detach().cpu().tolist()
+                    if l_anchor_usage is not None
+                    else None
+                ),
+                "diagnostics": bcq_module.diagnostics(),
+            }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_stem = (
@@ -7117,12 +6254,17 @@ def train_one_run(
         f"{STAGE}_{args.graph_layout}_"
         f"lidar-{args.lidar_segmentation}_"
         f"prior-{args.lidar_graph_prior}_"
-        f"{consensus_graph_configuration_tag(args, class_count)}_"
-        f"{topology_rewiring_configuration_tag(args)}_"
+        f"{dta_configuration_tag(args)}_"
+        f"{assignment_graph_configuration_tag(args)}_"
         f"{cross_overlap_configuration_tag(args)}_"
+        f"{bcq_configuration_tag(args)}_"
+        f"{consensus_token_configuration_tag(args)}_"
+        f"{overlap_distill_configuration_tag(args)}_"
+        f"{evidence_fusion_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
         f"{cnn_configuration_tag(args)}_"
         f"lidarmod-{args.lidar_modulation}_"
+        f"{seed_configuration_tag(args)}_"
         f"{dummy_logit_configuration_tag(args, class_count)}_"
         f"run{run_index + 1}"
     )
@@ -7146,13 +6288,15 @@ def train_one_run(
         "classifier_output_dim": classifier_output_dim,
         "real_class_count": class_count,
         "dummy_logit_count": classifier_output_dim - class_count,
-        "consensus_graph_diagnostics": (
-            consensus_graph_diagnostics
-        ),
-        "topology_rewiring_diagnostics": (
-            topology_rewiring_diagnostics
-        ),
+        "dta_diagnostics": dta_diagnostics,
+        "dta_film_diagnostics": dta_film_diagnostics,
+        "assignment_graph_diagnostics": assignment_graph_diagnostics,
         "cross_overlap_diagnostics": cross_overlap_diagnostics,
+        "bcq_diagnostics": bcq_diagnostics,
+        "consensus_token_diagnostics": consensus_token_diagnostics,
+        "bcq_final_node_diagnostics": bcq_final_node_diagnostics,
+        "overlap_distill_diagnostics": overlap_distill_diagnostics,
+        "evidence_fusion_diagnostics": evidence_fusion_diagnostics,
     }
 
 
@@ -7169,117 +6313,59 @@ def normalize_joint_layout_args(args):
             setattr(args, attribute, default)
 
     reset_if_needed(
-        "post_gat_consensus_graph",
+        "dual_transport_arbitration",
         "none",
-        "--post-gat-consensus-graph",
+        "--dual-transport-arbitration",
     )
+    reset_if_needed("dta_dk", 64, "--dta-dk")
+    reset_if_needed("dta_tau", 0.1, "--dta-tau")
+    reset_if_needed("dta_gamma_init", 0.0, "--dta-gamma-init")
+    reset_if_needed("dta_variant", "simple", "--dta-variant")
+    reset_if_needed("dta_nonlocal_topk", 10, "--dta-nonlocal-topk")
+    reset_if_needed("dta_normalization", "sinkhorn", "--dta-normalization")
+    reset_if_needed("dta_sinkhorn_iters", 5, "--dta-sinkhorn-iters")
+    reset_if_needed("dta_film", False, "--dta-film")
+    reset_if_needed("dta_film_ds", 64, "--dta-film-ds")
     reset_if_needed(
-        "consensus_graph_transport",
-        "none",
-        "--consensus-graph-transport",
-    )
-    reset_if_needed(
-        "consensus_graph_transport_stage",
-        "post-gat2",
-        "--consensus-graph-transport-stage",
-    )
-    reset_if_needed(
-        "consensus_graph_transport_operator",
-        "transport",
-        "--consensus-graph-transport-operator",
-    )
-    reset_if_needed(
-        "consensus_graph_transport_fusion",
-        "residual",
-        "--consensus-graph-transport-fusion",
-    )
-    reset_if_needed(
-        "consensus_graph_transport_message",
-        "fixed",
-        "--consensus-graph-transport-message",
-    )
-    reset_if_needed(
-        "consensus_graph_transport_second_gamma_init",
+        "dta_film_gamma_init",
         0.0,
-        "--consensus-graph-transport-second-gamma-init",
-    )
-    reset_if_needed("sheaf_restriction", "diag", "--sheaf-restriction")
-    reset_if_needed("sheaf_rank", 4, "--sheaf-rank")
-    reset_if_needed("sheaf_steps", 1, "--sheaf-steps")
-    reset_if_needed("sheaf_energy_weight", 0.0, "--sheaf-energy-weight")
-    reset_if_needed("dcsi_edge_topk", 8, "--dcsi-edge-topk")
-    reset_if_needed("dcsi_consensus_mix", 0.1, "--dcsi-consensus-mix")
-    reset_if_needed("dcsi_conflict_mix", 0.1, "--dcsi-conflict-mix")
-    reset_if_needed(
-        "dcsi_semantic_gamma_init",
-        0.1,
-        "--dcsi-semantic-gamma-init",
+        "--dta-film-gamma-init",
     )
     reset_if_needed(
-        "dcsi_conflict_gamma_init",
+        "dta_aux_sparse_weight",
         0.05,
-        "--dcsi-conflict-gamma-init",
-    )
-    reset_if_needed("cgsa_alpha_max", 2.0, "--cgsa-alpha-max")
-    reset_if_needed(
-        "cgsa_consensus_channel",
-        False,
-        "--cgsa-consensus-channel",
+        "--dta-aux-sparse-weight",
     )
     reset_if_needed(
-        "consensus_graph_cell_edge",
-        "binary",
-        "--consensus-graph-cell-edge",
+        "dta_aux_align_weight",
+        0.10,
+        "--dta-aux-align-weight",
     )
     reset_if_needed(
-        "topology_rewiring",
-        "none",
-        "--topology-rewiring",
+        "dta_aux_entropy_weight",
+        0.01,
+        "--dta-aux-entropy-weight",
+    )
+    reset_if_needed("assignment_graph", "none", "--assignment-graph")
+    reset_if_needed(
+        "assignment_graph_topk",
+        8,
+        "--assignment-graph-topk",
     )
     reset_if_needed(
-        "topology_advocacy_k",
-        0,
-        "--topology-advocacy-k",
-    )
-    reset_if_needed(
-        "topology_advocacy_rag_hops",
-        2,
-        "--topology-advocacy-rag-hops",
-    )
-    reset_if_needed(
-        "topology_audit_side",
-        "both",
-        "--topology-audit-side",
-    )
-    reset_if_needed(
-        "topology_evidence",
-        "learned",
-        "--topology-evidence",
-    )
-    reset_if_needed(
-        "topology_impurity_mode",
-        "target",
-        "--topology-impurity-mode",
-    )
-    reset_if_needed(
-        "topology_freeze_advocacy",
-        False,
-        "--topology-freeze-advocacy",
-    )
-    reset_if_needed(
-        "topology_veto_init",
+        "assignment_graph_gamma_init",
         0.0,
-        "--topology-veto-init",
+        "--assignment-graph-gamma-init",
     )
     reset_if_needed(
-        "topology_advocacy_init",
-        0.0,
-        "--topology-advocacy-init",
+        "assignment_graph_output",
+        "writeback",
+        "--assignment-graph-output",
     )
     reset_if_needed(
-        "topology_impurity_init",
-        0.0,
-        "--topology-impurity-init",
+        "assignment_graph_weight",
+        0.1,
+        "--assignment-graph-weight",
     )
     reset_if_needed(
         "cross_overlap_relation",
@@ -7322,6 +6408,105 @@ def normalize_joint_layout_args(args):
         "--cross-overlap-second-gamma-init",
     )
     reset_if_needed(
+        "cross_overlap_min_coverage",
+        0.0,
+        "--cross-overlap-min-coverage",
+    )
+    reset_if_needed(
+        "cross_overlap_iou_topk",
+        0,
+        "--cross-overlap-iou-topk",
+    )
+    reset_if_needed(
+        "cross_overlap_fragmentation_alpha",
+        0.0,
+        "--cross-overlap-fragmentation-alpha",
+    )
+    reset_if_needed(
+        "overlap_distill_weight",
+        0.0,
+        "--overlap-distill-weight",
+    )
+    reset_if_needed(
+        "overlap_distill_temperature",
+        2.0,
+        "--overlap-distill-temperature",
+    )
+    reset_if_needed(
+        "overlap_distill_iou_threshold",
+        0.3,
+        "--overlap-distill-iou-threshold",
+    )
+    reset_if_needed(
+        "overlap_distill_margin",
+        0.1,
+        "--overlap-distill-margin",
+    )
+    reset_if_needed(
+        "overlap_distill_warmup_ratio",
+        0.2,
+        "--overlap-distill-warmup-ratio",
+    )
+    reset_if_needed(
+        "overlap_distill_confidence",
+        "max-prob",
+        "--overlap-distill-confidence",
+    )
+    reset_if_needed("evidence_fusion", "none", "--evidence-fusion")
+    reset_if_needed("edl_kl_weight", 0.1, "--edl-kl-weight")
+    reset_if_needed("edl_anneal_ratio", 0.5, "--edl-anneal-ratio")
+    reset_if_needed("bcq_interaction", "none", "--bcq-interaction")
+    reset_if_needed("bcq_anchor_ratio", 4, "--bcq-anchor-ratio")
+    reset_if_needed("bcq_anchor_topk", 8, "--bcq-anchor-topk")
+    reset_if_needed("bcq_anchor_dk", 32, "--bcq-anchor-dk")
+    reset_if_needed("bcq_conflict_alpha", 2.0, "--bcq-conflict-alpha")
+    reset_if_needed("bcq_gamma_init", 0.0, "--bcq-gamma-init")
+    reset_if_needed(
+        "consensus_token_fusion",
+        "none",
+        "--consensus-token-fusion",
+    )
+    reset_if_needed(
+        "consensus_token_ratio",
+        4,
+        "--consensus-token-ratio",
+    )
+    reset_if_needed(
+        "consensus_token_heads",
+        4,
+        "--consensus-token-heads",
+    )
+    reset_if_needed(
+        "consensus_token_topk",
+        0,
+        "--consensus-token-topk",
+    )
+    reset_if_needed(
+        "consensus_token_tau",
+        1.0,
+        "--consensus-token-tau",
+    )
+    reset_if_needed(
+        "consensus_token_ce_weight",
+        0.4,
+        "--consensus-token-ce-weight",
+    )
+    reset_if_needed(
+        "consensus_token_agreement_weight",
+        0.1,
+        "--consensus-token-agreement-weight",
+    )
+    reset_if_needed(
+        "consensus_token_usage_weight",
+        0.01,
+        "--consensus-token-usage-weight",
+    )
+    reset_if_needed(
+        "consensus_token_fusion_gate_init",
+        0.0,
+        "--consensus-token-fusion-gate-init",
+    )
+    reset_if_needed(
         "lidar_graph_prior",
         "centroid",
         "--lidar-graph-prior",
@@ -7347,6 +6532,14 @@ def validate_args(args):
     normalize_joint_layout_args(args)
     if args.cross_overlap_stage in ("post-gat", "postgat"):
         args.cross_overlap_stage = "post-gat2"
+    if args.dual_transport_arbitration in ("post-gat", "postgat"):
+        args.dual_transport_arbitration = "post-gat2"
+    if args.assignment_graph in ("post-gat", "postgat"):
+        args.assignment_graph = "post-gat2"
+    if args.bcq_interaction in ("post-gat", "postgat"):
+        args.bcq_interaction = "post-gat2"
+    if args.consensus_token_fusion in ("post-gat", "postgat"):
+        args.consensus_token_fusion = "post-gat2"
     if args.train_samples_per_class <= 0:
         raise ValueError("--train-samples-per-class must be positive.")
     if args.epochs <= 0 or args.runs <= 0:
@@ -7367,126 +6560,51 @@ def validate_args(args):
         raise ValueError("Dynamic tau and spatial prior k must be positive.")
     if args.lidar_height_knn_k <= 0:
         raise ValueError("--lidar-height-knn-k must be positive.")
-    if args.topology_advocacy_k < 0:
-        raise ValueError("--topology-advocacy-k must be nonnegative.")
-    if args.topology_advocacy_rag_hops not in (1, 2):
-        raise ValueError("--topology-advocacy-rag-hops must be 1 or 2.")
-    if args.bridge_attention_dk <= 0:
-        raise ValueError("--bridge-attention-dk must be positive.")
-    if args.bridge_attention_topk <= 0:
-        raise ValueError("--bridge-attention-topk must be positive.")
-    if not 0.0 <= args.consensus_graph_weight <= 1.0:
+    if args.dta_dk <= 0:
+        raise ValueError("--dta-dk must be positive.")
+    if args.dta_tau <= 0:
+        raise ValueError("--dta-tau must be positive.")
+    if args.dta_gamma_init < 0:
+        raise ValueError("--dta-gamma-init must be nonnegative.")
+    if args.dta_nonlocal_topk < 0:
+        raise ValueError("--dta-nonlocal-topk must be nonnegative.")
+    if args.dta_sinkhorn_iters <= 0:
+        raise ValueError("--dta-sinkhorn-iters must be positive.")
+    if args.dta_film_ds <= 0:
+        raise ValueError("--dta-film-ds must be positive.")
+    if args.dta_film_ds > args.hidden_dim:
+        raise ValueError("--dta-film-ds must be <= --hidden-dim.")
+    if args.dta_film_gamma_init < 0:
+        raise ValueError("--dta-film-gamma-init must be nonnegative.")
+    if args.dta_aux_sparse_weight < 0:
+        raise ValueError("--dta-aux-sparse-weight must be nonnegative.")
+    if args.dta_aux_align_weight < 0:
+        raise ValueError("--dta-aux-align-weight must be nonnegative.")
+    if args.dta_aux_entropy_weight < 0:
+        raise ValueError("--dta-aux-entropy-weight must be nonnegative.")
+    if args.assignment_graph_topk <= 0:
+        raise ValueError("--assignment-graph-topk must be positive.")
+    if args.assignment_graph_gamma_init < 0:
         raise ValueError(
-            "--consensus-graph-weight must be between 0 and 1."
+            "--assignment-graph-gamma-init must be nonnegative."
         )
-    if args.consensus_graph_residual_init < 0:
+    if not 0.0 <= args.assignment_graph_weight <= 1.0:
+        raise ValueError("--assignment-graph-weight must be in [0, 1].")
+    if args.cross_overlap_min_coverage < 0:
         raise ValueError(
-            "--consensus-graph-residual-init must be nonnegative."
+            "--cross-overlap-min-coverage must be nonnegative."
         )
-    if args.consensus_graph_c_gamma_init < 0:
+    if args.cross_overlap_iou_topk < 0:
+        raise ValueError("--cross-overlap-iou-topk must be nonnegative.")
+    if args.cross_overlap_fragmentation_alpha < 0:
         raise ValueError(
-            "--consensus-graph-c-gamma-init must be nonnegative."
+            "--cross-overlap-fragmentation-alpha must be nonnegative."
         )
-    if not 0.0 <= args.consensus_graph_transport_lambda <= 1.0:
-        raise ValueError(
-            "--consensus-graph-transport-lambda must be between 0 and 1."
-        )
-    if args.consensus_graph_transport_gamma_init < 0:
-        raise ValueError(
-            "--consensus-graph-transport-gamma-init must be nonnegative."
-        )
-    if args.consensus_graph_transport_second_gamma_init < 0:
-        raise ValueError(
-            "--consensus-graph-transport-second-gamma-init must be "
-            "nonnegative."
-        )
-    if args.consensus_graph_transport_prior_weight < 0:
-        raise ValueError(
-            "--consensus-graph-transport-prior-weight must be nonnegative."
-        )
-    if args.sheaf_rank <= 0:
-        raise ValueError("--sheaf-rank must be positive.")
-    if args.sheaf_steps <= 0:
-        raise ValueError("--sheaf-steps must be positive.")
-    if args.sheaf_energy_weight < 0:
-        raise ValueError("--sheaf-energy-weight must be nonnegative.")
-    if args.dcsi_edge_topk <= 0:
-        raise ValueError("--dcsi-edge-topk must be positive.")
-    if args.dcsi_consensus_mix < 0 or args.dcsi_conflict_mix < 0:
-        raise ValueError("DCSI mix values must be nonnegative.")
-    if (
-        args.dcsi_semantic_gamma_init < 0
-        or args.dcsi_conflict_gamma_init < 0
-    ):
-        raise ValueError("DCSI gamma init values must be nonnegative.")
-    if args.cgsa_alpha_max <= 0:
-        raise ValueError("--cgsa-alpha-max must be positive.")
-    if any(
-        weight < 0
-        for weight in (
-            args.consensus_graph_spatial_prior_weight,
-            args.consensus_graph_hsi_prior_weight,
-            args.consensus_graph_lidar_prior_weight,
-        )
-    ):
-        raise ValueError(
-            "Consensus graph prior weights must be nonnegative."
-        )
-    if any(
-        weight < 0
-        for weight in (
-            args.cell_sam_weight,
-            args.cell_height_weight,
-            args.cell_boundary_weight,
-            args.cell_conflict_weight,
-        )
-    ):
-        raise ValueError("Mediator cell edge weights must be nonnegative.")
-    if (
-        args.consensus_graph_cell_edge != "binary"
-        and args.post_gat_consensus_graph != "intersection-mediator"
-    ):
-        raise ValueError(
-            "--consensus-graph-cell-edge spectral-height-boundary "
-            "requires --post-gat-consensus-graph "
-            "intersection-mediator."
-        )
-    if args.topology_rewiring != "none":
-        if args.graph_layout != "separate":
-            raise ValueError(
-                "--topology-rewiring requires --graph-layout separate."
-            )
-        if len(args.scales) != 1:
-            raise ValueError(
-                "--topology-rewiring uses common-refinement cells "
-                "and requires exactly one superpixel scale."
-            )
-        if args.post_gat_consensus_graph != "none":
-            raise ValueError(
-                "--topology-rewiring treats intersection cells as a "
-                "cross-modal topology auditor; do not enable "
-                "--post-gat-consensus-graph at the same time."
-            )
-        if args.consensus_graph_transport != "none":
-            raise ValueError(
-                "--topology-rewiring is mutually exclusive with "
-                "--consensus-graph-transport."
-            )
     if args.cross_overlap_relation != "none":
         if args.graph_layout != "separate":
             raise ValueError(
                 "--cross-overlap-relation sparse requires "
                 "--graph-layout separate."
-            )
-        if args.post_gat_consensus_graph != "none":
-            raise ValueError(
-                "--cross-overlap-relation sparse does not create C nodes; "
-                "do not enable --post-gat-consensus-graph at the same time."
-            )
-        if args.consensus_graph_transport != "none":
-            raise ValueError(
-                "--cross-overlap-relation sparse is mutually exclusive with "
-                "--consensus-graph-transport."
             )
         if args.cross_overlap_prior_weight < 0:
             raise ValueError(
@@ -7513,62 +6631,134 @@ def validate_args(args):
             "--cross-overlap-edge-attrs physical requires "
             "--cross-overlap-relation sparse."
         )
-    if args.post_gat_consensus_graph != "none":
+    if args.dual_transport_arbitration != "none":
         if args.graph_layout != "separate":
             raise ValueError(
-                "--post-gat-consensus-graph requires "
+                "--dual-transport-arbitration requires "
                 "--graph-layout separate."
             )
-        if len(args.scales) != 1:
+        if args.cross_overlap_relation != "none":
             raise ValueError(
-                "--post-gat-consensus-graph intersection-mediator "
-                "requires exactly one superpixel scale."
+                "--dual-transport-arbitration uses the same overlap "
+                "support and is mutually exclusive with "
+                "--cross-overlap-relation sparse."
             )
-    elif args.consensus_graph_transport != "none":
+    elif args.dta_film:
+        raise ValueError("--dta-film requires --dual-transport-arbitration.")
+    if args.assignment_graph != "none":
+        if args.graph_layout != "separate":
+            raise ValueError(
+                "--assignment-graph requires --graph-layout separate."
+            )
+        if args.dual_transport_arbitration != "none":
+            raise ValueError(
+                "--assignment-graph and --dual-transport-arbitration "
+                "are separate post-GAT2 interaction ablations."
+            )
+        if args.cross_overlap_relation != "none":
+            raise ValueError(
+                "--assignment-graph and --cross-overlap-relation sparse "
+                "are separate interaction ablations."
+            )
+        if args.bcq_interaction != "none":
+            raise ValueError(
+                "--assignment-graph and --bcq-interaction are separate "
+                "post-GAT2 interaction ablations."
+            )
+        if args.consensus_token_fusion != "none":
+            raise ValueError(
+                "--assignment-graph and --consensus-token-fusion are "
+                "separate post-GAT2 interaction ablations."
+            )
+    if args.overlap_distill_weight < 0:
+        raise ValueError("--overlap-distill-weight must be nonnegative.")
+    if args.overlap_distill_temperature <= 0:
+        raise ValueError("--overlap-distill-temperature must be positive.")
+    if args.overlap_distill_iou_threshold < 0:
         raise ValueError(
-            "--consensus-graph-transport requires "
-            "--post-gat-consensus-graph intersection-mediator."
+            "--overlap-distill-iou-threshold must be nonnegative."
         )
-    if (
-        args.consensus_graph_transport == "none"
-        and args.consensus_graph_transport_stage != "post-gat2"
-    ):
+    if args.overlap_distill_margin < 0:
+        raise ValueError("--overlap-distill-margin must be nonnegative.")
+    if not 0.0 <= args.overlap_distill_warmup_ratio < 1.0:
         raise ValueError(
-            "--consensus-graph-transport-stage inter-gat/alternating "
-            "requires --consensus-graph-transport bidirectional."
+            "--overlap-distill-warmup-ratio must be in [0, 1)."
         )
-    if (
-        args.consensus_graph_transport == "none"
-        and args.consensus_graph_transport_fusion != "residual"
-    ):
+    if args.overlap_distill_weight > 0 and args.graph_layout != "separate":
         raise ValueError(
-            "--consensus-graph-transport-fusion tri-gate/concat/bilinear "
-            "requires --consensus-graph-transport bidirectional."
+            "--overlap-distill-weight requires --graph-layout separate."
         )
-    if (
-        args.consensus_graph_transport == "none"
-        and args.consensus_graph_transport_message != "fixed"
-    ):
+    if args.bcq_anchor_ratio <= 0:
+        raise ValueError("--bcq-anchor-ratio must be positive.")
+    if args.bcq_anchor_topk <= 0:
+        raise ValueError("--bcq-anchor-topk must be positive.")
+    if args.bcq_anchor_dk <= 0:
+        raise ValueError("--bcq-anchor-dk must be positive.")
+    if args.bcq_conflict_alpha < 0:
+        raise ValueError("--bcq-conflict-alpha must be nonnegative.")
+    if args.bcq_gamma_init < 0:
+        raise ValueError("--bcq-gamma-init must be nonnegative.")
+    if args.consensus_token_ratio <= 0:
+        raise ValueError("--consensus-token-ratio must be positive.")
+    if args.consensus_token_heads <= 0:
+        raise ValueError("--consensus-token-heads must be positive.")
+    if args.hidden_dim % args.consensus_token_heads != 0:
         raise ValueError(
-            "--consensus-graph-transport-message qk-prior requires "
-            "--consensus-graph-transport bidirectional."
+            "--hidden-dim must be divisible by --consensus-token-heads."
         )
-    if (
-        args.consensus_graph_transport == "none"
-        and args.consensus_graph_transport_operator != "transport"
-    ):
+    if args.consensus_token_topk < 0:
+        raise ValueError("--consensus-token-topk must be nonnegative.")
+    if args.consensus_token_tau <= 0:
+        raise ValueError("--consensus-token-tau must be positive.")
+    if args.consensus_token_ce_weight < 0:
         raise ValueError(
-            "--consensus-graph-transport-operator sheaf/dcsi/cgsa requires "
-            "--consensus-graph-transport bidirectional."
+            "--consensus-token-ce-weight must be nonnegative."
         )
-    if (
-        args.consensus_graph_transport_operator
-        in ("sheaf", "dcsi", "cgsa")
-        and args.post_gat_consensus_graph != "intersection-mediator"
-    ):
+    if args.consensus_token_agreement_weight < 0:
         raise ValueError(
-            "--consensus-graph-transport-operator sheaf/dcsi/cgsa requires "
-            "--post-gat-consensus-graph intersection-mediator."
+            "--consensus-token-agreement-weight must be nonnegative."
+        )
+    if args.consensus_token_usage_weight < 0:
+        raise ValueError(
+            "--consensus-token-usage-weight must be nonnegative."
+        )
+    if args.bcq_interaction != "none":
+        if args.graph_layout != "separate":
+            raise ValueError(
+                "--bcq-interaction requires --graph-layout separate."
+            )
+        if args.cross_overlap_relation != "none":
+            raise ValueError(
+                "--bcq-interaction is mutually exclusive with "
+                "--cross-overlap-relation sparse."
+            )
+        if args.consensus_token_fusion != "none":
+            raise ValueError(
+                "--bcq-interaction and --consensus-token-fusion are "
+                "separate ablations; enable only one."
+            )
+    if args.consensus_token_fusion != "none":
+        if args.graph_layout != "separate":
+            raise ValueError(
+                "--consensus-token-fusion requires --graph-layout separate."
+            )
+        if args.cross_overlap_relation != "none":
+            raise ValueError(
+                "--consensus-token-fusion is mutually exclusive with "
+                "--cross-overlap-relation sparse."
+            )
+        if args.evidence_fusion != "none":
+            raise ValueError(
+                "--consensus-token-fusion currently fuses logits and is "
+                "mutually exclusive with --evidence-fusion."
+            )
+    if args.edl_kl_weight < 0:
+        raise ValueError("--edl-kl-weight must be nonnegative.")
+    if not 0.0 < args.edl_anneal_ratio <= 1.0:
+        raise ValueError("--edl-anneal-ratio must be in (0, 1].")
+    if args.evidence_fusion != "none" and args.graph_layout != "separate":
+        raise ValueError(
+            "--evidence-fusion dirichlet requires --graph-layout separate."
         )
     if args.graph_layout == "joint" and args.cnn_branch != "original":
         raise ValueError(
@@ -7584,20 +6774,6 @@ def validate_args(args):
         raise ValueError(
             "--cnn-share-weights requires --cnn-layout separate."
         )
-    if args.graph_layout == "joint" and args.fdsm_scope != "none":
-        raise ValueError(
-            "--fdsm-scope hsi requires --graph-layout separate."
-        )
-    if args.graph_layout == "joint" and args.lidar_modulation != "none":
-        raise ValueError(
-            "--lidar-modulation requires --graph-layout separate."
-        )
-    if args.hidden_dim <= 0:
-        raise ValueError("--hidden-dim must be positive.")
-    if args.dummy_logit_dim < 0:
-        raise ValueError("--dummy-logit-dim must be nonnegative.")
-    if not 0.0 <= args.dropout < 1.0:
-        raise ValueError("--dropout must be in [0, 1).")
 
 
 def main():
@@ -7643,24 +6819,71 @@ def main():
             f"FDSM={args.fdsm_scope} | "
             f"LiDAR-mod={args.lidar_modulation}"
         )
-        if args.topology_rewiring != "none":
+        if args.dual_transport_arbitration != "none":
+            edge_count = 0
+            if cross_overlap_data is not None:
+                edge_count = cross_overlap_data.get("edge_count", 0)
             print(
-                "Topology rewiring: "
-                f"{args.topology_rewiring} | "
-                f"side={args.topology_audit_side} | "
-                f"evidence={args.topology_evidence} | "
-                f"impurity={args.topology_impurity_mode} | "
-                f"cells={cell_data['cell_count']} | "
-                "veto/advocacy/impurity-init="
-                f"{args.topology_veto_init:g}/"
-                f"{args.topology_advocacy_init:g}/"
-                f"{args.topology_impurity_init:g} | "
-                f"advocacy-k={args.topology_advocacy_k} | "
-                f"advocacy-rag={args.topology_advocacy_rag_hops}hop | "
-                f"freeze-adv={int(args.topology_freeze_advocacy)} | "
-                "mediator disabled"
+                "Dual transport arbitration: "
+                f"{args.dual_transport_arbitration} | "
+                f"variant={args.dta_variant} | "
+                f"d_k={args.dta_dk} | "
+                f"tau={args.dta_tau:g} | "
+                f"gamma-init={args.dta_gamma_init:g} | "
+                f"overlap-edges={edge_count} | "
+                "geometry/semantic transport mixed before readout"
+            )
+            if args.dta_variant == "full":
+                print(
+                    "  DTA full: "
+                    f"nonlocal-topk={args.dta_nonlocal_topk} | "
+                    f"normalization={args.dta_normalization} | "
+                    f"sinkhorn-iters={args.dta_sinkhorn_iters} | "
+                    "aux weights="
+                    f"{args.dta_aux_sparse_weight:g}/"
+                    f"{args.dta_aux_align_weight:g}/"
+                    f"{args.dta_aux_entropy_weight:g}"
+                )
+            if args.dta_film:
+                print(
+                    "  DTA-FiLM: "
+                    f"shared-dim={args.dta_film_ds} | "
+                    f"gamma-init={args.dta_film_gamma_init:g} | "
+                    "conflict-aware shared-subspace modulation"
+                )
+        if args.assignment_graph != "none":
+            edge_count = 0
+            retained_fraction = 1.0
+            if cross_overlap_data is not None:
+                edge_count = cross_overlap_data.get("edge_count", 0)
+                retained_fraction = cross_overlap_data.get(
+                    "retained_edge_fraction",
+                    1.0,
+                )
+            print(
+                "Assignment graph interaction: "
+                f"slot={args.assignment_graph} | "
+                f"topk={args.assignment_graph_topk} | "
+                f"gamma-init={args.assignment_graph_gamma_init:g} | "
+                f"output={args.assignment_graph_output} | "
+                f"weight={args.assignment_graph_weight:g} | "
+                f"assignment-nodes={edge_count}({retained_fraction:.2%}) | "
+                "overlap-restricted SEGMN-style pair graph after GAT2"
             )
         if args.cross_overlap_relation != "none":
+            original_edges = 0
+            retained_edges = 0
+            retained_fraction = 1.0
+            if cross_overlap_data is not None:
+                original_edges = cross_overlap_data.get(
+                    "original_edge_count",
+                    cross_overlap_data.get("edge_count", 0),
+                )
+                retained_edges = cross_overlap_data.get("edge_count", 0)
+                retained_fraction = cross_overlap_data.get(
+                    "retained_edge_fraction",
+                    1.0,
+                )
             print(
                 "Sparse overlap relation: "
                 f"{args.cross_overlap_relation} | "
@@ -7672,127 +6895,92 @@ def main():
                 "gamma-init="
                 f"{args.cross_overlap_gamma_init:g}/"
                 f"{args.cross_overlap_second_gamma_init:g} | "
+                "prune="
+                f"coverage<{args.cross_overlap_min_coverage:g},"
+                f"iou-topk={args.cross_overlap_iou_topk} | "
+                f"frag-alpha={args.cross_overlap_fragmentation_alpha:g} | "
+                f"edges={retained_edges}/{original_edges}"
+                f"({retained_fraction:.2%}) | "
                 "explicit C graph disabled"
             )
-        if args.post_gat_consensus_graph != "none":
-            resolved_mediator_count = cell_data["cell_count"]
-            private_weight = 1.0 - args.consensus_graph_weight
-            if args.consensus_graph_transport == "bidirectional":
-                if args.consensus_graph_transport_operator == "cgsa":
-                    fusion_detail = (
-                        "context-gated sheaf alignment, "
-                        f"stage={args.consensus_graph_transport_stage}, "
-                        f"restriction={args.sheaf_restriction}, "
-                        f"rank={args.sheaf_rank}, "
-                        f"steps={args.sheaf_steps}, "
-                        f"edge-topk={args.dcsi_edge_topk}, "
-                        f"alpha-max={args.cgsa_alpha_max:g}, "
-                        "gamma-init="
-                        f"{args.consensus_graph_transport_gamma_init:g}, "
-                        f"consensus-channel={int(args.cgsa_consensus_channel)}, "
-                        f"lambdaE={args.sheaf_energy_weight:g}; "
-                        "pixel C fusion disabled"
-                    )
-                elif args.consensus_graph_transport_operator == "dcsi":
-                    fusion_detail = (
-                        "dual-channel contextual sheaf interaction, "
-                        f"stage={args.consensus_graph_transport_stage}, "
-                        f"restriction={args.sheaf_restriction}, "
-                        f"rank={args.sheaf_rank}, "
-                        f"blocks={args.sheaf_steps}, "
-                        f"edge-topk={args.dcsi_edge_topk}, "
-                        "mu="
-                        f"{args.dcsi_consensus_mix:g}/"
-                        f"{args.dcsi_conflict_mix:g}, "
-                        "gamma-sem/conf="
-                        f"{args.dcsi_semantic_gamma_init:g}/"
-                        f"{args.dcsi_conflict_gamma_init:g}, "
-                        f"lambdaE={args.sheaf_energy_weight:g}; "
-                        "pixel C fusion disabled"
-                    )
-                elif args.consensus_graph_transport_operator == "sheaf":
-                    fusion_detail = (
-                        "cellular-sheaf diffusion, "
-                        f"stage={args.consensus_graph_transport_stage}, "
-                        f"restriction={args.sheaf_restriction}, "
-                        f"rank={args.sheaf_rank}, "
-                        f"steps={args.sheaf_steps}, "
-                        f"lambdaE={args.sheaf_energy_weight:g}, "
-                        "alpha-init="
-                        f"{args.consensus_graph_transport_gamma_init:g}; "
-                        "pixel C fusion disabled"
-                    )
-                else:
-                    fusion_detail = (
-                        "C-mediated bidirectional transport, "
-                        f"stage={args.consensus_graph_transport_stage}, "
-                        f"fusion={args.consensus_graph_transport_fusion}, "
-                        f"message={args.consensus_graph_transport_message}, "
-                        f"lambda={args.consensus_graph_transport_lambda:g}, "
-                        f"eta={args.consensus_graph_transport_prior_weight:g}, "
-                        "gamma-init="
-                        f"{args.consensus_graph_transport_gamma_init:g}/"
-                        f"{args.consensus_graph_transport_second_gamma_init:g}; "
-                        "pixel C fusion disabled"
-                    )
-            elif args.consensus_graph_fusion == "c-guided-gate":
-                fusion_detail = (
-                    "gate init H/L/C="
-                    f"{private_weight * args.graph_modality_lambda:g}/"
-                    f"{private_weight * (1.0 - args.graph_modality_lambda):g}/"
-                    f"{args.consensus_graph_weight:g}"
-                )
-            elif args.consensus_graph_fusion == "residual-c":
-                fusion_detail = (
-                    "local residual gate, "
-                    f"gamma-init={args.consensus_graph_residual_init:g}"
-                )
-            else:
-                fusion_detail = (
-                    "fixed H/L/C="
-                    f"{private_weight * args.graph_modality_lambda:g}/"
-                    f"{private_weight * (1.0 - args.graph_modality_lambda):g}/"
-                    f"{args.consensus_graph_weight:g}"
+        if args.bcq_interaction != "none":
+            edge_count = 0
+            retained_fraction = 1.0
+            if cross_overlap_data is not None:
+                edge_count = cross_overlap_data.get("edge_count", 0)
+                retained_fraction = cross_overlap_data.get(
+                    "retained_edge_fraction",
+                    1.0,
                 )
             print(
-                "Mediator: "
-                f"{args.post_gat_consensus_graph} | "
-                f"cells={resolved_mediator_count} | "
-                f"edge={args.consensus_graph_cell_edge} | "
-                f"C-QK d_k={args.bridge_attention_dk}, "
-                f"topk={args.bridge_attention_topk} | "
-                f"c-gamma-init={args.consensus_graph_c_gamma_init:g} | "
-                f"alpha S/H/L="
-                f"{args.consensus_graph_spatial_prior_weight:g}/"
-                f"{args.consensus_graph_hsi_prior_weight:g}/"
-                f"{args.consensus_graph_lidar_prior_weight:g} | "
-                f"{fusion_detail}"
+                "BCQ interaction: "
+                f"slot={args.bcq_interaction} | "
+                f"anchors={args.bcq_anchor_ratio}xC | "
+                f"topk={args.bcq_anchor_topk} | "
+                f"d_k={args.bcq_anchor_dk} | "
+                f"alpha={args.bcq_conflict_alpha:g} | "
+                f"gamma-init={args.bcq_gamma_init:g} | "
+                f"overlap-edges={edge_count}({retained_fraction:.2%}) | "
+                "transports membership distributions, not features"
             )
-            if args.consensus_graph_cell_edge == "spectral-height-boundary":
-                weight_stats = cell_data["cell_weight_stats"]
-                print(
-                    "Mediator C-C multimodal edge weights: "
-                    f"min={weight_stats['minimum']:.4f}, "
-                    f"mean={weight_stats['mean']:.4f}, "
-                    f"max={weight_stats['maximum']:.4f}"
+        if args.consensus_token_fusion != "none":
+            edge_count = 0
+            retained_fraction = 1.0
+            if cross_overlap_data is not None:
+                edge_count = cross_overlap_data.get("edge_count", 0)
+                retained_fraction = cross_overlap_data.get(
+                    "retained_edge_fraction",
+                    1.0,
                 )
-                if args.cell_conflict_weight > 0:
-                    conflict_stats = cell_data[
-                        "cell_boundary_conflict_stats"
-                    ]
-                    print(
-                        "HSI/LiDAR boundary conflict: "
-                        f"weight={args.cell_conflict_weight:g}, "
-                        f"min={conflict_stats['minimum']:.4f}, "
-                        f"mean={conflict_stats['mean']:.4f}, "
-                        f"max={conflict_stats['maximum']:.4f}"
-                    )
-        else:
             print(
-                "Mediator: none | graph fusion H/L="
-                f"{args.graph_modality_lambda:g}/"
-                f"{1.0 - args.graph_modality_lambda:g}"
+                "Consensus token fusion: "
+                f"slot={args.consensus_token_fusion} | "
+                f"tokens={args.consensus_token_ratio}xC | "
+                f"heads={args.consensus_token_heads} | "
+                f"topk={args.consensus_token_topk} | "
+                f"tau={args.consensus_token_tau:g} | "
+                "loss="
+                f"ce{args.consensus_token_ce_weight:g}/"
+                f"agree{args.consensus_token_agreement_weight:g}/"
+                f"usage{args.consensus_token_usage_weight:g} | "
+                f"gate-init={args.consensus_token_fusion_gate_init:g} | "
+                f"overlap-edges={edge_count}({retained_fraction:.2%}) | "
+                "logit fusion only, no node writeback"
             )
+        if args.overlap_distill_weight > 0:
+            edge_count = 0
+            if cross_overlap_data is not None:
+                edge_count = cross_overlap_data.get("edge_count", 0)
+            print(
+                "Overlap distillation: "
+                f"weight={args.overlap_distill_weight:g} | "
+                f"T={args.overlap_distill_temperature:g} | "
+                f"IoU>{args.overlap_distill_iou_threshold:g} | "
+                f"margin={args.overlap_distill_margin:g} | "
+                f"warmup={args.overlap_distill_warmup_ratio:g} | "
+                f"confidence={args.overlap_distill_confidence} | "
+                f"edges={edge_count} | "
+                "teacher=confidence winner with stop-grad"
+            )
+        if args.evidence_fusion != "none":
+            edge_count = 0
+            if cross_overlap_data is not None:
+                edge_count = cross_overlap_data.get("edge_count", 0)
+            print(
+                "Evidence decision fusion: "
+                f"{args.evidence_fusion} | "
+                "heads=HSI/LiDAR fc->softplus evidence | "
+                "pixel fusion=Dempster | "
+                f"EDL-kl={args.edl_kl_weight:g} | "
+                f"anneal-ratio={args.edl_anneal_ratio:g} | "
+                f"overlap-conflict-edges={edge_count} | "
+                "CNN classifier bypassed"
+            )
+        print(
+            "Graph fusion H/L="
+            f"{args.graph_modality_lambda:g}/"
+            f"{1.0 - args.graph_modality_lambda:g}"
+        )
     else:
         print(
             "Graph layout: retained concatenated-node joint graph "
@@ -7811,6 +6999,11 @@ def main():
         f"top-k={args.dynamic_topk}, tau={args.dynamic_tau}, "
         f"spatial-prior-k={args.spatial_prior_k}"
     )
+    if args.runs == 1:
+        seed_text = str(args.seed)
+    else:
+        seed_text = f"{args.seed}..{args.seed + args.runs - 1}"
+    print(f"Seed: base={args.seed} | run-seeds={seed_text}")
     classifier_output_dim = (
         class_count
         if args.dummy_logit_dim <= 0
@@ -7876,12 +7069,17 @@ def main():
         f"{STAGE}_{args.graph_layout}_"
         f"lidar-{args.lidar_segmentation}_"
         f"prior-{args.lidar_graph_prior}_"
-        f"{consensus_graph_configuration_tag(args, class_count)}_"
-        f"{topology_rewiring_configuration_tag(args)}_"
+        f"{dta_configuration_tag(args)}_"
+        f"{assignment_graph_configuration_tag(args)}_"
         f"{cross_overlap_configuration_tag(args)}_"
+        f"{bcq_configuration_tag(args)}_"
+        f"{consensus_token_configuration_tag(args)}_"
+        f"{overlap_distill_configuration_tag(args)}_"
+        f"{evidence_fusion_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
         f"{cnn_configuration_tag(args)}_"
         f"lidarmod-{args.lidar_modulation}_"
+        f"{seed_configuration_tag(args)}_"
         f"{dummy_logit_configuration_tag(args, class_count)}_results"
     )
     result_path = args.output_dir / safe_output_filename(
