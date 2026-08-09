@@ -126,6 +126,18 @@ def parse_args():
         help="HSI weight when fusing the two separate graph outputs.",
     )
     parser.add_argument(
+        "--shared-superpixel-fusion",
+        choices=("none", "weighted", "node-cat"),
+        default="none",
+        help=(
+            "Force LiDAR to reuse the exact HSI SLIC partition while "
+            "keeping two independent private graphs. 'weighted' retains "
+            "the existing weighted pixel readout; 'node-cat' concatenates "
+            "the aligned post-GAT2 HSI/LiDAR nodes before projecting them "
+            "back to pixels. Default: none keeps independent partitions."
+        ),
+    )
+    parser.add_argument(
         "--dual-transport-arbitration",
         choices=("none", "post-gat2", "post-gat", "postgat"),
         default="none",
@@ -159,13 +171,33 @@ def parse_args():
     )
     parser.add_argument(
         "--dta-variant",
-        choices=("simple", "full"),
+        choices=("simple", "full", "structural-consensus"),
         default="simple",
         help=(
             "Dual transport arbitration variant. 'simple' keeps semantic "
             "transport on overlap edges only; 'full' adds optional "
             "nonlocal retrieval, Sinkhorn normalization, and auxiliary "
-            "regularization. Default: simple."
+            "regularization; 'structural-consensus' preserves overlap-area "
+            "marginals while combining semantic similarity with projected "
+            "HSI/LiDAR private-graph consensus. Default: simple."
+        ),
+    )
+    parser.add_argument(
+        "--dta-overlap-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Exponent lambda_o of the physical overlap-mass prior in "
+            "structural-consensus DTA. Default: 1.0."
+        ),
+    )
+    parser.add_argument(
+        "--dta-structure-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Exponent lambda_s of A_H T0 A_L^T in structural-consensus "
+            "DTA. Default: 1.0."
         ),
     )
     parser.add_argument(
@@ -180,11 +212,13 @@ def parse_args():
     )
     parser.add_argument(
         "--dta-normalization",
-        choices=("softmax", "sinkhorn"),
+        choices=("softmax", "sinkhorn", "lightglue"),
         default="sinkhorn",
         help=(
             "Semantic transport normalization used by --dta-variant full. "
-            "The simple variant always uses sparse row-softmax. "
+            "'lightglue' uses bidirectional softmax with learned HSI/LiDAR "
+            "node matchability and avoids iterative Sinkhorn. The simple "
+            "variant always uses sparse row-softmax. "
             "Default: sinkhorn."
         ),
     )
@@ -192,7 +226,19 @@ def parse_args():
         "--dta-sinkhorn-iters",
         type=int,
         default=5,
-        help="Sinkhorn iterations for --dta-variant full. Default: 5.",
+        help=(
+            "Sinkhorn iterations for --dta-variant full or "
+            "structural-consensus. Default: 5."
+        ),
+    )
+    parser.add_argument(
+        "--dta-mass-sinkhorn-iters",
+        type=int,
+        default=20,
+        help=(
+            "Area-marginal Sinkhorn iterations for structural-consensus "
+            "DTA. Kept separate from full-DTA iterations. Default: 20."
+        ),
     )
     parser.add_argument(
         "--dta-aux-sparse-weight",
@@ -282,14 +328,45 @@ def parse_args():
     )
     parser.add_argument(
         "--assignment-graph-output",
-        choices=("writeback", "third-branch", "both"),
+        choices=("writeback", "third-branch", "pure-third", "both"),
         default="writeback",
         help=(
             "How the assignment graph contributes after its C-GNN. "
             "'writeback' applies post-GAT2 residual node correction; "
             "'third-branch' projects assignment nodes directly to pixels "
-            "and fuses them with private graph pixels; 'both' does both. "
-            "Default: writeback."
+            "and uses fixed fusion; 'pure-third' keeps both private node "
+            "streams untouched and exposes the consensus pixel stream; "
+            "'both' does writeback and third-branch output. Default: "
+            "writeback."
+        ),
+    )
+    parser.add_argument(
+        "--assignment-graph-pair-detach",
+        action="store_true",
+        help=(
+            "Detach HSI/LiDAR GAT2 parent nodes before constructing overlap-"
+            "pair consensus nodes. The consensus stream still learns, but "
+            "its gradient cannot alter either private graph. Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--assignment-graph-fusion",
+        choices=("fixed", "conflict-gate"),
+        default="fixed",
+        help=(
+            "Pixel fusion for the assignment consensus stream. 'fixed' "
+            "preserves the existing scalar-weight fusion; 'conflict-gate' "
+            "uses an IoU-conflict-aware per-pixel residual gate and requires "
+            "--assignment-graph-output pure-third. Default: fixed."
+        ),
+    )
+    parser.add_argument(
+        "--assignment-graph-gate-hidden",
+        type=int,
+        default=32,
+        help=(
+            "Hidden dimension of assignment conflict-aware pixel gate. "
+            "Default: 32."
         ),
     )
     parser.add_argument(
@@ -298,8 +375,80 @@ def parse_args():
         default=0.1,
         help=(
             "Weight of the assignment third branch when "
-            "--assignment-graph-output is third-branch or both. "
+            "--assignment-graph-fusion is fixed and the output includes "
+            "a third branch. Default: 0.1."
+        ),
+    )
+    parser.add_argument(
+        "--gfm",
+        choices=("none", "post-gat2", "post-gat", "postgat"),
+        default="none",
+        help=(
+            "Graph Functional Map Interaction. It translates post-GAT2 "
+            "node functions between fixed HSI/LiDAR graph spectral bases "
+            "and adds a gated consensus pixel stream without private-node "
+            "writeback. Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--gfm-rank",
+        type=int,
+        default=64,
+        help=(
+            "Total low-frequency spectral rank shared across all scales "
+            "for GFMI. Default: 64."
+        ),
+    )
+    parser.add_argument(
+        "--gfm-detach",
+        action="store_true",
+        help=(
+            "Detach post-GAT2 HSI/LiDAR nodes before GFMI. This keeps the "
+            "consensus stream trainable but prevents its gradients from "
+            "altering either private graph. Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--vcf",
+        choices=("none", "post-gat2", "post-gat", "postgat"),
+        default="none",
+        help=(
+            "Variational Consensus Field. It solves a differentiable "
+            "pixel-field inverse problem from the two post-GAT2 private "
+            "graph observations and adds the solution as a third pixel "
+            "stream without private-node writeback. Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--vcf-dim",
+        type=int,
+        default=64,
+        help="Latent pixel consensus-field dimension. Default: 64.",
+    )
+    parser.add_argument(
+        "--vcf-cg-iters",
+        type=int,
+        default=10,
+        help=(
+            "Number of differentiable conjugate-gradient iterations in "
+            "VCF. Default: 10."
+        ),
+    )
+    parser.add_argument(
+        "--vcf-lambda-init",
+        type=float,
+        default=0.1,
+        help=(
+            "Initial positive spatial-smoothness coefficient in VCF. "
             "Default: 0.1."
+        ),
+    )
+    parser.add_argument(
+        "--vcf-detach",
+        action="store_true",
+        help=(
+            "Detach post-GAT2 private nodes before constructing the VCF "
+            "observation system. Default: off."
         ),
     )
     parser.add_argument(
@@ -466,6 +615,121 @@ def parse_args():
             "edge. 'neg-entropy' is normalized as 1-H(p)/log(C). "
             "Default: max-prob."
         ),
+    )
+    parser.add_argument(
+        "--overlap-distill-credibility",
+        choices=("none", "class-ema"),
+        default="none",
+        help=(
+            "Optional class-conditional teacher calibration for overlap "
+            "distillation. 'class-ema' multiplies node confidence by the "
+            "modality's EMA training accuracy for its predicted class. "
+            "Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--overlap-distill-credibility-momentum",
+        type=float,
+        default=0.9,
+        help=(
+            "EMA momentum for class-conditional HSI/LiDAR credibility. "
+            "Default: 0.9."
+        ),
+    )
+    parser.add_argument(
+        "--overlap-distill-relational-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of overlap-edge relational structure distillation. "
+            "Zero disables it. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--overlap-distill-relational-samples",
+        type=int,
+        default=256,
+        help=(
+            "Maximum number of active overlap edges sampled for the "
+            "relational cosine-structure loss. Default: 256."
+        ),
+    )
+    parser.add_argument(
+        "--pacmt",
+        choices=("none", "soft-kd", "pl", "full"),
+        default="none",
+        help=(
+            "Training-only Physically-Arbitrated Cross-modal Mutual "
+            "Teaching. 'soft-kd' enables physically weighted soft mutual "
+            "distillation, 'pl' enables agreement pseudo labels, and "
+            "'full' enables both. Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--pacmt-alpha-sam",
+        type=float,
+        default=1.0,
+        help="Fixed SAM penalty strength in PACMT edge weights. Default: 1.",
+    )
+    parser.add_argument(
+        "--pacmt-alpha-frag",
+        type=float,
+        default=1.0,
+        help=(
+            "Fixed fragmentation penalty strength in PACMT edge weights. "
+            "Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--pacmt-iou-tau",
+        type=float,
+        default=0.1,
+        help="IoU soft-saturation constant IoU/(IoU+tau). Default: 0.1.",
+    )
+    parser.add_argument(
+        "--pacmt-direction-temperature",
+        type=float,
+        default=0.05,
+        help=(
+            "Temperature of the soft HSI/LiDAR teacher-direction sigmoid. "
+            "Default: 0.05."
+        ),
+    )
+    parser.add_argument(
+        "--pacmt-pl-conf",
+        type=float,
+        default=0.9,
+        help=(
+            "Minimum class-EMA-calibrated confidence of both endpoints "
+            "for PACMT pseudo labels. Default: 0.9."
+        ),
+    )
+    parser.add_argument(
+        "--pacmt-pl-min-weight",
+        type=float,
+        default=0.1,
+        help="Minimum physical edge weight for pseudo labels. Default: 0.1.",
+    )
+    parser.add_argument(
+        "--pacmt-pl-cap",
+        type=int,
+        default=30,
+        help=(
+            "Maximum pseudo-label overlap edges retained per class and "
+            "epoch. Default: 30."
+        ),
+    )
+    parser.add_argument(
+        "--pacmt-kd-weight",
+        type=float,
+        default=0.05,
+        help="Weight of PACMT soft mutual distillation. Default: 0.05.",
+    )
+    parser.add_argument(
+        "--pacmt-pl-weight",
+        type=float,
+        default=0.05,
+        help="Weight of PACMT agreement pseudo-label loss. Default: 0.05.",
     )
     parser.add_argument(
         "--evidence-fusion",
@@ -763,8 +1027,15 @@ def dta_configuration_tag(args):
     if args.dta_variant == "full":
         tag += (
             f"-nl{args.dta_nonlocal_topk}-"
-            f"{args.dta_normalization}-"
-            f"sh{args.dta_sinkhorn_iters}"
+            f"{args.dta_normalization}"
+        )
+        if args.dta_normalization == "sinkhorn":
+            tag += f"-sh{args.dta_sinkhorn_iters}"
+    elif args.dta_variant == "structural-consensus":
+        tag += (
+            f"-ow{args.dta_overlap_weight:g}-"
+            f"sw{args.dta_structure_weight:g}-"
+            f"msh{args.dta_mass_sinkhorn_iters}"
         )
     if args.dta_film:
         tag += (
@@ -777,12 +1048,40 @@ def dta_configuration_tag(args):
 def assignment_graph_configuration_tag(args):
     if args.assignment_graph == "none":
         return "ag-none"
-    return (
+    tag = (
         f"ag-{args.assignment_graph}-"
         f"top{args.assignment_graph_topk}-"
         f"g{args.assignment_graph_gamma_init:g}-"
         f"out{args.assignment_graph_output}-"
-        f"w{args.assignment_graph_weight:g}"
+        f"det{int(args.assignment_graph_pair_detach)}-"
+        f"fu{args.assignment_graph_fusion}"
+    )
+    if args.assignment_graph_fusion == "fixed":
+        tag += f"-w{args.assignment_graph_weight:g}"
+    else:
+        tag += f"-gh{args.assignment_graph_gate_hidden}"
+    return tag
+
+
+def gfm_configuration_tag(args):
+    if args.gfm == "none":
+        return "gfm-none"
+    return (
+        f"gfm-{args.gfm}-"
+        f"r{args.gfm_rank}-"
+        f"det{int(args.gfm_detach)}"
+    )
+
+
+def vcf_configuration_tag(args):
+    if args.vcf == "none":
+        return "vcf-none"
+    return (
+        f"vcf-{args.vcf}-"
+        f"d{args.vcf_dim}-"
+        f"cg{args.vcf_cg_iters}-"
+        f"lam{args.vcf_lambda_init:g}-"
+        f"det{int(args.vcf_detach)}"
     )
 
 
@@ -808,13 +1107,41 @@ def cross_overlap_configuration_tag(args):
 def overlap_distill_configuration_tag(args):
     if args.overlap_distill_weight <= 0:
         return "od-none"
-    return (
+    tag = (
         f"od-w{args.overlap_distill_weight:g}-"
         f"t{args.overlap_distill_temperature:g}-"
         f"iou{args.overlap_distill_iou_threshold:g}-"
         f"m{args.overlap_distill_margin:g}-"
         f"wr{args.overlap_distill_warmup_ratio:g}-"
         f"conf{args.overlap_distill_confidence}"
+    )
+    if args.overlap_distill_credibility != "none":
+        tag += (
+            f"-cred{args.overlap_distill_credibility}-"
+            f"cm{args.overlap_distill_credibility_momentum:g}"
+        )
+    if args.overlap_distill_relational_weight > 0:
+        tag += (
+            f"-rel{args.overlap_distill_relational_weight:g}-"
+            f"rs{args.overlap_distill_relational_samples}"
+        )
+    return tag
+
+
+def pacmt_configuration_tag(args):
+    if args.pacmt == "none":
+        return "pacmt-none"
+    return (
+        f"pacmt-{args.pacmt}-"
+        f"as{args.pacmt_alpha_sam:g}-"
+        f"af{args.pacmt_alpha_frag:g}-"
+        f"it{args.pacmt_iou_tau:g}-"
+        f"dt{args.pacmt_direction_temperature:g}-"
+        f"pc{args.pacmt_pl_conf:g}-"
+        f"pw{args.pacmt_pl_min_weight:g}-"
+        f"cap{args.pacmt_pl_cap}-"
+        f"kd{args.pacmt_kd_weight:g}-"
+        f"pl{args.pacmt_pl_weight:g}"
     )
 
 
@@ -864,6 +1191,12 @@ def cnn_configuration_tag(args):
     return f"cnn-{args.cnn_layout}-{args.cnn_branch}{share_tag}"
 
 
+def shared_superpixel_configuration_tag(args):
+    if args.shared_superpixel_fusion == "none":
+        return "sharedsp-none"
+    return f"sharedsp-{args.shared_superpixel_fusion}"
+
+
 def safe_output_filename(stem, suffix, maximum_bytes=240):
     """Keep experiment filenames below common filesystem limits."""
     filename = f"{stem}{suffix}"
@@ -881,6 +1214,7 @@ def build_modality_superpixel_assignments(
     lidar,
     scales,
     lidar_segmentation,
+    shared_superpixels=False,
 ):
     """Build HSI SLIC and selectable LiDAR region node assignments."""
     height, width, bands = hsi.shape
@@ -898,7 +1232,9 @@ def build_modality_superpixel_assignments(
             sparse_output=True,
         )
         )
-        if lidar_segmentation == "slic":
+        if shared_superpixels:
+            lidar_assignment = hsi_assignments[-1].copy()
+        elif lidar_segmentation == "slic":
             lidar_assignment = get_SLIC_Segs(
                 lidar,
                 scale,
@@ -922,6 +1258,7 @@ def build_modality_superpixel_assignments(
         hsi_assignment,
         lidar_assignment,
         joint_assignment,
+        hsi_assignments,
         lidar_assignments,
     )
 
@@ -1083,6 +1420,209 @@ def build_lidar_rag_height_knn_prior(
         offset += scale_nodes
 
     return constrained_prior, candidate_mask
+
+
+def _allocate_multiscale_spectral_ranks(
+    hsi_assignment_parts,
+    lidar_assignment_parts,
+    requested_rank,
+):
+    """Allocate one shared total spectral rank across paired scales."""
+    if len(hsi_assignment_parts) != len(lidar_assignment_parts):
+        raise ValueError("GFMI requires the same number of HSI/LiDAR scales.")
+    maximum = np.asarray(
+        [
+            min(h_part.shape[1], l_part.shape[1])
+            for h_part, l_part in zip(
+                hsi_assignment_parts,
+                lidar_assignment_parts,
+            )
+        ],
+        dtype=np.int64,
+    )
+    target = min(int(requested_rank), int(maximum.sum()))
+    if target <= 0:
+        raise ValueError("GFMI spectral rank has no available graph modes.")
+    ranks = np.zeros_like(maximum)
+    remaining = target
+    while remaining > 0:
+        progressed = False
+        for scale_index in range(len(ranks)):
+            if ranks[scale_index] >= maximum[scale_index]:
+                continue
+            ranks[scale_index] += 1
+            remaining -= 1
+            progressed = True
+            if remaining == 0:
+                break
+        if not progressed:
+            break
+    return ranks.tolist()
+
+
+def _normalized_laplacian_basis(adjacency, rank, area):
+    adjacency = np.asarray(adjacency, dtype=np.float64)
+    adjacency = np.maximum(
+        0.0,
+        0.5 * (adjacency + adjacency.T),
+    ).astype(np.float64)
+    degree = adjacency.sum(axis=1)
+    laplacian = np.diag(degree) - adjacency
+    mass = np.asarray(area, dtype=np.float64).reshape(-1)
+    if mass.shape[0] != adjacency.shape[0]:
+        raise ValueError(
+            "GFMI node-area vector must match the adjacency size."
+        )
+    inverse_sqrt_mass = 1.0 / np.sqrt(np.maximum(mass, 1.0))
+    symmetric = (
+        inverse_sqrt_mass[:, None]
+        * laplacian
+        * inverse_sqrt_mass[None, :]
+    )
+    symmetric = 0.5 * (symmetric + symmetric.T)
+    eigenvalues, psi = np.linalg.eigh(symmetric)
+    order = np.argsort(eigenvalues)[:rank]
+    basis = inverse_sqrt_mass[:, None] * psi[:, order]
+    return (
+        basis.astype(np.float32),
+        eigenvalues[order].astype(np.float32),
+    )
+
+
+def build_gfm_spectral_data(
+    hsi_assignment_parts,
+    lidar_assignment_parts,
+    height,
+    width,
+    spatial_neighbor_count,
+    lidar_rag_adjacency,
+    overlap_data,
+    requested_rank,
+):
+    """Precompute fixed graph bases and overlap-induced functional map."""
+    if overlap_data is None:
+        raise ValueError("GFMI requires HSI/LiDAR overlap data.")
+    ranks = _allocate_multiscale_spectral_ranks(
+        hsi_assignment_parts,
+        lidar_assignment_parts,
+        requested_rank,
+    )
+    hsi_node_count = sum(part.shape[1] for part in hsi_assignment_parts)
+    lidar_node_count = sum(part.shape[1] for part in lidar_assignment_parts)
+    actual_rank = int(sum(ranks))
+    phi_h = np.zeros((hsi_node_count, actual_rank), dtype=np.float32)
+    phi_l = np.zeros((lidar_node_count, actual_rank), dtype=np.float32)
+    phi_h_proj = np.zeros_like(phi_h)
+    phi_l_proj = np.zeros_like(phi_l)
+    eigenvalues_h = np.zeros(actual_rank, dtype=np.float32)
+    eigenvalues_l = np.zeros(actual_rank, dtype=np.float32)
+    h_offset = 0
+    l_offset = 0
+    spectral_offset = 0
+    for h_part, l_part, scale_rank in zip(
+        hsi_assignment_parts,
+        lidar_assignment_parts,
+        ranks,
+    ):
+        h_count = h_part.shape[1]
+        l_count = l_part.shape[1]
+        h_adjacency = build_superpixel_spatial_prior(
+            h_part,
+            height,
+            width,
+            spatial_neighbor_count,
+        )
+        if lidar_rag_adjacency is None:
+            l_adjacency = build_superpixel_spatial_prior(
+                l_part,
+                height,
+                width,
+                spatial_neighbor_count,
+            )
+        else:
+            l_adjacency = lidar_rag_adjacency[
+                l_offset : l_offset + l_count,
+                l_offset : l_offset + l_count,
+            ]
+        h_area = np.asarray(h_part.sum(axis=0)).reshape(-1)
+        l_area = np.asarray(l_part.sum(axis=0)).reshape(-1)
+        h_basis, h_eigenvalues = _normalized_laplacian_basis(
+            h_adjacency,
+            scale_rank,
+            h_area,
+        )
+        l_basis, l_eigenvalues = _normalized_laplacian_basis(
+            l_adjacency,
+            scale_rank,
+            l_area,
+        )
+        spectral_slice = slice(
+            spectral_offset,
+            spectral_offset + scale_rank,
+        )
+        phi_h[
+            h_offset : h_offset + h_count,
+            spectral_slice,
+        ] = h_basis
+        phi_l[
+            l_offset : l_offset + l_count,
+            spectral_slice,
+        ] = l_basis
+        phi_h_proj[
+            h_offset : h_offset + h_count,
+            spectral_slice,
+        ] = h_area[:, None] * h_basis
+        phi_l_proj[
+            l_offset : l_offset + l_count,
+            spectral_slice,
+        ] = l_area[:, None] * l_basis
+        eigenvalues_h[spectral_slice] = h_eigenvalues
+        eigenvalues_l[spectral_slice] = l_eigenvalues
+        h_offset += h_count
+        l_offset += l_count
+        spectral_offset += scale_rank
+
+    overlap_mass = np.zeros(
+        (hsi_node_count, lidar_node_count),
+        dtype=np.float32,
+    )
+    h_index = np.asarray(overlap_data["h_index"], dtype=np.int64)
+    l_index = np.asarray(overlap_data["l_index"], dtype=np.int64)
+    overlap_mass[h_index, l_index] = np.asarray(
+        overlap_data["overlap"],
+        dtype=np.float32,
+    )
+    transport_prior = overlap_mass / np.maximum(
+        overlap_mass.sum(axis=1, keepdims=True),
+        1e-6,
+    )
+    scale_mask = np.zeros(
+        (actual_rank, actual_rank),
+        dtype=bool,
+    )
+    spectral_offset = 0
+    for scale_rank in ranks:
+        spectral_slice = slice(
+            spectral_offset,
+            spectral_offset + scale_rank,
+        )
+        scale_mask[spectral_slice, spectral_slice] = True
+        spectral_offset += scale_rank
+    c_geo = phi_h_proj.T @ transport_prior @ phi_l
+    c_geo *= scale_mask
+    return {
+        "phi_h": phi_h,
+        "phi_l": phi_l,
+        "phi_h_proj": phi_h_proj,
+        "phi_l_proj": phi_l_proj,
+        "scale_mask": scale_mask,
+        "c_geo": c_geo.astype(np.float32),
+        "eigenvalues_h": eigenvalues_h,
+        "eigenvalues_l": eigenvalues_l,
+        "rank_per_scale": ranks,
+        "requested_rank": int(requested_rank),
+        "actual_rank": actual_rank,
+    }
 
 
 class MaskedDynamicGraphBuilder(DynamicGraphBuilder):
@@ -1270,6 +1810,7 @@ def build_sparse_overlap_relation_data(
         "iou": iou.astype(np.float32),
         "h_area": h_area.astype(np.float32),
         "l_area": l_area.astype(np.float32),
+        "pixel_count": int(hsi_sparse.shape[0]),
         "h_fragmentation": h_fragmentation.astype(np.float32),
         "l_fragmentation": l_fragmentation.astype(np.float32),
         "h_node_count": int(h_node_count),
@@ -1447,7 +1988,7 @@ def build_overlap_distill_tensors(overlap_data, device):
             h_area[h_index] + l_area[l_index] - overlap,
             1e-6,
         )
-    return {
+    tensors = {
         "h_index": torch.as_tensor(
             overlap_data["h_index"],
             dtype=torch.long,
@@ -1460,6 +2001,92 @@ def build_overlap_distill_tensors(overlap_data, device):
         ),
         "iou": torch.as_tensor(iou, dtype=torch.float32, device=device),
     }
+    edge_attributes = overlap_data.get("edge_attributes")
+    edge_attribute_names = overlap_data.get("edge_attribute_names", [])
+    if edge_attributes is not None and "sam" in edge_attribute_names:
+        sam_index = edge_attribute_names.index("sam")
+        tensors["sam"] = torch.as_tensor(
+            np.asarray(edge_attributes, dtype=np.float32)[:, sam_index],
+            dtype=torch.float32,
+            device=device,
+        )
+    h_fragmentation = overlap_data.get("h_fragmentation")
+    l_fragmentation = overlap_data.get("l_fragmentation")
+    if h_fragmentation is not None and l_fragmentation is not None:
+        h_index_numpy = np.asarray(overlap_data["h_index"], dtype=np.int64)
+        l_index_numpy = np.asarray(overlap_data["l_index"], dtype=np.int64)
+        tensors["h_fragmentation"] = torch.as_tensor(
+            np.asarray(h_fragmentation, dtype=np.float32)[h_index_numpy],
+            dtype=torch.float32,
+            device=device,
+        )
+        tensors["l_fragmentation"] = torch.as_tensor(
+            np.asarray(l_fragmentation, dtype=np.float32)[l_index_numpy],
+            dtype=torch.float32,
+            device=device,
+        )
+    return tensors
+
+
+def build_training_node_label_pairs(
+    assignment,
+    train_indices,
+    train_labels,
+    device,
+):
+    """Expand labeled pixels into their per-scale superpixel node labels."""
+    assignment = coo_matrix(assignment, dtype=np.float32).tocsr()
+    selected = assignment[np.asarray(train_indices, dtype=np.int64)]
+    pixel_rows, node_indices = selected.nonzero()
+    labels = np.asarray(train_labels, dtype=np.int64)[pixel_rows]
+    return {
+        "node_index": torch.as_tensor(
+            node_indices,
+            dtype=torch.long,
+            device=device,
+        ),
+        "label": torch.as_tensor(
+            labels,
+            dtype=torch.long,
+            device=device,
+        ),
+    }
+
+
+@torch.no_grad()
+def update_class_credibility_ema(
+    credibility,
+    node_scores,
+    training_pairs,
+    class_count,
+    momentum,
+):
+    """Update modality/class reliability from labeled pixel-node pairs."""
+    predictions = node_scores[:, :class_count].argmax(dim=1)
+    node_predictions = predictions.index_select(
+        0,
+        training_pairs["node_index"],
+    )
+    labels = training_pairs["label"]
+    class_total = torch.bincount(labels, minlength=class_count)
+    class_correct = torch.bincount(
+        labels,
+        weights=(node_predictions == labels).to(credibility.dtype),
+        minlength=class_count,
+    )
+    observed = class_total > 0
+    current_accuracy = class_correct / class_total.clamp_min(1).to(
+        credibility.dtype
+    )
+    current_accuracy = current_accuracy.masked_fill(
+        ~observed,
+        float("nan"),
+    )
+    credibility[observed] = (
+        momentum * credibility[observed]
+        + (1.0 - momentum) * current_accuracy[observed]
+    )
+    return current_accuracy, observed
 
 
 def overlap_distill_ramp(epoch, total_epochs, warmup_ratio):
@@ -1516,6 +2143,9 @@ def confidence_weighted_overlap_distill_loss(
     margin=0.1,
     confidence_mode="max-prob",
     inputs_are_probabilities=False,
+    credibility_h=None,
+    credibility_l=None,
+    return_active_edges=False,
 ):
     """IoU-weighted strong-to-weak KL on HSI/LiDAR overlap edges."""
     if overlap_tensors is None:
@@ -1530,17 +2160,24 @@ def confidence_weighted_overlap_distill_loss(
     mask = edge_iou > iou_threshold
     selected_count = int(mask.detach().sum().item())
     if selected_count == 0:
-        return zero, {
+        diagnostics = {
             "selected_edges": 0,
             "h_to_l_edges": 0,
             "l_to_h_edges": 0,
             "h_to_l_ratio": 0.0,
             "l_to_h_ratio": 0.0,
+            "h_to_l_by_class": [0] * class_count,
+            "l_to_h_by_class": [0] * class_count,
             "mean_iou": 0.0,
             "mean_conf_h": 0.0,
             "mean_conf_l": 0.0,
+            "mean_teacher_score_h": 0.0,
+            "mean_teacher_score_l": 0.0,
             "raw_loss": 0.0,
         }
+        if return_active_edges:
+            return zero, diagnostics, h_index.new_empty((0,))
+        return zero, diagnostics
 
     h_edges = h_index[mask]
     l_edges = l_index[mask]
@@ -1562,8 +2199,21 @@ def confidence_weighted_overlap_distill_loss(
     conf_h = _prediction_confidence(p_h, confidence_mode)
     conf_l = _prediction_confidence(p_l, confidence_mode)
 
-    h_teaches_l = conf_h > conf_l + margin
-    l_teaches_h = conf_l > conf_h + margin
+    predicted_h = p_h.argmax(dim=1)
+    predicted_l = p_l.argmax(dim=1)
+    if credibility_h is None:
+        edge_credibility_h = torch.ones_like(conf_h)
+    else:
+        edge_credibility_h = credibility_h.index_select(0, predicted_h)
+    if credibility_l is None:
+        edge_credibility_l = torch.ones_like(conf_l)
+    else:
+        edge_credibility_l = credibility_l.index_select(0, predicted_l)
+    teacher_score_h = conf_h * edge_credibility_h
+    teacher_score_l = conf_l * edge_credibility_l
+
+    h_teaches_l = teacher_score_h > teacher_score_l + margin
+    l_teaches_h = teacher_score_l > teacher_score_h + margin
     h_to_l_loss = F.kl_div(
         _distill_edge_log_probabilities(
             l_selected,
@@ -1592,18 +2242,307 @@ def confidence_weighted_overlap_distill_loss(
     loss = loss * temperature * temperature
     h_to_l_count = int(h_teaches_l.detach().sum().item())
     l_to_h_count = int(l_teaches_h.detach().sum().item())
+    h_to_l_by_class = torch.bincount(
+        predicted_h[h_teaches_l],
+        minlength=class_count,
+    )
+    l_to_h_by_class = torch.bincount(
+        predicted_l[l_teaches_h],
+        minlength=class_count,
+    )
     diagnostics = {
         "selected_edges": selected_count,
         "h_to_l_edges": h_to_l_count,
         "l_to_h_edges": l_to_h_count,
         "h_to_l_ratio": h_to_l_count / max(selected_count, 1),
         "l_to_h_ratio": l_to_h_count / max(selected_count, 1),
+        "h_to_l_by_class": h_to_l_by_class.detach().cpu().tolist(),
+        "l_to_h_by_class": l_to_h_by_class.detach().cpu().tolist(),
         "mean_iou": float(weights.detach().mean().item()),
         "mean_conf_h": float(conf_h.detach().mean().item()),
         "mean_conf_l": float(conf_l.detach().mean().item()),
+        "mean_teacher_score_h": float(
+            teacher_score_h.detach().mean().item()
+        ),
+        "mean_teacher_score_l": float(
+            teacher_score_l.detach().mean().item()
+        ),
         "raw_loss": float(loss.detach().item()),
     }
+    if return_active_edges:
+        selected_positions = torch.nonzero(mask, as_tuple=False).flatten()
+        active_positions = selected_positions[
+            h_teaches_l | l_teaches_h
+        ]
+        return loss, diagnostics, active_positions
     return loss, diagnostics
+
+
+def build_pacmt_physical_edge_weights(
+    overlap_tensors,
+    alpha_sam=1.0,
+    alpha_frag=1.0,
+    iou_tau=0.1,
+):
+    """Build fixed physical teaching reliability on every overlap edge."""
+    required = ("iou", "sam", "h_fragmentation", "l_fragmentation")
+    missing = [name for name in required if name not in overlap_tensors]
+    if missing:
+        raise ValueError(
+            "PACMT requires physical overlap data; missing tensors: "
+            + ", ".join(missing)
+        )
+    iou = overlap_tensors["iou"]
+    sam = overlap_tensors["sam"]
+    fragmentation = torch.maximum(
+        overlap_tensors["h_fragmentation"],
+        overlap_tensors["l_fragmentation"],
+    )
+    return (
+        iou / (iou + float(iou_tau))
+        * torch.exp(-float(alpha_sam) * sam)
+        * torch.exp(-float(alpha_frag) * fragmentation)
+    ).detach()
+
+
+def _pacmt_class_balanced_edge_mask(
+    predicted_class,
+    eligible,
+    quality,
+    class_count,
+    per_class_cap,
+):
+    selected = torch.zeros_like(eligible)
+    for class_index in range(class_count):
+        class_edges = torch.nonzero(
+            eligible & (predicted_class == class_index),
+            as_tuple=False,
+        ).flatten()
+        if class_edges.numel() == 0:
+            continue
+        if class_edges.numel() > per_class_cap:
+            class_quality = quality.index_select(0, class_edges)
+            keep = torch.topk(
+                class_quality,
+                k=per_class_cap,
+                largest=True,
+                sorted=False,
+            ).indices
+            class_edges = class_edges.index_select(0, keep)
+        selected[class_edges] = True
+    return selected
+
+
+def physically_arbitrated_mutual_teaching_loss(
+    hsi_node_logits,
+    lidar_node_logits,
+    overlap_tensors,
+    physical_edge_weight,
+    class_count,
+    mode,
+    credibility_h,
+    credibility_l,
+    temperature=2.0,
+    confidence_mode="max-prob",
+    direction_temperature=0.05,
+    pseudo_confidence=0.9,
+    pseudo_min_weight=0.1,
+    pseudo_per_class_cap=30,
+    pseudo_edge_mask=None,
+):
+    """PACMT soft-direction KD and class-balanced agreement pseudo labels."""
+    if mode not in {"soft-kd", "pl", "full"}:
+        raise ValueError(f"Unsupported PACMT mode: {mode}")
+    h_logits = hsi_node_logits[:, :class_count]
+    l_logits = lidar_node_logits[:, :class_count]
+    h_index = overlap_tensors["h_index"]
+    l_index = overlap_tensors["l_index"]
+    h_selected = h_logits.index_select(0, h_index)
+    l_selected = l_logits.index_select(0, l_index)
+    p_h = F.softmax(h_selected / temperature, dim=-1)
+    p_l = F.softmax(l_selected / temperature, dim=-1)
+    predicted_h = p_h.argmax(dim=1)
+    predicted_l = p_l.argmax(dim=1)
+    conf_h = _prediction_confidence(p_h, confidence_mode)
+    conf_l = _prediction_confidence(p_l, confidence_mode)
+    edge_credibility_h = credibility_h.index_select(0, predicted_h)
+    edge_credibility_l = credibility_l.index_select(0, predicted_l)
+    teacher_score_h = conf_h * edge_credibility_h
+    teacher_score_l = conf_l * edge_credibility_l
+
+    direction_h_to_l = torch.sigmoid(
+        (
+            teacher_score_h.detach()
+            - teacher_score_l.detach()
+        ) / float(direction_temperature)
+    )
+    zero = (h_selected.sum() + l_selected.sum()) * 0.0
+    kd_loss = zero
+    if mode in {"soft-kd", "full"}:
+        h_to_l_kl = F.kl_div(
+            F.log_softmax(l_selected / temperature, dim=-1),
+            p_h.detach(),
+            reduction="none",
+        ).sum(dim=-1)
+        l_to_h_kl = F.kl_div(
+            F.log_softmax(h_selected / temperature, dim=-1),
+            p_l.detach(),
+            reduction="none",
+        ).sum(dim=-1)
+        edge_kd = (
+            direction_h_to_l * h_to_l_kl
+            + (1.0 - direction_h_to_l) * l_to_h_kl
+        )
+        kd_loss = (
+            physical_edge_weight * edge_kd
+        ).sum() / physical_edge_weight.sum().clamp_min(1e-8)
+        kd_loss = kd_loss * temperature * temperature
+
+    agreement = predicted_h == predicted_l
+    pseudo_quality = physical_edge_weight * torch.minimum(
+        teacher_score_h.detach(),
+        teacher_score_l.detach(),
+    )
+    pseudo_eligible = (
+        agreement
+        & (teacher_score_h.detach() > pseudo_confidence)
+        & (teacher_score_l.detach() > pseudo_confidence)
+        & (physical_edge_weight > pseudo_min_weight)
+    )
+    if pseudo_edge_mask is not None:
+        pseudo_eligible = pseudo_eligible & pseudo_edge_mask
+    pseudo_selected = _pacmt_class_balanced_edge_mask(
+        predicted_h,
+        pseudo_eligible,
+        pseudo_quality,
+        class_count,
+        pseudo_per_class_cap,
+    )
+    pseudo_loss = zero
+    selected_count = int(pseudo_selected.detach().sum().item())
+    pseudo_by_class = torch.zeros(
+        class_count,
+        dtype=torch.long,
+        device=h_logits.device,
+    )
+    if selected_count > 0:
+        pseudo_targets = predicted_h[pseudo_selected].detach()
+        pseudo_weights = pseudo_quality[pseudo_selected]
+        h_pseudo_ce = F.cross_entropy(
+            h_selected[pseudo_selected],
+            pseudo_targets,
+            reduction="none",
+        )
+        l_pseudo_ce = F.cross_entropy(
+            l_selected[pseudo_selected],
+            pseudo_targets,
+            reduction="none",
+        )
+        pseudo_loss = (
+            pseudo_weights * (h_pseudo_ce + l_pseudo_ce)
+        ).sum() / pseudo_weights.sum().clamp_min(1e-8)
+        pseudo_by_class = torch.bincount(
+            pseudo_targets,
+            minlength=class_count,
+        )
+    if mode == "soft-kd":
+        pseudo_loss = zero
+    elif mode == "pl":
+        kd_loss = zero
+
+    h_hard_teacher = direction_h_to_l >= 0.5
+    diagnostics = {
+        "edge_count": int(h_index.numel()),
+        "physical_weight_mean": float(
+            physical_edge_weight.detach().mean().item()
+        ),
+        "physical_weight_min": float(
+            physical_edge_weight.detach().min().item()
+        ),
+        "physical_weight_max": float(
+            physical_edge_weight.detach().max().item()
+        ),
+        "soft_h_to_l_mean": float(
+            direction_h_to_l.detach().mean().item()
+        ),
+        "h_to_l_teacher_edges": int(
+            h_hard_teacher.detach().sum().item()
+        ),
+        "l_to_h_teacher_edges": int(
+            (~h_hard_teacher).detach().sum().item()
+        ),
+        "mean_conf_h": float(conf_h.detach().mean().item()),
+        "mean_conf_l": float(conf_l.detach().mean().item()),
+        "mean_teacher_score_h": float(
+            teacher_score_h.detach().mean().item()
+        ),
+        "mean_teacher_score_l": float(
+            teacher_score_l.detach().mean().item()
+        ),
+        "pseudo_eligible_edges": int(
+            pseudo_eligible.detach().sum().item()
+        ),
+        "pseudo_unlabeled_candidate_edges": int(
+            pseudo_edge_mask.detach().sum().item()
+            if pseudo_edge_mask is not None
+            else h_index.numel()
+        ),
+        "pseudo_selected_edges": selected_count,
+        "pseudo_by_class": pseudo_by_class.detach().cpu().tolist(),
+        "kd_raw_loss": float(kd_loss.detach().item()),
+        "pseudo_raw_loss": float(pseudo_loss.detach().item()),
+    }
+    return kd_loss, pseudo_loss, diagnostics
+
+
+def relational_overlap_distill_loss(
+    hsi_nodes,
+    lidar_nodes,
+    overlap_tensors,
+    active_edge_positions,
+    sample_count=256,
+):
+    """Match HSI/LiDAR pairwise structure on active overlap edges."""
+    zero = (hsi_nodes.sum() + lidar_nodes.sum()) * 0.0
+    active_count = int(active_edge_positions.numel())
+    if active_count == 0:
+        return zero, {
+            "relational_active_edges": 0,
+            "relational_sampled_edges": 0,
+            "relational_raw_loss": 0.0,
+        }
+    if active_count > sample_count:
+        order = torch.randperm(
+            active_count,
+            device=active_edge_positions.device,
+        )[:sample_count]
+        edge_positions = active_edge_positions.index_select(0, order)
+    else:
+        edge_positions = active_edge_positions
+    h_index = overlap_tensors["h_index"].index_select(0, edge_positions)
+    l_index = overlap_tensors["l_index"].index_select(0, edge_positions)
+    edge_iou = overlap_tensors["iou"].index_select(0, edge_positions)
+    h_features = F.normalize(
+        hsi_nodes.index_select(0, h_index),
+        dim=1,
+    )
+    l_features = F.normalize(
+        lidar_nodes.index_select(0, l_index),
+        dim=1,
+    )
+    h_structure = h_features @ h_features.transpose(0, 1)
+    l_structure = l_features @ l_features.transpose(0, 1)
+    pair_weight = torch.sqrt(
+        edge_iou.unsqueeze(1) * edge_iou.unsqueeze(0)
+    )
+    relational_loss = (
+        pair_weight * (h_structure - l_structure).square()
+    ).sum() / pair_weight.sum().clamp_min(1e-8)
+    return relational_loss, {
+        "relational_active_edges": active_count,
+        "relational_sampled_edges": int(edge_positions.numel()),
+        "relational_raw_loss": float(relational_loss.detach().item()),
+    }
 
 
 def dirichlet_kl_to_uniform(alpha):
@@ -2489,6 +3428,9 @@ class DualTransportArbitration(nn.Module):
         nonlocal_topk=10,
         normalization="sinkhorn",
         sinkhorn_iters=5,
+        mass_sinkhorn_iters=20,
+        overlap_weight=1.0,
+        structure_weight=1.0,
     ):
         super().__init__()
         self.channels = int(channels)
@@ -2498,6 +3440,9 @@ class DualTransportArbitration(nn.Module):
         self.nonlocal_topk = int(nonlocal_topk)
         self.normalization = normalization
         self.sinkhorn_iters = int(sinkhorn_iters)
+        self.mass_sinkhorn_iters = int(mass_sinkhorn_iters)
+        self.overlap_weight = float(overlap_weight)
+        self.structure_weight = float(structure_weight)
         self.register_buffer(
             "h_index",
             torch.as_tensor(relation_data["h_index"], dtype=torch.long),
@@ -2591,11 +3536,38 @@ class DualTransportArbitration(nn.Module):
             l_geo_dense > 0,
             persistent=False,
         )
+        overlap_dense = torch.zeros(
+            (self.h_node_count, self.l_node_count),
+            dtype=torch.float32,
+        )
+        overlap_dense[
+            torch.as_tensor(relation_data["h_index"], dtype=torch.long),
+            torch.as_tensor(relation_data["l_index"], dtype=torch.long),
+        ] = torch.as_tensor(relation_data["overlap"], dtype=torch.float32)
+        pixel_count = float(relation_data.get("pixel_count", 1.0))
+        overlap_mass = overlap_dense / max(pixel_count, 1.0)
+        self.register_buffer(
+            "overlap_mass",
+            overlap_mass,
+            persistent=False,
+        )
+        self.register_buffer(
+            "h_area_marginal",
+            overlap_mass.sum(dim=1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "l_area_marginal",
+            overlap_mass.sum(dim=0),
+            persistent=False,
+        )
 
         self.q_h = nn.Linear(channels, attention_d_k, bias=False)
         self.k_l = nn.Linear(channels, attention_d_k, bias=False)
         self.q_l = nn.Linear(channels, attention_d_k, bias=False)
         self.k_h = nn.Linear(channels, attention_d_k, bias=False)
+        self.matchability_h = nn.Linear(channels, 1)
+        self.matchability_l = nn.Linear(channels, 1)
         self.v_l2h = nn.Linear(channels, channels)
         self.v_h2l = nn.Linear(channels, channels)
         self.gate_scale_h = nn.Parameter(torch.ones(()))
@@ -2611,6 +3583,16 @@ class DualTransportArbitration(nn.Module):
             nn.Linear(3, 16),
             nn.ReLU(),
             nn.Linear(16, 1),
+        )
+        self.structural_gate_h = nn.Sequential(
+            nn.Linear(3 * channels, channels),
+            nn.ReLU(),
+            nn.Linear(channels, channels),
+        )
+        self.structural_gate_l = nn.Sequential(
+            nn.Linear(3 * channels, channels),
+            nn.ReLU(),
+            nn.Linear(channels, channels),
         )
         self.align_l_to_h = nn.Linear(channels, channels, bias=False)
         self.align_h_to_l = nn.Linear(channels, channels, bias=False)
@@ -2741,6 +3723,180 @@ class DualTransportArbitration(nn.Module):
         weights = log_weights.exp() * support.to(log_weights.dtype)
         weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
         return torch.nan_to_num(weights, nan=0.0)
+
+    @staticmethod
+    def _row_normalize_adjacency(adjacency):
+        adjacency = torch.nan_to_num(adjacency, nan=0.0).clamp_min(0.0)
+        return adjacency / adjacency.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+    def _area_marginal_sinkhorn(self, log_kernel):
+        """Balance one HSI-by-LiDAR kernel to the overlap-area marginals."""
+        eps = 1e-12
+        log_a = torch.log(self.h_area_marginal.clamp_min(eps))
+        log_b = torch.log(self.l_area_marginal.clamp_min(eps))
+        log_u = torch.zeros_like(log_a)
+        log_v = torch.zeros_like(log_b)
+        for _ in range(self.mass_sinkhorn_iters):
+            log_u = log_a - torch.logsumexp(
+                log_kernel + log_v.unsqueeze(0),
+                dim=1,
+            )
+            log_v = log_b - torch.logsumexp(
+                log_kernel + log_u.unsqueeze(1),
+                dim=0,
+            )
+        log_transport = (
+            log_kernel + log_u.unsqueeze(1) + log_v.unsqueeze(0)
+        )
+        return torch.exp(log_transport)
+
+    def _forward_structural_consensus(
+        self,
+        hsi_nodes,
+        lidar_nodes,
+        hsi_adjacency,
+        lidar_adjacency,
+    ):
+        """Mass-preserving semantic/topological consensus transport."""
+        if hsi_adjacency is None or lidar_adjacency is None:
+            raise ValueError(
+                "structural-consensus DTA requires both private graph "
+                "adjacency matrices."
+            )
+        eps = 1e-8
+        semantic_logits = self.q_h(hsi_nodes) @ self.k_l(lidar_nodes).t()
+        semantic_logits = semantic_logits * self.scale / self.tau
+
+        h_adjacency = self._row_normalize_adjacency(hsi_adjacency)
+        l_adjacency = self._row_normalize_adjacency(lidar_adjacency)
+        structural_support = (
+            h_adjacency @ self.overlap_mass @ l_adjacency.transpose(0, 1)
+        )
+        log_kernel = semantic_logits
+        if self.overlap_weight > 0:
+            log_kernel = log_kernel + self.overlap_weight * torch.log(
+                self.overlap_mass + eps
+            )
+        if self.structure_weight > 0:
+            log_kernel = log_kernel + self.structure_weight * torch.log(
+                structural_support + eps
+            )
+
+        coupling = self._area_marginal_sinkhorn(log_kernel)
+        h_condition = coupling / self.h_area_marginal.unsqueeze(1).clamp_min(
+            1e-12
+        )
+        l_condition = coupling.transpose(0, 1) / (
+            self.l_area_marginal.unsqueeze(1).clamp_min(1e-12)
+        )
+        h_geo_condition = self.overlap_mass / (
+            self.h_area_marginal.unsqueeze(1).clamp_min(1e-12)
+        )
+        l_geo_condition = self.overlap_mass.transpose(0, 1) / (
+            self.l_area_marginal.unsqueeze(1).clamp_min(1e-12)
+        )
+
+        h_message = h_condition @ self.v_l2h(lidar_nodes)
+        l_message = l_condition @ self.v_h2l(hsi_nodes)
+        h_gate = torch.sigmoid(
+            self.structural_gate_h(
+                torch.cat(
+                    [
+                        hsi_nodes,
+                        h_message,
+                        torch.abs(hsi_nodes - h_message),
+                    ],
+                    dim=1,
+                )
+            )
+        )
+        l_gate = torch.sigmoid(
+            self.structural_gate_l(
+                torch.cat(
+                    [
+                        lidar_nodes,
+                        l_message,
+                        torch.abs(lidar_nodes - l_message),
+                    ],
+                    dim=1,
+                )
+            )
+        )
+        delta_h = h_gate * self.ln_h(h_message)
+        delta_l = l_gate * self.ln_l(l_message)
+
+        h_conflict = (
+            h_condition
+            * (
+                torch.log(h_condition.clamp_min(1e-12))
+                - torch.log(h_geo_condition.clamp_min(1e-12))
+            )
+        ).sum(dim=1)
+        l_conflict = (
+            l_condition
+            * (
+                torch.log(l_condition.clamp_min(1e-12))
+                - torch.log(l_geo_condition.clamp_min(1e-12))
+            )
+        ).sum(dim=1)
+        h_geo_entropy = -(
+            h_geo_condition
+            * torch.log(h_geo_condition.clamp_min(1e-12))
+        ).sum(dim=1)
+        l_geo_entropy = -(
+            l_geo_condition
+            * torch.log(l_geo_condition.clamp_min(1e-12))
+        ).sum(dim=1)
+        h_transport_entropy = -(
+            h_condition * torch.log(h_condition.clamp_min(1e-12))
+        ).sum(dim=1)
+        l_transport_entropy = -(
+            l_condition * torch.log(l_condition.clamp_min(1e-12))
+        ).sum(dim=1)
+        row_error = torch.abs(coupling.sum(dim=1) - self.h_area_marginal)
+        col_error = torch.abs(coupling.sum(dim=0) - self.l_area_marginal)
+        shared_stats = {
+            "coupling_delta_l1": float(
+                torch.abs(coupling - self.overlap_mass).detach().mean().item()
+            ),
+            "sinkhorn_row_error_mean": float(
+                row_error.detach().mean().item()
+            ),
+            "sinkhorn_row_error_max": float(row_error.detach().max().item()),
+            "sinkhorn_col_error_mean": float(
+                col_error.detach().mean().item()
+            ),
+            "sinkhorn_col_error_max": float(col_error.detach().max().item()),
+            "structural_support_density": float(
+                (structural_support.detach() > eps).float().mean().item()
+            ),
+            "coupling_entropy": float(
+                (
+                    -coupling
+                    * torch.log(coupling.clamp_min(1e-12))
+                ).detach().sum().item()
+            ),
+            "transport_mass": float(coupling.detach().sum().item()),
+        }
+        h_stats = {
+            "conflict": h_conflict,
+            "gate": h_gate.mean(dim=1, keepdim=True),
+            "geo_entropy": h_geo_entropy,
+            "sem_entropy": h_transport_entropy,
+            "delta": delta_h,
+            "ctx": h_message,
+            **shared_stats,
+        }
+        l_stats = {
+            "conflict": l_conflict,
+            "gate": l_gate.mean(dim=1, keepdim=True),
+            "geo_entropy": l_geo_entropy,
+            "sem_entropy": l_transport_entropy,
+            "delta": delta_l,
+            "ctx": l_message,
+            **shared_stats,
+        }
+        return delta_h, delta_l, h_stats, l_stats
 
     def _one_direction(
         self,
@@ -2913,6 +4069,165 @@ class DualTransportArbitration(nn.Module):
         }
         return delta, stats
 
+    @staticmethod
+    def _masked_log_softmax(logits, support, dim):
+        masked_logits = logits.masked_fill(~support, -1e9)
+        log_weights = F.log_softmax(masked_logits, dim=dim)
+        return log_weights.masked_fill(~support, -float("inf"))
+
+    def _lightglue_support(self, similarity):
+        """Symmetric overlap plus row/column semantic top-k support."""
+        support = self.h_support_dense.clone()
+        if self.nonlocal_topk <= 0:
+            return support
+        row_k = min(self.nonlocal_topk, similarity.shape[1])
+        if row_k > 0:
+            row_index = torch.topk(similarity, k=row_k, dim=1).indices
+            support.scatter_(1, row_index, True)
+        col_k = min(self.nonlocal_topk, similarity.shape[0])
+        if col_k > 0:
+            col_index = torch.topk(
+                similarity.transpose(0, 1),
+                k=col_k,
+                dim=1,
+            ).indices
+            support.transpose(0, 1).scatter_(1, col_index, True)
+        return support
+
+    def _lightglue_direction(
+        self,
+        query_nodes,
+        source_nodes,
+        assignment,
+        geo_dense,
+        support_geo,
+        receiver_matchability,
+        v_proj,
+        gate_mlp,
+        layer_norm,
+    ):
+        """Turn a shared LightGlue-style assignment into one DTA direction."""
+        eps = 1e-12
+        sem_dense = assignment / assignment.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(eps)
+        valid = support_geo.any(dim=1)
+        escape = (sem_dense * (~support_geo).to(sem_dense.dtype)).sum(dim=1)
+        sem_in_geo = sem_dense * support_geo.to(sem_dense.dtype)
+        sem_in_geo = sem_in_geo / sem_in_geo.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(eps)
+        kl = (
+            sem_in_geo
+            * (
+                torch.log(sem_in_geo.clamp_min(eps))
+                - torch.log(geo_dense.clamp_min(eps))
+            )
+            * support_geo.to(sem_dense.dtype)
+        ).sum(dim=1)
+        sem_entropy = -(
+            sem_dense * torch.log(sem_dense.clamp_min(eps))
+        ).sum(dim=1)
+        geo_entropy = -(
+            geo_dense * torch.log(geo_dense.clamp_min(eps))
+        ).sum(dim=1)
+
+        gate_input = torch.stack(
+            [
+                self._standardize(kl, valid),
+                self._standardize(escape, valid),
+                self._standardize(sem_entropy, valid),
+            ],
+            dim=1,
+        )
+        arbitration_gate = torch.zeros(
+            (query_nodes.shape[0], 1),
+            dtype=query_nodes.dtype,
+            device=query_nodes.device,
+        )
+        arbitration_gate[valid] = torch.sigmoid(
+            gate_mlp(gate_input[valid])
+        )
+        effective_gate = arbitration_gate * receiver_matchability.unsqueeze(1)
+
+        source_values = v_proj(source_nodes)
+        geo_message = geo_dense @ source_values
+        sem_message = sem_dense @ source_values
+        ctx = (
+            (1.0 - effective_gate) * geo_message
+            + effective_gate * sem_message
+        )
+        delta = layer_norm(ctx)
+        delta = delta.masked_fill(~valid.unsqueeze(1), 0.0)
+        return delta, {
+            "conflict": kl,
+            "gate": effective_gate,
+            "arbitration_gate": arbitration_gate,
+            "matchability": receiver_matchability,
+            "escape": escape,
+            "geo_entropy": geo_entropy,
+            "sem_entropy": sem_entropy,
+            "delta": delta,
+            "ctx": ctx,
+            "sem_dense": sem_dense,
+        }
+
+    def _forward_full_lightglue(self, hsi_nodes, lidar_nodes):
+        """Shared bidirectional-softmax assignment with node matchability."""
+        h_to_l_logits = self.q_h(hsi_nodes) @ self.k_l(lidar_nodes).t()
+        l_to_h_logits = self.q_l(lidar_nodes) @ self.k_h(hsi_nodes).t()
+        similarity = 0.5 * (
+            h_to_l_logits + l_to_h_logits.transpose(0, 1)
+        )
+        similarity = similarity * self.scale / self.tau
+        support = self._lightglue_support(similarity)
+
+        h_matchability_logits = self.matchability_h(hsi_nodes).squeeze(1)
+        l_matchability_logits = self.matchability_l(lidar_nodes).squeeze(1)
+        row_scores = self._masked_log_softmax(similarity, support, dim=1)
+        col_scores = self._masked_log_softmax(similarity, support, dim=0)
+        log_assignment = (
+            row_scores
+            + col_scores
+            + F.logsigmoid(h_matchability_logits).unsqueeze(1)
+            + F.logsigmoid(l_matchability_logits).unsqueeze(0)
+        )
+        assignment = torch.exp(log_assignment).masked_fill(~support, 0.0)
+        h_matchability = torch.sigmoid(h_matchability_logits)
+        l_matchability = torch.sigmoid(l_matchability_logits)
+
+        delta_h, h_stats = self._lightglue_direction(
+            hsi_nodes,
+            lidar_nodes,
+            assignment,
+            self.h_geo_dense,
+            self.h_support_dense,
+            h_matchability,
+            self.v_l2h,
+            self.gate_mlp_h,
+            self.ln_h,
+        )
+        delta_l, l_stats = self._lightglue_direction(
+            lidar_nodes,
+            hsi_nodes,
+            assignment.transpose(0, 1),
+            self.l_geo_dense,
+            self.l_support_dense,
+            l_matchability,
+            self.v_h2l,
+            self.gate_mlp_l,
+            self.ln_l,
+        )
+        assignment_mass = float(assignment.detach().sum().item())
+        support_density = float(support.detach().float().mean().item())
+        h_stats["assignment_mass"] = assignment_mass
+        l_stats["assignment_mass"] = assignment_mass
+        h_stats["assignment_support_density"] = support_density
+        l_stats["assignment_support_density"] = support_density
+        return delta_h, delta_l, h_stats, l_stats
+
     def _forward_simple(self, hsi_nodes, lidar_nodes):
         delta_h, h_stats = self._one_direction(
             hsi_nodes,
@@ -2947,28 +4262,33 @@ class DualTransportArbitration(nn.Module):
         return delta_h, delta_l, h_stats, l_stats
 
     def _forward_full(self, hsi_nodes, lidar_nodes):
-        delta_h, h_stats = self._one_direction_full(
-            hsi_nodes,
-            lidar_nodes,
-            self.h_geo_dense,
-            self.h_support_dense,
-            self.q_h,
-            self.k_l,
-            self.v_l2h,
-            self.gate_mlp_h,
-            self.ln_h,
-        )
-        delta_l, l_stats = self._one_direction_full(
-            lidar_nodes,
-            hsi_nodes,
-            self.l_geo_dense,
-            self.l_support_dense,
-            self.q_l,
-            self.k_h,
-            self.v_h2l,
-            self.gate_mlp_l,
-            self.ln_l,
-        )
+        if self.normalization == "lightglue":
+            delta_h, delta_l, h_stats, l_stats = (
+                self._forward_full_lightglue(hsi_nodes, lidar_nodes)
+            )
+        else:
+            delta_h, h_stats = self._one_direction_full(
+                hsi_nodes,
+                lidar_nodes,
+                self.h_geo_dense,
+                self.h_support_dense,
+                self.q_h,
+                self.k_l,
+                self.v_l2h,
+                self.gate_mlp_h,
+                self.ln_h,
+            )
+            delta_l, l_stats = self._one_direction_full(
+                lidar_nodes,
+                hsi_nodes,
+                self.l_geo_dense,
+                self.l_support_dense,
+                self.q_l,
+                self.k_h,
+                self.v_h2l,
+                self.gate_mlp_l,
+                self.ln_l,
+            )
         self.last_aux_losses = {}
         if self.training:
             h_valid = self.h_degree > 0
@@ -3010,9 +4330,24 @@ class DualTransportArbitration(nn.Module):
                 )
         return delta_h, delta_l, h_stats, l_stats
 
-    def forward(self, hsi_nodes, lidar_nodes):
+    def forward(
+        self,
+        hsi_nodes,
+        lidar_nodes,
+        hsi_adjacency=None,
+        lidar_adjacency=None,
+    ):
         self.last_aux_losses = {}
-        if self.variant == "full":
+        if self.variant == "structural-consensus":
+            delta_h, delta_l, h_stats, l_stats = (
+                self._forward_structural_consensus(
+                    hsi_nodes,
+                    lidar_nodes,
+                    hsi_adjacency,
+                    lidar_adjacency,
+                )
+            )
+        elif self.variant == "full":
             delta_h, delta_l, h_stats, l_stats = self._forward_full(
                 hsi_nodes,
                 lidar_nodes,
@@ -3067,7 +4402,6 @@ class DualTransportArbitration(nn.Module):
                 {
                     "nonlocal_topk": int(self.nonlocal_topk),
                     "normalization": self.normalization,
-                    "sinkhorn_iters": int(self.sinkhorn_iters),
                     "h_escape_mean": self._mean_valid(
                         h_stats["escape"],
                         h_valid,
@@ -3076,6 +4410,61 @@ class DualTransportArbitration(nn.Module):
                         l_stats["escape"],
                         l_valid,
                     ),
+                }
+            )
+            if self.normalization == "sinkhorn":
+                self.last_diagnostics["sinkhorn_iters"] = int(
+                    self.sinkhorn_iters
+                )
+            if self.normalization == "lightglue":
+                self.last_diagnostics.update(
+                    {
+                        "h_matchability_mean": self._mean_valid(
+                            h_stats["matchability"],
+                            h_valid,
+                        ),
+                        "l_matchability_mean": self._mean_valid(
+                            l_stats["matchability"],
+                            l_valid,
+                        ),
+                        "h_arbitration_gate_mean": self._mean_valid(
+                            h_stats["arbitration_gate"].squeeze(1),
+                            h_valid,
+                        ),
+                        "l_arbitration_gate_mean": self._mean_valid(
+                            l_stats["arbitration_gate"].squeeze(1),
+                            l_valid,
+                        ),
+                        "assignment_mass": h_stats["assignment_mass"],
+                        "assignment_support_density": h_stats[
+                            "assignment_support_density"
+                        ],
+                    }
+                )
+        elif self.variant == "structural-consensus":
+            self.last_diagnostics.update(
+                {
+                    "overlap_weight": float(self.overlap_weight),
+                    "structure_weight": float(self.structure_weight),
+                    "sinkhorn_iters": int(self.mass_sinkhorn_iters),
+                    "coupling_delta_l1": h_stats["coupling_delta_l1"],
+                    "sinkhorn_row_error_mean": h_stats[
+                        "sinkhorn_row_error_mean"
+                    ],
+                    "sinkhorn_row_error_max": h_stats[
+                        "sinkhorn_row_error_max"
+                    ],
+                    "sinkhorn_col_error_mean": h_stats[
+                        "sinkhorn_col_error_mean"
+                    ],
+                    "sinkhorn_col_error_max": h_stats[
+                        "sinkhorn_col_error_max"
+                    ],
+                    "structural_support_density": h_stats[
+                        "structural_support_density"
+                    ],
+                    "coupling_entropy": h_stats["coupling_entropy"],
+                    "transport_mass": h_stats["transport_mass"],
                 }
             )
         return updated_hsi, updated_lidar
@@ -3188,6 +4577,484 @@ class ConflictAwareFiLM(nn.Module):
         return self.last_diagnostics
 
 
+class ConsensusStreamFusion(nn.Module):
+    """Conflict-aware pixel fusion for the intersection consensus stream."""
+
+    def __init__(self, channels, gate_hidden=32):
+        super().__init__()
+        self.consensus_proj = nn.Linear(channels, channels)
+        gate_output = nn.Linear(gate_hidden, 1)
+        nn.init.zeros_(gate_output.weight)
+        nn.init.constant_(gate_output.bias, -3.0)
+        self.gate = nn.Sequential(
+            nn.Linear(2 * channels + 2, gate_hidden),
+            nn.LeakyReLU(),
+            gate_output,
+        )
+        self.last_diagnostics = None
+
+    def forward(self, private_pixels, consensus_pixels, conflict_pixels):
+        consensus = self.consensus_proj(consensus_pixels)
+        cosine = F.cosine_similarity(
+            private_pixels,
+            consensus,
+            dim=1,
+        ).unsqueeze(1)
+        gate = torch.sigmoid(
+            self.gate(
+                torch.cat(
+                    [
+                        private_pixels,
+                        consensus,
+                        cosine,
+                        conflict_pixels,
+                    ],
+                    dim=1,
+                )
+            )
+        )
+        fused = private_pixels + gate * consensus
+        gate_detached = gate.detach().squeeze(1)
+        conflict_detached = conflict_pixels.detach().squeeze(1)
+        if gate_detached.numel() > 1:
+            centered_gate = gate_detached - gate_detached.mean()
+            centered_conflict = (
+                conflict_detached - conflict_detached.mean()
+            )
+            correlation = (
+                centered_gate * centered_conflict
+            ).mean() / (
+                centered_gate.std(unbiased=False)
+                * centered_conflict.std(unbiased=False)
+            ).clamp_min(1e-8)
+            gate_conflict_correlation = float(correlation.item())
+        else:
+            gate_conflict_correlation = 0.0
+        self.last_diagnostics = {
+            "consensus_gate_mean": float(gate_detached.mean().item()),
+            "consensus_gate_std": float(
+                gate_detached.std(unbiased=False).item()
+            ),
+            "consensus_gate_min": float(gate_detached.min().item()),
+            "consensus_gate_max": float(gate_detached.max().item()),
+            "conflict_pixel_mean": float(conflict_detached.mean().item()),
+            "gate_conflict_correlation": gate_conflict_correlation,
+            "consensus_pixel_norm": float(
+                consensus.detach().norm(dim=1).mean().item()
+            ),
+            "consensus_residual_norm": float(
+                (gate * consensus).detach().norm(dim=1).mean().item()
+            ),
+        }
+        return fused, gate
+
+    def diagnostics(self):
+        return self.last_diagnostics
+
+
+class GraphFunctionalMapInteraction(nn.Module):
+    """Translate private node functions through fixed graph spectral bases."""
+
+    def __init__(self, channels, spectral_data, detach_inputs=False):
+        super().__init__()
+        phi_h = torch.as_tensor(
+            spectral_data["phi_h"],
+            dtype=torch.float32,
+        )
+        phi_l = torch.as_tensor(
+            spectral_data["phi_l"],
+            dtype=torch.float32,
+        )
+        phi_h_proj = torch.as_tensor(
+            spectral_data["phi_h_proj"],
+            dtype=torch.float32,
+        )
+        phi_l_proj = torch.as_tensor(
+            spectral_data["phi_l_proj"],
+            dtype=torch.float32,
+        )
+        c_geo = torch.as_tensor(
+            spectral_data["c_geo"],
+            dtype=torch.float32,
+        )
+        scale_mask = torch.as_tensor(
+            spectral_data["scale_mask"],
+            dtype=torch.float32,
+        )
+        if phi_h.shape[1] != phi_l.shape[1]:
+            raise ValueError("GFMI HSI/LiDAR bases must have equal rank.")
+        if c_geo.shape != (phi_h.shape[1], phi_l.shape[1]):
+            raise ValueError("GFMI geometric map has incompatible shape.")
+        self.rank = int(phi_h.shape[1])
+        self.detach_inputs = bool(detach_inputs)
+        self.rank_per_scale = list(spectral_data["rank_per_scale"])
+        self.register_buffer("phi_h", phi_h, persistent=False)
+        self.register_buffer("phi_l", phi_l, persistent=False)
+        self.register_buffer("phi_h_proj", phi_h_proj, persistent=False)
+        self.register_buffer("phi_l_proj", phi_l_proj, persistent=False)
+        self.register_buffer("scale_mask", scale_mask, persistent=False)
+        self.register_buffer("c_geo", c_geo, persistent=False)
+        self.register_buffer(
+            "eigenvalues_h",
+            torch.as_tensor(
+                spectral_data["eigenvalues_h"],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "eigenvalues_l",
+            torch.as_tensor(
+                spectral_data["eigenvalues_l"],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.c_res = nn.Parameter(torch.zeros_like(c_geo))
+        self.band_h = nn.Parameter(torch.zeros(self.rank))
+        self.band_l = nn.Parameter(torch.zeros(self.rank))
+        self.mix_h = nn.Sequential(
+            nn.Linear(3 * channels, channels),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
+        self.mix_l = nn.Sequential(
+            nn.Linear(3 * channels, channels),
+            nn.LayerNorm(channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, channels),
+        )
+        self.last_diagnostics = None
+
+    def forward(self, hsi_nodes, lidar_nodes):
+        hsi_source = hsi_nodes.detach() if self.detach_inputs else hsi_nodes
+        lidar_source = (
+            lidar_nodes.detach() if self.detach_inputs else lidar_nodes
+        )
+        functional_map = (self.c_geo + self.c_res) * self.scale_mask
+        h_coefficients = self.phi_h_proj.transpose(0, 1) @ hsi_source
+        l_coefficients = self.phi_l_proj.transpose(0, 1) @ lidar_source
+        mapped_l_coefficients = functional_map @ l_coefficients
+        mapped_h_coefficients = (
+            functional_map.transpose(0, 1) @ h_coefficients
+        )
+        h_band_gate = torch.sigmoid(self.band_h).unsqueeze(1)
+        l_band_gate = torch.sigmoid(self.band_l).unsqueeze(1)
+        lidar_in_hsi = self.phi_h @ (
+            h_band_gate * mapped_l_coefficients
+        )
+        hsi_in_lidar = self.phi_l @ (
+            l_band_gate * mapped_h_coefficients
+        )
+        consensus_h = self.mix_h(
+            torch.cat(
+                [
+                    hsi_source,
+                    lidar_in_hsi,
+                    hsi_source * lidar_in_hsi,
+                ],
+                dim=1,
+            )
+        )
+        consensus_l = self.mix_l(
+            torch.cat(
+                [
+                    lidar_source,
+                    hsi_in_lidar,
+                    lidar_source * hsi_in_lidar,
+                ],
+                dim=1,
+            )
+        )
+        h_conflict = (
+            h_coefficients - mapped_l_coefficients
+        ).detach().norm(dim=1)
+        l_conflict = (
+            l_coefficients - mapped_h_coefficients
+        ).detach().norm(dim=1)
+        c_geo_norm = self.c_geo.detach().norm()
+        c_res_norm = self.c_res.detach().norm()
+        self.last_diagnostics = {
+            "rank": self.rank,
+            "rank_per_scale": self.rank_per_scale,
+            "detach_inputs": self.detach_inputs,
+            "band_h_mean": float(h_band_gate.detach().mean().item()),
+            "band_l_mean": float(l_band_gate.detach().mean().item()),
+            "band_h": h_band_gate.detach().squeeze(1).cpu().tolist(),
+            "band_l": l_band_gate.detach().squeeze(1).cpu().tolist(),
+            "frequency_conflict_h": h_conflict.cpu().tolist(),
+            "frequency_conflict_l": l_conflict.cpu().tolist(),
+            "frequency_conflict_h_mean": float(h_conflict.mean().item()),
+            "frequency_conflict_l_mean": float(l_conflict.mean().item()),
+            "c_geo_norm": float(c_geo_norm.item()),
+            "c_res_norm": float(c_res_norm.item()),
+            "c_res_relative_norm": float(
+                (c_res_norm / c_geo_norm.clamp_min(1e-8)).item()
+            ),
+        }
+        return consensus_h, consensus_l
+
+    def diagnostics(self):
+        return self.last_diagnostics
+
+
+class VariationalConsensusField(nn.Module):
+    """Recover a pixel consensus field from two superpixel observations."""
+
+    def __init__(
+        self,
+        channels,
+        consensus_dim,
+        hsi_pooling_assignment,
+        lidar_pooling_assignment,
+        hsi_projection_assignment,
+        lidar_projection_assignment,
+        height,
+        width,
+        cg_iters=10,
+        beta_init=0.0,
+        lambda_init=0.1,
+        detach_inputs=False,
+    ):
+        super().__init__()
+        if consensus_dim <= 0 or cg_iters <= 0:
+            raise ValueError("VCF dimension and CG iterations must be positive.")
+        if lambda_init <= 0:
+            raise ValueError("VCF lambda_init must be positive.")
+        self.channels = int(channels)
+        self.consensus_dim = int(consensus_dim)
+        self.height = int(height)
+        self.width = int(width)
+        self.pixel_count = self.height * self.width
+        self.cg_iters = int(cg_iters)
+        self.detach_inputs = bool(detach_inputs)
+        self.eps = 1e-8
+
+        hsi_pooling_t = hsi_pooling_assignment.detach().clone().coalesce()
+        lidar_pooling_t = (
+            lidar_pooling_assignment.detach().clone().coalesce()
+        )
+        if hsi_pooling_t.shape[0] != self.pixel_count:
+            raise ValueError("VCF HSI pooling assignment has wrong pixel size.")
+        if lidar_pooling_t.shape[0] != self.pixel_count:
+            raise ValueError("VCF LiDAR pooling assignment has wrong pixel size.")
+        self.register_buffer(
+            "b_h_t",
+            hsi_pooling_t,
+            persistent=False,
+        )
+        self.register_buffer(
+            "b_l_t",
+            lidar_pooling_t,
+            persistent=False,
+        )
+        self.register_buffer(
+            "b_h",
+            hsi_pooling_t.transpose(0, 1).coalesce(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "b_l",
+            lidar_pooling_t.transpose(0, 1).coalesce(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "proj_h",
+            hsi_projection_assignment.detach().clone().coalesce(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "proj_l",
+            lidar_projection_assignment.detach().clone().coalesce(),
+            persistent=False,
+        )
+        smooth_kernel = torch.tensor(
+            [
+                [0.0, -1.0, 0.0],
+                [-1.0, 4.0, -1.0],
+                [0.0, -1.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        self.register_buffer(
+            "smooth_kernel",
+            smooth_kernel,
+            persistent=False,
+        )
+
+        self.w_h = nn.Linear(channels, consensus_dim)
+        self.w_l = nn.Linear(channels, consensus_dim)
+        self.prec_h = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, 1),
+        )
+        self.prec_l = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LeakyReLU(),
+            nn.Linear(channels, 1),
+        )
+        self.log_beta = nn.Parameter(torch.tensor(float(beta_init)))
+        self.log_lam = nn.Parameter(
+            torch.tensor(float(np.log(lambda_init)))
+        )
+        self.out = nn.Linear(consensus_dim, channels)
+        self.last_diagnostics = None
+
+    def _smooth(self, field):
+        image = field.transpose(0, 1).reshape(
+            1,
+            self.consensus_dim,
+            self.height,
+            self.width,
+        )
+        kernel = self.smooth_kernel.expand(
+            self.consensus_dim,
+            1,
+            3,
+            3,
+        )
+        smoothed = F.conv2d(
+            image,
+            kernel,
+            padding=1,
+            groups=self.consensus_dim,
+        )
+        return smoothed.reshape(
+            self.consensus_dim,
+            self.pixel_count,
+        ).transpose(0, 1)
+
+    def _system(self, field, precision_h, precision_l):
+        h_term = torch.sparse.mm(
+            self.b_h_t,
+            precision_h * torch.sparse.mm(self.b_h, field),
+        )
+        l_term = torch.exp(self.log_beta) * torch.sparse.mm(
+            self.b_l_t,
+            precision_l * torch.sparse.mm(self.b_l, field),
+        )
+        smooth_term = torch.exp(self.log_lam) * self._smooth(field)
+        return h_term + l_term + smooth_term + 1e-4 * field
+
+    def _conjugate_gradient(self, rhs, precision_h, precision_l):
+        solution = torch.zeros_like(rhs)
+        residual = rhs
+        direction = residual
+        residual_square = (residual * residual).sum(dim=0)
+        rhs_square = residual_square.detach().clone()
+        for _ in range(self.cg_iters):
+            system_direction = self._system(
+                direction,
+                precision_h,
+                precision_l,
+            )
+            denominator = (direction * system_direction).sum(dim=0)
+            active = residual_square > self.eps
+            step = torch.where(
+                active,
+                residual_square / denominator.clamp_min(self.eps),
+                torch.zeros_like(residual_square),
+            )
+            solution = solution + direction * step.unsqueeze(0)
+            residual = residual - system_direction * step.unsqueeze(0)
+            next_residual_square = (residual * residual).sum(dim=0)
+            direction_scale = torch.where(
+                active,
+                next_residual_square / residual_square.clamp_min(self.eps),
+                torch.zeros_like(residual_square),
+            )
+            direction = residual + direction * direction_scale.unsqueeze(0)
+            residual_square = next_residual_square
+        relative_residual = torch.sqrt(
+            residual_square / rhs_square.clamp_min(self.eps)
+        )
+        return solution, relative_residual
+
+    def forward(self, hsi_nodes, lidar_nodes):
+        hsi_source = hsi_nodes.detach() if self.detach_inputs else hsi_nodes
+        lidar_source = (
+            lidar_nodes.detach() if self.detach_inputs else lidar_nodes
+        )
+        observation_h = self.w_h(hsi_source)
+        observation_l = self.w_l(lidar_source)
+        precision_h = F.softplus(self.prec_h(hsi_source))
+        precision_l = F.softplus(self.prec_l(lidar_source))
+        rhs = torch.sparse.mm(
+            self.b_h_t,
+            precision_h * observation_h,
+        )
+        rhs = rhs + torch.exp(self.log_beta) * torch.sparse.mm(
+            self.b_l_t,
+            precision_l * observation_l,
+        )
+        consensus_field, relative_residual = self._conjugate_gradient(
+            rhs,
+            precision_h,
+            precision_l,
+        )
+
+        residual_h = torch.norm(
+            torch.sparse.mm(self.b_h, consensus_field) - observation_h,
+            dim=1,
+            keepdim=True,
+        )
+        residual_l = torch.norm(
+            torch.sparse.mm(self.b_l, consensus_field) - observation_l,
+            dim=1,
+            keepdim=True,
+        )
+        conflict_pixels = (
+            torch.sparse.mm(self.proj_h, residual_h)
+            + torch.sparse.mm(self.proj_l, residual_l)
+        )
+        conflict_pixels = (
+            conflict_pixels - conflict_pixels.mean()
+        ) / conflict_pixels.std(unbiased=False).clamp_min(1e-6)
+        output = self.out(consensus_field)
+        self.last_diagnostics = {
+            "consensus_dim": self.consensus_dim,
+            "cg_iters": self.cg_iters,
+            "detach_inputs": self.detach_inputs,
+            "precision_h_mean": float(
+                precision_h.detach().mean().item()
+            ),
+            "precision_l_mean": float(
+                precision_l.detach().mean().item()
+            ),
+            "observation_residual_h_mean": float(
+                residual_h.detach().mean().item()
+            ),
+            "observation_residual_l_mean": float(
+                residual_l.detach().mean().item()
+            ),
+            "cg_relative_residual_mean": float(
+                relative_residual.detach().mean().item()
+            ),
+            "cg_relative_residual_max": float(
+                relative_residual.detach().max().item()
+            ),
+            "beta": float(torch.exp(self.log_beta.detach()).item()),
+            "smoothness_lambda": float(
+                torch.exp(self.log_lam.detach()).item()
+            ),
+            "field_norm": float(
+                consensus_field.detach().norm(dim=1).mean().item()
+            ),
+            "conflict_mean": float(
+                conflict_pixels.detach().mean().item()
+            ),
+            "conflict_std": float(
+                conflict_pixels.detach().std(unbiased=False).item()
+            ),
+        }
+        return output, conflict_pixels
+
+    def diagnostics(self):
+        return self.last_diagnostics
+
+
 class AssignmentGraphInteraction(nn.Module):
     """SEGMN-style assignment graph over nonzero HSI/LiDAR overlap pairs.
 
@@ -3205,11 +5072,13 @@ class AssignmentGraphInteraction(nn.Module):
         topk=8,
         gamma_init=0.0,
         output="writeback",
+        detach_pair_inputs=False,
     ):
         super().__init__()
         self.channels = int(channels)
         self.topk = int(topk)
         self.output = output
+        self.detach_pair_inputs = bool(detach_pair_inputs)
         self.h_node_count = int(relation_data["h_node_count"])
         self.l_node_count = int(relation_data["l_node_count"])
         self.edge_count = int(relation_data["edge_count"])
@@ -3435,6 +5304,9 @@ class AssignmentGraphInteraction(nn.Module):
     ):
         h_pair = hsi_nodes.index_select(0, self.h_index)
         l_pair = lidar_nodes.index_select(0, self.l_index)
+        if self.detach_pair_inputs:
+            h_pair = h_pair.detach()
+            l_pair = l_pair.detach()
         pair_similarity = F.cosine_similarity(
             h_pair,
             l_pair,
@@ -3544,6 +5416,7 @@ class AssignmentGraphInteraction(nn.Module):
         self.last_diagnostics = {
             "mode": "assignment-graph-post-gat2",
             "output": self.output,
+            "pair_inputs_detached": bool(self.detach_pair_inputs),
             "assignment_node_count": int(self.edge_count),
             "assignment_topk": int(self.topk),
             "assignment_density": float(
@@ -4604,6 +6477,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         lidar_candidate_mask=None,
         hidden_dim=128,
         graph_modality_lambda=0.5,
+        shared_superpixel_fusion="none",
         fusion_lambda=0.5,
         dynamic_d_k=16,
         dynamic_topk=8,
@@ -4613,9 +6487,12 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         dta_tau=0.1,
         dta_gamma_init=0.0,
         dta_variant="simple",
+        dta_overlap_weight=1.0,
+        dta_structure_weight=1.0,
         dta_nonlocal_topk=10,
         dta_normalization="sinkhorn",
         dta_sinkhorn_iters=5,
+        dta_mass_sinkhorn_iters=20,
         dta_film=False,
         dta_film_d_s=64,
         dta_film_gamma_init=0.0,
@@ -4624,6 +6501,17 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         assignment_graph_gamma_init=0.0,
         assignment_graph_output="writeback",
         assignment_graph_weight=0.1,
+        assignment_graph_pair_detach=False,
+        assignment_graph_fusion="fixed",
+        assignment_graph_gate_hidden=32,
+        gfm="none",
+        gfm_detach=False,
+        gfm_spectral_data=None,
+        vcf="none",
+        vcf_dim=64,
+        vcf_cg_iters=10,
+        vcf_lambda_init=0.1,
+        vcf_detach=False,
         cross_overlap_relation="none",
         cross_overlap_stage="inter-gat",
         cross_overlap_message="qk-prior",
@@ -4661,6 +6549,7 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.height = height
         self.width = width
         self.graph_modality_lambda = graph_modality_lambda
+        self.shared_superpixel_fusion = shared_superpixel_fusion
         self.fusion_lambda = fusion_lambda
         self.cross_overlap_relation = cross_overlap_relation
         self.cross_overlap_stage = cross_overlap_stage
@@ -4668,12 +6557,17 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.assignment_graph = assignment_graph
         self.assignment_graph_output = assignment_graph_output
         self.assignment_graph_weight = float(assignment_graph_weight)
+        self.assignment_graph_fusion = assignment_graph_fusion
+        self.gfm = gfm
+        self.vcf = vcf
         self.evidence_fusion = evidence_fusion
         self.bcq_interaction = bcq_interaction
         self.consensus_token_fusion = consensus_token_fusion
         self.last_dta_diagnostics = None
         self.last_dta_film_diagnostics = None
         self.last_assignment_graph_diagnostics = None
+        self.last_gfm_diagnostics = None
+        self.last_vcf_diagnostics = None
         self.last_cross_overlap_diagnostics = None
         self.last_bcq_diagnostics = None
         self.last_consensus_token_diagnostics = None
@@ -4707,6 +6601,24 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             rag_adjacency=lidar_rag_adjacency,
             geometry_descriptors=lidar_geometry_descriptors,
         )
+        if shared_superpixel_fusion == "node-cat":
+            if hsi_assignment.shape != lidar_assignment.shape:
+                raise ValueError(
+                    "node-cat readout requires identical HSI/LiDAR "
+                    "superpixel assignment shapes."
+                )
+            self.shared_node_cat_projection = nn.Sequential(
+                nn.Linear(2 * hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.LeakyReLU(),
+            )
+        elif shared_superpixel_fusion in ("none", "weighted"):
+            self.shared_node_cat_projection = None
+        else:
+            raise ValueError(
+                "shared_superpixel_fusion must be none, weighted, or "
+                "node-cat."
+            )
 
         def make_cnn_branch():
             if cnn_branch == "original":
@@ -4830,9 +6742,12 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 tau=dta_tau,
                 gamma_init=dta_gamma_init,
                 variant=dta_variant,
+                overlap_weight=dta_overlap_weight,
+                structure_weight=dta_structure_weight,
                 nonlocal_topk=dta_nonlocal_topk,
                 normalization=dta_normalization,
                 sinkhorn_iters=dta_sinkhorn_iters,
+                mass_sinkhorn_iters=dta_mass_sinkhorn_iters,
             )
         else:
             self.dta_branch = None
@@ -4863,9 +6778,75 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 topk=assignment_graph_topk,
                 gamma_init=assignment_graph_gamma_init,
                 output=assignment_graph_output,
+                detach_pair_inputs=assignment_graph_pair_detach,
             )
+            if assignment_graph_fusion == "conflict-gate":
+                self.consensus_stream_fusion = ConsensusStreamFusion(
+                    hidden_dim,
+                    gate_hidden=assignment_graph_gate_hidden,
+                )
+                conflict_pixels = torch.sparse.mm(
+                    self.assignment_graph_branch.pair_projection_assignment,
+                    (1.0 - self.assignment_graph_branch.iou).unsqueeze(1),
+                )
+                self.register_buffer(
+                    "assignment_conflict_pixels",
+                    conflict_pixels,
+                    persistent=False,
+                )
+            else:
+                self.consensus_stream_fusion = None
+                self.assignment_conflict_pixels = None
         else:
             self.assignment_graph_branch = None
+            self.consensus_stream_fusion = None
+            self.assignment_conflict_pixels = None
+
+        if gfm != "none":
+            if gfm_spectral_data is None:
+                raise ValueError("GFMI requires precomputed spectral data.")
+            self.gfm_branch = GraphFunctionalMapInteraction(
+                hidden_dim,
+                gfm_spectral_data,
+                detach_inputs=gfm_detach,
+            )
+            self.gfm_consensus_fusion = ConsensusStreamFusion(hidden_dim)
+            self.register_buffer(
+                "gfm_conflict_pixels",
+                torch.zeros(height * width, 1, dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self.gfm_branch = None
+            self.gfm_consensus_fusion = None
+            self.gfm_conflict_pixels = None
+
+        if vcf != "none":
+            self.vcf_branch = VariationalConsensusField(
+                channels=hidden_dim,
+                consensus_dim=vcf_dim,
+                hsi_pooling_assignment=(
+                    self.hsi_graph.pooling_assignment
+                ),
+                lidar_pooling_assignment=(
+                    self.lidar_graph.pooling_assignment
+                ),
+                hsi_projection_assignment=(
+                    self.hsi_graph.projection_assignment
+                ),
+                lidar_projection_assignment=(
+                    self.lidar_graph.projection_assignment
+                ),
+                height=height,
+                width=width,
+                cg_iters=vcf_cg_iters,
+                lambda_init=vcf_lambda_init,
+                detach_inputs=vcf_detach,
+            )
+            self.vcf_consensus_fusion = ConsensusStreamFusion(hidden_dim)
+        else:
+            self.vcf_branch = None
+            self.vcf_consensus_fusion = None
 
         if cross_overlap_relation == "sparse":
             if cross_overlap_data is None:
@@ -5114,6 +7095,8 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             hsi_final_nodes, lidar_final_nodes = self.dta_branch(
                 hsi_final_nodes,
                 lidar_final_nodes,
+                hsi_adjacency,
+                lidar_adjacency,
             )
             self.last_dta_diagnostics = self.dta_branch.diagnostics()
             if self.dta_film_branch is not None:
@@ -5139,6 +7122,22 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                 self.assignment_graph_branch.diagnostics()
             )
         return hsi_final_nodes, lidar_final_nodes
+
+
+    def _project_shared_node_cat(self, hsi_nodes, lidar_nodes):
+        if self.shared_node_cat_projection is None:
+            raise RuntimeError("Shared node-cat projection is not enabled.")
+        if hsi_nodes.shape[0] != lidar_nodes.shape[0]:
+            raise RuntimeError(
+                "HSI/LiDAR node counts differ; node-cat requires one-to-one "
+                "nodes from the shared partition."
+            )
+        concatenated_nodes = torch.cat([hsi_nodes, lidar_nodes], dim=1)
+        pixel_features = torch.sparse.mm(
+            self.hsi_graph.projection_assignment,
+            concatenated_nodes,
+        )
+        return self.shared_node_cat_projection(pixel_features)
 
 
     def _forward_cross_overlap_relation(self, hsi, lidar):
@@ -5357,6 +7356,8 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
         self.last_dta_diagnostics = None
         self.last_dta_film_diagnostics = None
         self.last_assignment_graph_diagnostics = None
+        self.last_gfm_diagnostics = None
+        self.last_vcf_diagnostics = None
         self.last_cross_overlap_diagnostics = None
         self.last_bcq_diagnostics = None
         self.last_consensus_token_diagnostics = None
@@ -5379,8 +7380,11 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
             if (
                 self.dta_branch is not None
                 or self.assignment_graph_branch is not None
+                or self.gfm_branch is not None
+                or self.vcf_branch is not None
                 or self.overlap_distill_enabled
                 or self.evidence_fusion == "dirichlet"
+                or self.shared_superpixel_fusion == "node-cat"
             ):
                 (
                     hsi_final_nodes,
@@ -5390,32 +7394,103 @@ class OriginalHGCNHLWithSeparateGSDGGraphs(nn.Module):
                     hsi_final_nodes,
                     lidar_final_nodes,
                 )
-                hsi_graph_features = self.hsi_graph.project_nodes(
-                    hsi_final_nodes
-                )
-                lidar_graph_features = self.lidar_graph.project_nodes(
-                    lidar_final_nodes
-                )
+                if self.shared_superpixel_fusion == "node-cat":
+                    graph_features = self._project_shared_node_cat(
+                        hsi_final_nodes,
+                        lidar_final_nodes,
+                    )
+                else:
+                    hsi_graph_features = self.hsi_graph.project_nodes(
+                        hsi_final_nodes
+                    )
+                    lidar_graph_features = self.lidar_graph.project_nodes(
+                        lidar_final_nodes
+                    )
             else:
                 hsi_graph_features = self.hsi_graph(hsi)
                 lidar_graph_features = self.lidar_graph(lidar)
-            graph_features = (
-                self.graph_modality_lambda * hsi_graph_features
-                + (1.0 - self.graph_modality_lambda)
-                * lidar_graph_features
-            )
+            if self.shared_superpixel_fusion != "node-cat":
+                graph_features = (
+                    self.graph_modality_lambda * hsi_graph_features
+                    + (1.0 - self.graph_modality_lambda)
+                    * lidar_graph_features
+                )
+            if self.gfm_branch is not None:
+                consensus_h, consensus_l = self.gfm_branch(
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                )
+                consensus_h_pixels = torch.sparse.mm(
+                    self.hsi_graph.projection_assignment,
+                    consensus_h,
+                )
+                consensus_l_pixels = torch.sparse.mm(
+                    self.lidar_graph.projection_assignment,
+                    consensus_l,
+                )
+                consensus_pixels = (
+                    self.graph_modality_lambda * consensus_h_pixels
+                    + (1.0 - self.graph_modality_lambda)
+                    * consensus_l_pixels
+                )
+                graph_features, _ = self.gfm_consensus_fusion(
+                    graph_features,
+                    consensus_pixels,
+                    self.gfm_conflict_pixels,
+                )
+                self.last_gfm_diagnostics = {
+                    **(self.gfm_branch.diagnostics() or {}),
+                    **(self.gfm_consensus_fusion.diagnostics() or {}),
+                }
+            if self.vcf_branch is not None:
+                consensus_pixels, conflict_pixels = self.vcf_branch(
+                    hsi_final_nodes,
+                    lidar_final_nodes,
+                )
+                graph_features, _ = self.vcf_consensus_fusion(
+                    graph_features,
+                    consensus_pixels,
+                    conflict_pixels,
+                )
+                self.last_vcf_diagnostics = {
+                    **(self.vcf_branch.diagnostics() or {}),
+                    **(self.vcf_consensus_fusion.diagnostics() or {}),
+                }
             if (
                 self.assignment_graph_branch is not None
-                and self.assignment_graph_output in ("third-branch", "both")
+                and self.assignment_graph_output
+                in ("third-branch", "pure-third", "both")
             ):
                 assignment_graph_features = (
                     self.assignment_graph_branch.project_pair_nodes()
                 )
-                graph_features = (
-                    (1.0 - self.assignment_graph_weight) * graph_features
-                    + self.assignment_graph_weight
-                    * assignment_graph_features
-                )
+                if self.assignment_graph_fusion == "conflict-gate":
+                    graph_features, _ = self.consensus_stream_fusion(
+                        graph_features,
+                        assignment_graph_features,
+                        self.assignment_conflict_pixels,
+                    )
+                    self.last_assignment_graph_diagnostics = {
+                        **(self.last_assignment_graph_diagnostics or {}),
+                        "pixel_fusion": "conflict-gate",
+                        **(
+                            self.consensus_stream_fusion.diagnostics()
+                            or {}
+                        ),
+                    }
+                else:
+                    graph_features = (
+                        (1.0 - self.assignment_graph_weight) * graph_features
+                        + self.assignment_graph_weight
+                        * assignment_graph_features
+                    )
+                    self.last_assignment_graph_diagnostics = {
+                        **(self.last_assignment_graph_diagnostics or {}),
+                        "pixel_fusion": "fixed",
+                        "third_branch_weight": float(
+                            self.assignment_graph_weight
+                        ),
+                    }
 
         if self.evidence_fusion == "dirichlet":
             return self._forward_evidence_fusion_from_cached_nodes()
@@ -5460,12 +7535,14 @@ def prepare_data(args, config):
         hsi_assignment,
         lidar_assignment,
         assignment,
+        hsi_assignment_parts,
         lidar_assignment_parts,
     ) = build_modality_superpixel_assignments(
         hsi,
         lidar[:, :, np.newaxis],
         args.scales,
         args.lidar_segmentation,
+        shared_superpixels=args.shared_superpixel_fusion != "none",
     )
     hsi_spatial_prior = build_superpixel_spatial_prior(
         hsi_assignment,
@@ -5533,21 +7610,40 @@ def prepare_data(args, config):
     needs_cross_overlap_data = (
         args.dual_transport_arbitration != "none"
         or args.assignment_graph != "none"
+        or args.gfm != "none"
         or args.cross_overlap_relation == "sparse"
         or args.overlap_distill_weight > 0
+        or args.pacmt != "none"
         or args.evidence_fusion == "dirichlet"
         or args.bcq_interaction != "none"
         or args.consensus_token_fusion != "none"
     )
     if needs_cross_overlap_data:
+        overlap_edge_attrs = (
+            "physical"
+            if args.pacmt != "none"
+            else args.cross_overlap_edge_attrs
+        )
         cross_overlap_data = build_sparse_overlap_relation_data(
             hsi_assignment,
             lidar_assignment,
             hsi_features=hsi,
             lidar_image=lidar,
-            edge_attrs=args.cross_overlap_edge_attrs,
+            edge_attrs=overlap_edge_attrs,
             min_coverage=args.cross_overlap_min_coverage,
             iou_topk=args.cross_overlap_iou_topk,
+        )
+    gfm_spectral_data = None
+    if args.gfm != "none":
+        gfm_spectral_data = build_gfm_spectral_data(
+            hsi_assignment_parts,
+            lidar_assignment_parts,
+            hsi.shape[0],
+            hsi.shape[1],
+            args.spatial_prior_k,
+            lidar_rag_adjacency,
+            cross_overlap_data,
+            args.gfm_rank,
         )
 
     return (
@@ -5567,6 +7663,7 @@ def prepare_data(args, config):
         cell_data,
         bridge_data,
         cross_overlap_data,
+        gfm_spectral_data,
         joint_spatial_prior,
     )
 
@@ -5589,6 +7686,7 @@ def train_one_run(
     cell_data,
     bridge_data,
     cross_overlap_data,
+    gfm_spectral_data,
     joint_spatial_prior,
     run_index,
 ):
@@ -5648,14 +7746,18 @@ def train_one_run(
             ),
             lidar_modulation=args.lidar_modulation,
             graph_modality_lambda=args.graph_modality_lambda,
+            shared_superpixel_fusion=args.shared_superpixel_fusion,
             dual_transport_arbitration=args.dual_transport_arbitration,
             dta_d_k=args.dta_dk,
             dta_tau=args.dta_tau,
             dta_gamma_init=args.dta_gamma_init,
             dta_variant=args.dta_variant,
+            dta_overlap_weight=args.dta_overlap_weight,
+            dta_structure_weight=args.dta_structure_weight,
             dta_nonlocal_topk=args.dta_nonlocal_topk,
             dta_normalization=args.dta_normalization,
             dta_sinkhorn_iters=args.dta_sinkhorn_iters,
+            dta_mass_sinkhorn_iters=args.dta_mass_sinkhorn_iters,
             dta_film=args.dta_film,
             dta_film_d_s=args.dta_film_ds,
             dta_film_gamma_init=args.dta_film_gamma_init,
@@ -5664,6 +7766,21 @@ def train_one_run(
             assignment_graph_gamma_init=args.assignment_graph_gamma_init,
             assignment_graph_output=args.assignment_graph_output,
             assignment_graph_weight=args.assignment_graph_weight,
+            assignment_graph_pair_detach=(
+                args.assignment_graph_pair_detach
+            ),
+            assignment_graph_fusion=args.assignment_graph_fusion,
+            assignment_graph_gate_hidden=(
+                args.assignment_graph_gate_hidden
+            ),
+            gfm=args.gfm,
+            gfm_detach=args.gfm_detach,
+            gfm_spectral_data=gfm_spectral_data,
+            vcf=args.vcf,
+            vcf_dim=args.vcf_dim,
+            vcf_cg_iters=args.vcf_cg_iters,
+            vcf_lambda_init=args.vcf_lambda_init,
+            vcf_detach=args.vcf_detach,
             cross_overlap_relation=args.cross_overlap_relation,
             cross_overlap_stage=args.cross_overlap_stage,
             cross_overlap_message=args.cross_overlap_message,
@@ -5677,7 +7794,9 @@ def train_one_run(
                 args.cross_overlap_fragmentation_alpha
             ),
             cross_overlap_data=cross_overlap_data,
-            overlap_distill_enabled=args.overlap_distill_weight > 0,
+            overlap_distill_enabled=(
+                args.overlap_distill_weight > 0 or args.pacmt != "none"
+            ),
             evidence_fusion=args.evidence_fusion,
             bcq_interaction=args.bcq_interaction,
             bcq_class_count=class_count,
@@ -5722,20 +7841,86 @@ def train_one_run(
     )
     criterion = nn.CrossEntropyLoss()
     overlap_distill_tensors = None
-    if args.overlap_distill_weight > 0:
+    hsi_training_node_pairs = None
+    lidar_training_node_pairs = None
+    credibility_h = None
+    credibility_l = None
+    pacmt_edge_weight = None
+    pacmt_unlabeled_edge_mask = None
+    needs_prediction_interaction = (
+        args.overlap_distill_weight > 0 or args.pacmt != "none"
+    )
+    needs_class_credibility = (
+        args.overlap_distill_credibility == "class-ema"
+        or args.pacmt != "none"
+    )
+    if needs_prediction_interaction:
         overlap_distill_tensors = build_overlap_distill_tensors(
             cross_overlap_data,
             device,
         )
+        if needs_class_credibility:
+            training_labels_numpy = train_labels.detach().cpu().numpy()
+            hsi_training_node_pairs = build_training_node_label_pairs(
+                hsi_assignment,
+                train_indices,
+                training_labels_numpy,
+                device,
+            )
+            lidar_training_node_pairs = build_training_node_label_pairs(
+                lidar_assignment,
+                train_indices,
+                training_labels_numpy,
+                device,
+            )
+            credibility_h = torch.full(
+                (class_count,),
+                0.5,
+                dtype=torch.float32,
+                device=device,
+            )
+            credibility_l = torch.full_like(credibility_h, 0.5)
+        if args.pacmt != "none":
+            pacmt_edge_weight = build_pacmt_physical_edge_weights(
+                overlap_distill_tensors,
+                alpha_sam=args.pacmt_alpha_sam,
+                alpha_frag=args.pacmt_alpha_frag,
+                iou_tau=args.pacmt_iou_tau,
+            )
+            h_labeled_nodes = torch.zeros(
+                hsi_assignment.shape[1],
+                dtype=torch.bool,
+                device=device,
+            )
+            l_labeled_nodes = torch.zeros(
+                lidar_assignment.shape[1],
+                dtype=torch.bool,
+                device=device,
+            )
+            h_labeled_nodes[hsi_training_node_pairs["node_index"]] = True
+            l_labeled_nodes[lidar_training_node_pairs["node_index"]] = True
+            pacmt_unlabeled_edge_mask = ~(
+                h_labeled_nodes.index_select(
+                    0,
+                    overlap_distill_tensors["h_index"],
+                )
+                | l_labeled_nodes.index_select(
+                    0,
+                    overlap_distill_tensors["l_index"],
+                )
+            )
     best_loss = float("inf")
     best_state = None
     dta_diagnostics = []
     dta_film_diagnostics = []
     assignment_graph_diagnostics = []
+    gfm_diagnostics = []
+    vcf_diagnostics = []
     cross_overlap_diagnostics = []
     bcq_diagnostics = []
     consensus_token_diagnostics = []
     overlap_distill_diagnostics = []
+    pacmt_diagnostics = []
     evidence_fusion_diagnostics = []
     start_time = time.perf_counter()
 
@@ -5870,6 +8055,7 @@ def train_one_run(
                     or {}
                 ),
             }
+        credibility_updated = False
         overlap_distill_record = None
         if args.overlap_distill_weight > 0:
             inputs_are_probabilities = args.evidence_fusion == "dirichlet"
@@ -5896,8 +8082,28 @@ def train_one_run(
                     "Overlap distillation requires separate HSI/LiDAR "
                     "node predictions. Use --graph-layout separate."
                 )
-            distill_loss, distill_record = (
-                confidence_weighted_overlap_distill_loss(
+            current_accuracy_h = None
+            current_accuracy_l = None
+            if args.overlap_distill_credibility == "class-ema":
+                current_accuracy_h, _ = update_class_credibility_ema(
+                    credibility_h,
+                    hsi_node_scores,
+                    hsi_training_node_pairs,
+                    class_count,
+                    args.overlap_distill_credibility_momentum,
+                )
+                current_accuracy_l, _ = update_class_credibility_ema(
+                    credibility_l,
+                    lidar_node_scores,
+                    lidar_training_node_pairs,
+                    class_count,
+                    args.overlap_distill_credibility_momentum,
+                )
+                credibility_updated = True
+            needs_relational_edges = (
+                args.overlap_distill_relational_weight > 0
+            )
+            distill_outputs = confidence_weighted_overlap_distill_loss(
                     hsi_node_scores,
                     lidar_node_scores,
                     overlap_distill_tensors,
@@ -5907,8 +8113,48 @@ def train_one_run(
                     margin=args.overlap_distill_margin,
                     confidence_mode=args.overlap_distill_confidence,
                     inputs_are_probabilities=inputs_are_probabilities,
+                    credibility_h=credibility_h,
+                    credibility_l=credibility_l,
+                    return_active_edges=needs_relational_edges,
                 )
-            )
+            if needs_relational_edges:
+                distill_loss, distill_record, active_edges = (
+                    distill_outputs
+                )
+                hsi_final_nodes = getattr(
+                    model,
+                    "last_hsi_final_nodes",
+                    None,
+                )
+                lidar_final_nodes = getattr(
+                    model,
+                    "last_lidar_final_nodes",
+                    None,
+                )
+                if hsi_final_nodes is None or lidar_final_nodes is None:
+                    raise RuntimeError(
+                        "Relational overlap distillation requires cached "
+                        "HSI/LiDAR final nodes."
+                    )
+                relational_loss, relational_record = (
+                    relational_overlap_distill_loss(
+                        hsi_final_nodes,
+                        lidar_final_nodes,
+                        overlap_distill_tensors,
+                        active_edges,
+                        sample_count=(
+                            args.overlap_distill_relational_samples
+                        ),
+                    )
+                )
+            else:
+                distill_loss, distill_record = distill_outputs
+                relational_loss = loss.new_tensor(0.0)
+                relational_record = {
+                    "relational_active_edges": 0,
+                    "relational_sampled_edges": 0,
+                    "relational_raw_loss": 0.0,
+                }
             distill_ramp = overlap_distill_ramp(
                 epoch,
                 args.epochs,
@@ -5919,7 +8165,23 @@ def train_one_run(
                 * distill_ramp
                 * distill_loss
             )
-            loss = loss + weighted_distill_loss
+            weighted_relational_loss = (
+                args.overlap_distill_relational_weight
+                * distill_ramp
+                * relational_loss
+            )
+            total_distill_loss = (
+                weighted_distill_loss + weighted_relational_loss
+            )
+            loss = loss + total_distill_loss
+            def optional_accuracy_list(values):
+                if values is None:
+                    return None
+                return [
+                    None if torch.isnan(value) else float(value.item())
+                    for value in values.detach().cpu()
+                ]
+
             overlap_distill_record = {
                 "epoch": epoch,
                 "weight": float(args.overlap_distill_weight),
@@ -5929,6 +8191,32 @@ def train_one_run(
                 "warmup_ratio": float(args.overlap_distill_warmup_ratio),
                 "ramp": float(distill_ramp),
                 "confidence": args.overlap_distill_confidence,
+                "credibility": args.overlap_distill_credibility,
+                "credibility_momentum": float(
+                    args.overlap_distill_credibility_momentum
+                ),
+                "credibility_h": (
+                    credibility_h.detach().cpu().tolist()
+                    if credibility_h is not None
+                    else None
+                ),
+                "credibility_l": (
+                    credibility_l.detach().cpu().tolist()
+                    if credibility_l is not None
+                    else None
+                ),
+                "current_class_accuracy_h": optional_accuracy_list(
+                    current_accuracy_h
+                ),
+                "current_class_accuracy_l": optional_accuracy_list(
+                    current_accuracy_l
+                ),
+                "relational_weight": float(
+                    args.overlap_distill_relational_weight
+                ),
+                "relational_samples": int(
+                    args.overlap_distill_relational_samples
+                ),
                 "input": (
                     "expected-probability"
                     if inputs_are_probabilities
@@ -5937,7 +8225,130 @@ def train_one_run(
                 "weighted_loss": float(
                     weighted_distill_loss.detach().item()
                 ),
+                "relational_weighted_loss": float(
+                    weighted_relational_loss.detach().item()
+                ),
+                "total_weighted_loss": float(
+                    total_distill_loss.detach().item()
+                ),
                 **distill_record,
+                **relational_record,
+            }
+        pacmt_record = None
+        if args.pacmt != "none":
+            hsi_node_logits = getattr(model, "last_hsi_node_logits", None)
+            lidar_node_logits = getattr(
+                model,
+                "last_lidar_node_logits",
+                None,
+            )
+            if hsi_node_logits is None or lidar_node_logits is None:
+                raise RuntimeError(
+                    "PACMT requires cached HSI/LiDAR node logits. Use "
+                    "--graph-layout separate and --evidence-fusion none."
+                )
+            current_accuracy_h = None
+            current_accuracy_l = None
+            if not credibility_updated:
+                current_accuracy_h, _ = update_class_credibility_ema(
+                    credibility_h,
+                    hsi_node_logits,
+                    hsi_training_node_pairs,
+                    class_count,
+                    args.overlap_distill_credibility_momentum,
+                )
+                current_accuracy_l, _ = update_class_credibility_ema(
+                    credibility_l,
+                    lidar_node_logits,
+                    lidar_training_node_pairs,
+                    class_count,
+                    args.overlap_distill_credibility_momentum,
+                )
+                credibility_updated = True
+            pacmt_kd_loss, pacmt_pl_loss, pacmt_outputs = (
+                physically_arbitrated_mutual_teaching_loss(
+                    hsi_node_logits,
+                    lidar_node_logits,
+                    overlap_distill_tensors,
+                    pacmt_edge_weight,
+                    class_count,
+                    mode=args.pacmt,
+                    credibility_h=credibility_h,
+                    credibility_l=credibility_l,
+                    temperature=args.overlap_distill_temperature,
+                    confidence_mode=args.overlap_distill_confidence,
+                    direction_temperature=(
+                        args.pacmt_direction_temperature
+                    ),
+                    pseudo_confidence=args.pacmt_pl_conf,
+                    pseudo_min_weight=args.pacmt_pl_min_weight,
+                    pseudo_per_class_cap=args.pacmt_pl_cap,
+                    pseudo_edge_mask=pacmt_unlabeled_edge_mask,
+                )
+            )
+            pacmt_ramp = overlap_distill_ramp(
+                epoch,
+                args.epochs,
+                args.overlap_distill_warmup_ratio,
+            )
+            weighted_pacmt_kd = (
+                args.pacmt_kd_weight * pacmt_ramp * pacmt_kd_loss
+            )
+            weighted_pacmt_pl = (
+                args.pacmt_pl_weight * pacmt_ramp * pacmt_pl_loss
+            )
+            weighted_pacmt_loss = weighted_pacmt_kd + weighted_pacmt_pl
+            loss = loss + weighted_pacmt_loss
+
+            def pacmt_optional_accuracy_list(values):
+                if values is None:
+                    return None
+                return [
+                    None if torch.isnan(value) else float(value.item())
+                    for value in values.detach().cpu()
+                ]
+
+            pacmt_record = {
+                "epoch": epoch,
+                "mode": args.pacmt,
+                "ramp": float(pacmt_ramp),
+                "temperature": float(args.overlap_distill_temperature),
+                "warmup_ratio": float(
+                    args.overlap_distill_warmup_ratio
+                ),
+                "confidence": args.overlap_distill_confidence,
+                "credibility_momentum": float(
+                    args.overlap_distill_credibility_momentum
+                ),
+                "credibility_h": credibility_h.detach().cpu().tolist(),
+                "credibility_l": credibility_l.detach().cpu().tolist(),
+                "current_class_accuracy_h": (
+                    pacmt_optional_accuracy_list(current_accuracy_h)
+                ),
+                "current_class_accuracy_l": (
+                    pacmt_optional_accuracy_list(current_accuracy_l)
+                ),
+                "alpha_sam": float(args.pacmt_alpha_sam),
+                "alpha_frag": float(args.pacmt_alpha_frag),
+                "iou_tau": float(args.pacmt_iou_tau),
+                "direction_temperature": float(
+                    args.pacmt_direction_temperature
+                ),
+                "pseudo_confidence": float(args.pacmt_pl_conf),
+                "pseudo_min_weight": float(args.pacmt_pl_min_weight),
+                "pseudo_per_class_cap": int(args.pacmt_pl_cap),
+                "kd_weight": float(args.pacmt_kd_weight),
+                "pseudo_weight": float(args.pacmt_pl_weight),
+                "kd_weighted_loss": float(
+                    weighted_pacmt_kd.detach().item()
+                ),
+                "pseudo_weighted_loss": float(
+                    weighted_pacmt_pl.detach().item()
+                ),
+                "total_weighted_loss": float(
+                    weighted_pacmt_loss.detach().item()
+                ),
+                **pacmt_outputs,
             }
         loss.backward()
         optimizer.step()
@@ -5979,6 +8390,20 @@ def train_one_run(
                     **assignment_graph_record,
                 }
                 assignment_graph_diagnostics.append(assignment_graph_record)
+            gfm_record = getattr(model, "last_gfm_diagnostics", None)
+            if gfm_record is not None:
+                gfm_record = {
+                    "epoch": epoch,
+                    **gfm_record,
+                }
+                gfm_diagnostics.append(gfm_record)
+            vcf_record = getattr(model, "last_vcf_diagnostics", None)
+            if vcf_record is not None:
+                vcf_record = {
+                    "epoch": epoch,
+                    **vcf_record,
+                }
+                vcf_diagnostics.append(vcf_record)
             cross_overlap_record = getattr(
                 model,
                 "last_cross_overlap_diagnostics",
@@ -6003,6 +8428,8 @@ def train_one_run(
                 overlap_distill_diagnostics.append(
                     overlap_distill_record
                 )
+            if pacmt_record is not None:
+                pacmt_diagnostics.append(pacmt_record)
             if evidence_record is not None:
                 evidence_fusion_diagnostics.append(evidence_record)
             train_predictions = (
@@ -6022,6 +8449,21 @@ def train_one_run(
                 f"train_OA={train_oa:.4f}"
             )
             if overlap_distill_record is not None:
+                credibility_suffix = ""
+                if overlap_distill_record["credibility"] == "class-ema":
+                    credibility_suffix = (
+                        ", credibility H/L="
+                        f"{np.mean(overlap_distill_record['credibility_h']):.3f}/"
+                        f"{np.mean(overlap_distill_record['credibility_l']):.3f}"
+                    )
+                relational_suffix = ""
+                if overlap_distill_record["relational_weight"] > 0:
+                    relational_suffix = (
+                        ", relational="
+                        f"{overlap_distill_record['relational_weighted_loss']:.6f}"
+                        "@"
+                        f"{overlap_distill_record['relational_sampled_edges']}"
+                    )
                 print(
                     "  Overlap distill: "
                     f"w={overlap_distill_record['weight']:.3g}, "
@@ -6035,7 +8477,27 @@ def train_one_run(
                     "conf="
                     f"{overlap_distill_record['mean_conf_h']:.3f}/"
                     f"{overlap_distill_record['mean_conf_l']:.3f}, "
+                    "score="
+                    f"{overlap_distill_record['mean_teacher_score_h']:.3f}/"
+                    f"{overlap_distill_record['mean_teacher_score_l']:.3f}, "
                     f"IoU={overlap_distill_record['mean_iou']:.3f}"
+                    f"{credibility_suffix}{relational_suffix}"
+                )
+            if pacmt_record is not None:
+                print(
+                    "  PACMT: "
+                    f"mode={pacmt_record['mode']}, "
+                    f"ramp={pacmt_record['ramp']:.3f}, "
+                    "KD/PL="
+                    f"{pacmt_record['kd_weighted_loss']:.6f}/"
+                    f"{pacmt_record['pseudo_weighted_loss']:.6f}, "
+                    "teacher H->L/L->H="
+                    f"{pacmt_record['h_to_l_teacher_edges']}/"
+                    f"{pacmt_record['l_to_h_teacher_edges']}, "
+                    "pseudo="
+                    f"{pacmt_record['pseudo_selected_edges']}/"
+                    f"{pacmt_record['pseudo_eligible_edges']}, "
+                    f"edge-w={pacmt_record['physical_weight_mean']:.3f}"
                 )
             if evidence_record is not None:
                 print(
@@ -6081,6 +8543,31 @@ def train_one_run(
                         f"{dta_record['h_escape_mean']:.3f}/"
                         f"{dta_record['l_escape_mean']:.3f}"
                     )
+                if dta_record.get("normalization") == "lightglue":
+                    print(
+                        "  DTA LightGlue assignment: "
+                        "matchability H/L="
+                        f"{dta_record['h_matchability_mean']:.3f}/"
+                        f"{dta_record['l_matchability_mean']:.3f}, "
+                        "arb-gate H/L="
+                        f"{dta_record['h_arbitration_gate_mean']:.3f}/"
+                        f"{dta_record['l_arbitration_gate_mean']:.3f}, "
+                        f"mass={dta_record['assignment_mass']:.3f}, "
+                        "support-density="
+                        f"{dta_record['assignment_support_density']:.3f}"
+                    )
+                if dta_record["mode"].endswith("structural-consensus"):
+                    print(
+                        "  DTA structural consensus: "
+                        "marginal max row/col="
+                        f"{dta_record['sinkhorn_row_error_max']:.2e}/"
+                        f"{dta_record['sinkhorn_col_error_max']:.2e}, "
+                        "coupling-delta="
+                        f"{dta_record['coupling_delta_l1']:.3e}, "
+                        "support-density="
+                        f"{dta_record['structural_support_density']:.3f}, "
+                        f"mass={dta_record['transport_mass']:.3f}"
+                    )
             if dta_film_record is not None:
                 print(
                     "  DTA-FiLM: "
@@ -6099,6 +8586,16 @@ def train_one_run(
                     f"{dta_film_record['delta_l_norm']:.4f}"
                 )
             if assignment_graph_record is not None:
+                consensus_suffix = ""
+                if (
+                    assignment_graph_record.get("pixel_fusion")
+                    == "conflict-gate"
+                ):
+                    consensus_suffix = (
+                        ", pix-gate/conflict="
+                        f"{assignment_graph_record['consensus_gate_mean']:.3f}/"
+                        f"{assignment_graph_record['conflict_pixel_mean']:.3f}"
+                    )
                 print(
                     "  Assignment graph: "
                     f"out={assignment_graph_record['output']}, "
@@ -6115,6 +8612,41 @@ def train_one_run(
                     "adj="
                     f"dens{assignment_graph_record['assignment_density']:.4f}/"
                     f"ent{assignment_graph_record['assignment_entropy_mean']:.3f}"
+                    f"{consensus_suffix}"
+                )
+            if gfm_record is not None:
+                print(
+                    "  GFMI: "
+                    f"rank={gfm_record['rank']}, "
+                    f"detach={gfm_record['detach_inputs']}, "
+                    "band H/L="
+                    f"{gfm_record['band_h_mean']:.3f}/"
+                    f"{gfm_record['band_l_mean']:.3f}, "
+                    "spectral-conflict H/L="
+                    f"{gfm_record['frequency_conflict_h_mean']:.3f}/"
+                    f"{gfm_record['frequency_conflict_l_mean']:.3f}, "
+                    "Cres/Cgeo="
+                    f"{gfm_record['c_res_relative_norm']:.3e}, "
+                    f"pixel-gate={gfm_record['consensus_gate_mean']:.3f}"
+                )
+            if vcf_record is not None:
+                print(
+                    "  VCF: "
+                    f"d={vcf_record['consensus_dim']}, "
+                    f"CG={vcf_record['cg_iters']}, "
+                    f"detach={vcf_record['detach_inputs']}, "
+                    "precision H/L="
+                    f"{vcf_record['precision_h_mean']:.3f}/"
+                    f"{vcf_record['precision_l_mean']:.3f}, "
+                    "obs-res H/L="
+                    f"{vcf_record['observation_residual_h_mean']:.3f}/"
+                    f"{vcf_record['observation_residual_l_mean']:.3f}, "
+                    "CG-res mean/max="
+                    f"{vcf_record['cg_relative_residual_mean']:.2e}/"
+                    f"{vcf_record['cg_relative_residual_max']:.2e}, "
+                    f"beta/lambda={vcf_record['beta']:.3f}/"
+                    f"{vcf_record['smoothness_lambda']:.3f}, "
+                    f"pixel-gate={vcf_record['consensus_gate_mean']:.3f}"
                 )
             if cross_overlap_record is not None:
                 if (
@@ -6256,13 +8788,17 @@ def train_one_run(
         f"prior-{args.lidar_graph_prior}_"
         f"{dta_configuration_tag(args)}_"
         f"{assignment_graph_configuration_tag(args)}_"
+        f"{gfm_configuration_tag(args)}_"
+        f"{vcf_configuration_tag(args)}_"
         f"{cross_overlap_configuration_tag(args)}_"
         f"{bcq_configuration_tag(args)}_"
         f"{consensus_token_configuration_tag(args)}_"
         f"{overlap_distill_configuration_tag(args)}_"
+        f"{pacmt_configuration_tag(args)}_"
         f"{evidence_fusion_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
         f"{cnn_configuration_tag(args)}_"
+        f"{shared_superpixel_configuration_tag(args)}_"
         f"lidarmod-{args.lidar_modulation}_"
         f"{seed_configuration_tag(args)}_"
         f"{dummy_logit_configuration_tag(args, class_count)}_"
@@ -6291,11 +8827,30 @@ def train_one_run(
         "dta_diagnostics": dta_diagnostics,
         "dta_film_diagnostics": dta_film_diagnostics,
         "assignment_graph_diagnostics": assignment_graph_diagnostics,
+        "gfm_diagnostics": gfm_diagnostics,
+        "vcf_diagnostics": vcf_diagnostics,
         "cross_overlap_diagnostics": cross_overlap_diagnostics,
         "bcq_diagnostics": bcq_diagnostics,
         "consensus_token_diagnostics": consensus_token_diagnostics,
         "bcq_final_node_diagnostics": bcq_final_node_diagnostics,
         "overlap_distill_diagnostics": overlap_distill_diagnostics,
+        "pacmt_diagnostics": pacmt_diagnostics,
+        "overlap_distill_final_credibility": (
+            {
+                "hsi": credibility_h.detach().cpu().tolist(),
+                "lidar": credibility_l.detach().cpu().tolist(),
+            }
+            if credibility_h is not None and credibility_l is not None
+            else None
+        ),
+        "pacmt_final_credibility": (
+            {
+                "hsi": credibility_h.detach().cpu().tolist(),
+                "lidar": credibility_l.detach().cpu().tolist(),
+            }
+            if args.pacmt != "none"
+            else None
+        ),
         "evidence_fusion_diagnostics": evidence_fusion_diagnostics,
     }
 
@@ -6313,6 +8868,11 @@ def normalize_joint_layout_args(args):
             setattr(args, attribute, default)
 
     reset_if_needed(
+        "shared_superpixel_fusion",
+        "none",
+        "--shared-superpixel-fusion",
+    )
+    reset_if_needed(
         "dual_transport_arbitration",
         "none",
         "--dual-transport-arbitration",
@@ -6321,9 +8881,16 @@ def normalize_joint_layout_args(args):
     reset_if_needed("dta_tau", 0.1, "--dta-tau")
     reset_if_needed("dta_gamma_init", 0.0, "--dta-gamma-init")
     reset_if_needed("dta_variant", "simple", "--dta-variant")
+    reset_if_needed("dta_overlap_weight", 1.0, "--dta-overlap-weight")
+    reset_if_needed("dta_structure_weight", 1.0, "--dta-structure-weight")
     reset_if_needed("dta_nonlocal_topk", 10, "--dta-nonlocal-topk")
     reset_if_needed("dta_normalization", "sinkhorn", "--dta-normalization")
     reset_if_needed("dta_sinkhorn_iters", 5, "--dta-sinkhorn-iters")
+    reset_if_needed(
+        "dta_mass_sinkhorn_iters",
+        20,
+        "--dta-mass-sinkhorn-iters",
+    )
     reset_if_needed("dta_film", False, "--dta-film")
     reset_if_needed("dta_film_ds", 64, "--dta-film-ds")
     reset_if_needed(
@@ -6367,6 +8934,29 @@ def normalize_joint_layout_args(args):
         0.1,
         "--assignment-graph-weight",
     )
+    reset_if_needed(
+        "assignment_graph_pair_detach",
+        False,
+        "--assignment-graph-pair-detach",
+    )
+    reset_if_needed(
+        "assignment_graph_fusion",
+        "fixed",
+        "--assignment-graph-fusion",
+    )
+    reset_if_needed(
+        "assignment_graph_gate_hidden",
+        32,
+        "--assignment-graph-gate-hidden",
+    )
+    reset_if_needed("gfm", "none", "--gfm")
+    reset_if_needed("gfm_rank", 64, "--gfm-rank")
+    reset_if_needed("gfm_detach", False, "--gfm-detach")
+    reset_if_needed("vcf", "none", "--vcf")
+    reset_if_needed("vcf_dim", 64, "--vcf-dim")
+    reset_if_needed("vcf_cg_iters", 10, "--vcf-cg-iters")
+    reset_if_needed("vcf_lambda_init", 0.1, "--vcf-lambda-init")
+    reset_if_needed("vcf_detach", False, "--vcf-detach")
     reset_if_needed(
         "cross_overlap_relation",
         "none",
@@ -6452,6 +9042,44 @@ def normalize_joint_layout_args(args):
         "max-prob",
         "--overlap-distill-confidence",
     )
+    reset_if_needed(
+        "overlap_distill_credibility",
+        "none",
+        "--overlap-distill-credibility",
+    )
+    reset_if_needed(
+        "overlap_distill_credibility_momentum",
+        0.9,
+        "--overlap-distill-credibility-momentum",
+    )
+    reset_if_needed(
+        "overlap_distill_relational_weight",
+        0.0,
+        "--overlap-distill-relational-weight",
+    )
+    reset_if_needed(
+        "overlap_distill_relational_samples",
+        256,
+        "--overlap-distill-relational-samples",
+    )
+    reset_if_needed("pacmt", "none", "--pacmt")
+    reset_if_needed("pacmt_alpha_sam", 1.0, "--pacmt-alpha-sam")
+    reset_if_needed("pacmt_alpha_frag", 1.0, "--pacmt-alpha-frag")
+    reset_if_needed("pacmt_iou_tau", 0.1, "--pacmt-iou-tau")
+    reset_if_needed(
+        "pacmt_direction_temperature",
+        0.05,
+        "--pacmt-direction-temperature",
+    )
+    reset_if_needed("pacmt_pl_conf", 0.9, "--pacmt-pl-conf")
+    reset_if_needed(
+        "pacmt_pl_min_weight",
+        0.1,
+        "--pacmt-pl-min-weight",
+    )
+    reset_if_needed("pacmt_pl_cap", 30, "--pacmt-pl-cap")
+    reset_if_needed("pacmt_kd_weight", 0.05, "--pacmt-kd-weight")
+    reset_if_needed("pacmt_pl_weight", 0.05, "--pacmt-pl-weight")
     reset_if_needed("evidence_fusion", "none", "--evidence-fusion")
     reset_if_needed("edl_kl_weight", 0.1, "--edl-kl-weight")
     reset_if_needed("edl_anneal_ratio", 0.5, "--edl-anneal-ratio")
@@ -6536,6 +9164,10 @@ def validate_args(args):
         args.dual_transport_arbitration = "post-gat2"
     if args.assignment_graph in ("post-gat", "postgat"):
         args.assignment_graph = "post-gat2"
+    if args.gfm in ("post-gat", "postgat"):
+        args.gfm = "post-gat2"
+    if args.vcf in ("post-gat", "postgat"):
+        args.vcf = "post-gat2"
     if args.bcq_interaction in ("post-gat", "postgat"):
         args.bcq_interaction = "post-gat2"
     if args.consensus_token_fusion in ("post-gat", "postgat"):
@@ -6554,6 +9186,38 @@ def validate_args(args):
         raise ValueError(
             "--graph-modality-lambda must be between 0 and 1."
         )
+    if args.shared_superpixel_fusion != "none":
+        if args.graph_layout != "separate":
+            raise ValueError(
+                "--shared-superpixel-fusion requires --graph-layout "
+                "separate."
+            )
+        active_cross_interactions = []
+        if args.dual_transport_arbitration != "none":
+            active_cross_interactions.append("--dual-transport-arbitration")
+        if args.assignment_graph != "none":
+            active_cross_interactions.append("--assignment-graph")
+        if args.gfm != "none":
+            active_cross_interactions.append("--gfm")
+        if args.vcf != "none":
+            active_cross_interactions.append("--vcf")
+        if args.cross_overlap_relation != "none":
+            active_cross_interactions.append("--cross-overlap-relation")
+        if args.bcq_interaction != "none":
+            active_cross_interactions.append("--bcq-interaction")
+        if args.consensus_token_fusion != "none":
+            active_cross_interactions.append("--consensus-token-fusion")
+        if args.evidence_fusion != "none":
+            active_cross_interactions.append("--evidence-fusion")
+        if args.overlap_distill_weight > 0:
+            active_cross_interactions.append("--overlap-distill-weight")
+        if args.pacmt != "none":
+            active_cross_interactions.append("--pacmt")
+        if active_cross_interactions:
+            raise ValueError(
+                "Shared-superpixel fusion is a no-interaction ablation; "
+                "disable " + ", ".join(active_cross_interactions) + "."
+            )
     if args.dynamic_dk <= 0 or args.dynamic_topk <= 0:
         raise ValueError("Dynamic graph dimensions must be positive.")
     if args.dynamic_tau <= 0 or args.spatial_prior_k <= 0:
@@ -6568,8 +9232,14 @@ def validate_args(args):
         raise ValueError("--dta-gamma-init must be nonnegative.")
     if args.dta_nonlocal_topk < 0:
         raise ValueError("--dta-nonlocal-topk must be nonnegative.")
+    if args.dta_overlap_weight < 0:
+        raise ValueError("--dta-overlap-weight must be nonnegative.")
+    if args.dta_structure_weight < 0:
+        raise ValueError("--dta-structure-weight must be nonnegative.")
     if args.dta_sinkhorn_iters <= 0:
         raise ValueError("--dta-sinkhorn-iters must be positive.")
+    if args.dta_mass_sinkhorn_iters <= 0:
+        raise ValueError("--dta-mass-sinkhorn-iters must be positive.")
     if args.dta_film_ds <= 0:
         raise ValueError("--dta-film-ds must be positive.")
     if args.dta_film_ds > args.hidden_dim:
@@ -6590,6 +9260,27 @@ def validate_args(args):
         )
     if not 0.0 <= args.assignment_graph_weight <= 1.0:
         raise ValueError("--assignment-graph-weight must be in [0, 1].")
+    if args.assignment_graph_gate_hidden <= 0:
+        raise ValueError(
+            "--assignment-graph-gate-hidden must be positive."
+        )
+    if args.gfm_rank <= 0:
+        raise ValueError("--gfm-rank must be positive.")
+    if args.vcf_dim <= 0:
+        raise ValueError("--vcf-dim must be positive.")
+    if args.vcf_cg_iters <= 0:
+        raise ValueError("--vcf-cg-iters must be positive.")
+    if args.vcf_lambda_init <= 0:
+        raise ValueError("--vcf-lambda-init must be positive.")
+    if (
+        args.assignment_graph_fusion == "conflict-gate"
+        and args.assignment_graph_output != "pure-third"
+    ):
+        raise ValueError(
+            "--assignment-graph-fusion conflict-gate requires "
+            "--assignment-graph-output pure-third so the consensus stream "
+            "does not write back to either private graph."
+        )
     if args.cross_overlap_min_coverage < 0:
         raise ValueError(
             "--cross-overlap-min-coverage must be nonnegative."
@@ -6643,6 +9334,18 @@ def validate_args(args):
                 "support and is mutually exclusive with "
                 "--cross-overlap-relation sparse."
             )
+        if (
+            args.dta_variant == "structural-consensus"
+            and (
+                args.cross_overlap_min_coverage > 0
+                or args.cross_overlap_iou_topk > 0
+            )
+        ):
+            raise ValueError(
+                "structural-consensus DTA requires the complete physical "
+                "overlap mass M. Set --cross-overlap-min-coverage 0 and "
+                "--cross-overlap-iou-topk 0."
+            )
     elif args.dta_film:
         raise ValueError("--dta-film requires --dual-transport-arbitration.")
     if args.assignment_graph != "none":
@@ -6670,6 +9373,54 @@ def validate_args(args):
                 "--assignment-graph and --consensus-token-fusion are "
                 "separate post-GAT2 interaction ablations."
             )
+    if args.gfm != "none":
+        if args.graph_layout != "separate":
+            raise ValueError("--gfm requires --graph-layout separate.")
+        active_interactions = []
+        if args.dual_transport_arbitration != "none":
+            active_interactions.append("--dual-transport-arbitration")
+        if args.assignment_graph != "none":
+            active_interactions.append("--assignment-graph")
+        if args.cross_overlap_relation != "none":
+            active_interactions.append("--cross-overlap-relation")
+        if args.bcq_interaction != "none":
+            active_interactions.append("--bcq-interaction")
+        if args.consensus_token_fusion != "none":
+            active_interactions.append("--consensus-token-fusion")
+        if args.evidence_fusion != "none":
+            active_interactions.append("--evidence-fusion")
+        if args.vcf != "none":
+            active_interactions.append("--vcf")
+        if active_interactions:
+            raise ValueError(
+                "--gfm is a standalone post-GAT2 interaction ablation and "
+                "cannot be combined with " + ", ".join(active_interactions)
+                + "."
+            )
+    if args.vcf != "none":
+        if args.graph_layout != "separate":
+            raise ValueError("--vcf requires --graph-layout separate.")
+        active_interactions = []
+        if args.dual_transport_arbitration != "none":
+            active_interactions.append("--dual-transport-arbitration")
+        if args.assignment_graph != "none":
+            active_interactions.append("--assignment-graph")
+        if args.gfm != "none":
+            active_interactions.append("--gfm")
+        if args.cross_overlap_relation != "none":
+            active_interactions.append("--cross-overlap-relation")
+        if args.bcq_interaction != "none":
+            active_interactions.append("--bcq-interaction")
+        if args.consensus_token_fusion != "none":
+            active_interactions.append("--consensus-token-fusion")
+        if args.evidence_fusion != "none":
+            active_interactions.append("--evidence-fusion")
+        if active_interactions:
+            raise ValueError(
+                "--vcf is a standalone post-GAT2 interaction ablation and "
+                "cannot be combined with " + ", ".join(active_interactions)
+                + "."
+            )
     if args.overlap_distill_weight < 0:
         raise ValueError("--overlap-distill-weight must be nonnegative.")
     if args.overlap_distill_temperature <= 0:
@@ -6684,10 +9435,51 @@ def validate_args(args):
         raise ValueError(
             "--overlap-distill-warmup-ratio must be in [0, 1)."
         )
+    if not 0.0 <= args.overlap_distill_credibility_momentum < 1.0:
+        raise ValueError(
+            "--overlap-distill-credibility-momentum must be in [0, 1)."
+        )
+    if args.overlap_distill_relational_weight < 0:
+        raise ValueError(
+            "--overlap-distill-relational-weight must be nonnegative."
+        )
+    if args.overlap_distill_relational_samples <= 0:
+        raise ValueError(
+            "--overlap-distill-relational-samples must be positive."
+        )
+    if (
+        args.overlap_distill_credibility != "none"
+        or args.overlap_distill_relational_weight > 0
+    ) and args.overlap_distill_weight <= 0:
+        raise ValueError(
+            "CCOD credibility/relational options require positive "
+            "--overlap-distill-weight."
+        )
     if args.overlap_distill_weight > 0 and args.graph_layout != "separate":
         raise ValueError(
             "--overlap-distill-weight requires --graph-layout separate."
         )
+    if args.pacmt != "none" and args.graph_layout != "separate":
+        raise ValueError("--pacmt requires --graph-layout separate.")
+    if args.pacmt != "none" and args.evidence_fusion != "none":
+        raise ValueError(
+            "PACMT currently operates on node logits and requires "
+            "--evidence-fusion none."
+        )
+    if args.pacmt_alpha_sam < 0 or args.pacmt_alpha_frag < 0:
+        raise ValueError("PACMT physical penalty strengths must be nonnegative.")
+    if args.pacmt_iou_tau <= 0:
+        raise ValueError("--pacmt-iou-tau must be positive.")
+    if args.pacmt_direction_temperature <= 0:
+        raise ValueError("--pacmt-direction-temperature must be positive.")
+    if not 0.0 <= args.pacmt_pl_conf <= 1.0:
+        raise ValueError("--pacmt-pl-conf must be in [0, 1].")
+    if not 0.0 <= args.pacmt_pl_min_weight <= 1.0:
+        raise ValueError("--pacmt-pl-min-weight must be in [0, 1].")
+    if args.pacmt_pl_cap <= 0:
+        raise ValueError("--pacmt-pl-cap must be positive.")
+    if args.pacmt_kd_weight < 0 or args.pacmt_pl_weight < 0:
+        raise ValueError("PACMT loss weights must be nonnegative.")
     if args.bcq_anchor_ratio <= 0:
         raise ValueError("--bcq-anchor-ratio must be positive.")
     if args.bcq_anchor_topk <= 0:
@@ -6798,6 +9590,7 @@ def main():
         cell_data,
         bridge_data,
         cross_overlap_data,
+        gfm_spectral_data,
         joint_spatial_prior,
     ) = prepare_data(args, config)
 
@@ -6808,7 +9601,12 @@ def main():
     print(
         f"CNN: {cnn_configuration_tag(args)} | "
         f"graph-layout: {args.graph_layout} | "
-        f"LiDAR segments: {args.lidar_segmentation}"
+        "LiDAR segments: "
+        + (
+            "shared-HSI-SLIC"
+            if args.shared_superpixel_fusion != "none"
+            else args.lidar_segmentation
+        )
     )
     if args.graph_layout == "separate":
         print(
@@ -6819,6 +9617,12 @@ def main():
             f"FDSM={args.fdsm_scope} | "
             f"LiDAR-mod={args.lidar_modulation}"
         )
+        if args.shared_superpixel_fusion != "none":
+            print(
+                "Shared-superpixel ablation: exact HSI partition reused "
+                f"by LiDAR | readout={args.shared_superpixel_fusion} | "
+                "private GATs remain independent | no cross-graph module"
+            )
         if args.dual_transport_arbitration != "none":
             edge_count = 0
             if cross_overlap_data is not None:
@@ -6834,15 +9638,29 @@ def main():
                 "geometry/semantic transport mixed before readout"
             )
             if args.dta_variant == "full":
+                normalization_detail = ""
+                if args.dta_normalization == "sinkhorn":
+                    normalization_detail = (
+                        f" | sinkhorn-iters={args.dta_sinkhorn_iters}"
+                    )
                 print(
                     "  DTA full: "
                     f"nonlocal-topk={args.dta_nonlocal_topk} | "
-                    f"normalization={args.dta_normalization} | "
-                    f"sinkhorn-iters={args.dta_sinkhorn_iters} | "
+                    f"normalization={args.dta_normalization}"
+                    f"{normalization_detail} | "
                     "aux weights="
                     f"{args.dta_aux_sparse_weight:g}/"
                     f"{args.dta_aux_align_weight:g}/"
                     f"{args.dta_aux_entropy_weight:g}"
+                )
+            elif args.dta_variant == "structural-consensus":
+                print(
+                    "  DTA structural consensus: "
+                    f"overlap-weight={args.dta_overlap_weight:g} | "
+                    f"structure-weight={args.dta_structure_weight:g} | "
+                    "area-Sinkhorn-iters="
+                    f"{args.dta_mass_sinkhorn_iters} | "
+                    "T0 marginals preserved"
                 )
             if args.dta_film:
                 print(
@@ -6860,15 +9678,52 @@ def main():
                     "retained_edge_fraction",
                     1.0,
                 )
+            if args.assignment_graph_fusion == "fixed":
+                assignment_fusion_detail = (
+                    f"weight={args.assignment_graph_weight:g} | "
+                )
+            else:
+                assignment_fusion_detail = (
+                    "conflict-gate-hidden="
+                    f"{args.assignment_graph_gate_hidden} | "
+                )
             print(
                 "Assignment graph interaction: "
                 f"slot={args.assignment_graph} | "
                 f"topk={args.assignment_graph_topk} | "
                 f"gamma-init={args.assignment_graph_gamma_init:g} | "
                 f"output={args.assignment_graph_output} | "
-                f"weight={args.assignment_graph_weight:g} | "
+                f"pair-detach={args.assignment_graph_pair_detach} | "
+                f"fusion={args.assignment_graph_fusion} | "
+                f"{assignment_fusion_detail}"
                 f"assignment-nodes={edge_count}({retained_fraction:.2%}) | "
                 "overlap-restricted SEGMN-style pair graph after GAT2"
+            )
+        if args.gfm != "none":
+            if gfm_spectral_data is None:
+                raise RuntimeError("GFMI spectral data was not prepared.")
+            print(
+                "Graph functional map interaction: "
+                f"slot={args.gfm} | "
+                f"rank={gfm_spectral_data['actual_rank']}"
+                f"(requested={args.gfm_rank}, "
+                f"per-scale={gfm_spectral_data['rank_per_scale']}) | "
+                f"detach={args.gfm_detach} | "
+                "fixed low-frequency bases + overlap map prior + "
+                "learnable residual map | consensus pixel stream only; "
+                "no private-node writeback"
+            )
+        if args.vcf != "none":
+            print(
+                "Variational consensus field: "
+                f"slot={args.vcf} | "
+                f"dim={args.vcf_dim} | "
+                f"CG-iters={args.vcf_cg_iters} | "
+                f"lambda-init={args.vcf_lambda_init:g} | "
+                f"detach={args.vcf_detach} | "
+                "superpixel pooling observations + learnable precision + "
+                "pixel 4-neighbor smoothness | consensus pixel stream "
+                "only; no private-node writeback and no auxiliary loss"
             )
         if args.cross_overlap_relation != "none":
             original_edges = 0
@@ -6951,6 +9806,11 @@ def main():
             edge_count = 0
             if cross_overlap_data is not None:
                 edge_count = cross_overlap_data.get("edge_count", 0)
+            teacher_rule = (
+                "class-calibrated-confidence"
+                if args.overlap_distill_credibility == "class-ema"
+                else "confidence"
+            )
             print(
                 "Overlap distillation: "
                 f"weight={args.overlap_distill_weight:g} | "
@@ -6959,8 +9819,30 @@ def main():
                 f"margin={args.overlap_distill_margin:g} | "
                 f"warmup={args.overlap_distill_warmup_ratio:g} | "
                 f"confidence={args.overlap_distill_confidence} | "
+                f"credibility={args.overlap_distill_credibility}"
+                f"(m={args.overlap_distill_credibility_momentum:g}) | "
+                "relational="
+                f"{args.overlap_distill_relational_weight:g}"
+                f"@{args.overlap_distill_relational_samples} | "
                 f"edges={edge_count} | "
-                "teacher=confidence winner with stop-grad"
+                f"teacher={teacher_rule} winner with stop-grad"
+            )
+        if args.pacmt != "none":
+            edge_count = 0
+            if cross_overlap_data is not None:
+                edge_count = cross_overlap_data.get("edge_count", 0)
+            print(
+                "PACMT: "
+                f"mode={args.pacmt} | "
+                f"weights KD/PL={args.pacmt_kd_weight:g}/"
+                f"{args.pacmt_pl_weight:g} | "
+                f"physical alpha SAM/frag={args.pacmt_alpha_sam:g}/"
+                f"{args.pacmt_alpha_frag:g} | "
+                f"IoU-tau={args.pacmt_iou_tau:g} | "
+                f"direction-T={args.pacmt_direction_temperature:g} | "
+                f"PL conf/min-w/cap={args.pacmt_pl_conf:g}/"
+                f"{args.pacmt_pl_min_weight:g}/{args.pacmt_pl_cap} | "
+                f"edges={edge_count} | training-only, zero inference cost"
             )
         if args.evidence_fusion != "none":
             edge_count = 0
@@ -6976,11 +9858,14 @@ def main():
                 f"overlap-conflict-edges={edge_count} | "
                 "CNN classifier bypassed"
             )
-        print(
-            "Graph fusion H/L="
-            f"{args.graph_modality_lambda:g}/"
-            f"{1.0 - args.graph_modality_lambda:g}"
-        )
+        if args.shared_superpixel_fusion == "node-cat":
+            print("Graph fusion: post-GAT2 node cat -> pixel projection")
+        else:
+            print(
+                "Graph fusion H/L="
+                f"{args.graph_modality_lambda:g}/"
+                f"{1.0 - args.graph_modality_lambda:g}"
+            )
     else:
         print(
             "Graph layout: retained concatenated-node joint graph "
@@ -7038,6 +9923,7 @@ def main():
             cell_data,
             bridge_data,
             cross_overlap_data,
+            gfm_spectral_data,
             joint_spatial_prior,
             run_index,
         )
@@ -7071,13 +9957,17 @@ def main():
         f"prior-{args.lidar_graph_prior}_"
         f"{dta_configuration_tag(args)}_"
         f"{assignment_graph_configuration_tag(args)}_"
+        f"{gfm_configuration_tag(args)}_"
+        f"{vcf_configuration_tag(args)}_"
         f"{cross_overlap_configuration_tag(args)}_"
         f"{bcq_configuration_tag(args)}_"
         f"{consensus_token_configuration_tag(args)}_"
         f"{overlap_distill_configuration_tag(args)}_"
+        f"{pacmt_configuration_tag(args)}_"
         f"{evidence_fusion_configuration_tag(args)}_"
         f"fdsm-{args.fdsm_scope}_"
         f"{cnn_configuration_tag(args)}_"
+        f"{shared_superpixel_configuration_tag(args)}_"
         f"lidarmod-{args.lidar_modulation}_"
         f"{seed_configuration_tag(args)}_"
         f"{dummy_logit_configuration_tag(args, class_count)}_results"
